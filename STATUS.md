@@ -4,6 +4,21 @@ Updated every session. Format: what works (with the test that proves it),
 what is broken, what is untested, what is next. Never claim success that was
 not observed.
 
+## Date: 2026-10-17 (session 2)
+
+### Portability fix (user-reported: first build on GCC 15 failed)
+
+* Building on a user machine with GCC 15 tripped
+  `-Werror=discarded-qualifiers` in msvcrt.c: GCC 15 const-propagates the
+  first argument's qualifier into `strchr`/`strrchr`/`strstr` builtin return
+  types, so returning them as `char *` (the MSVC CRT contract:
+  const-in/mutable-out) became an implicit const-discard. Fixed with
+  explicit casts + a comment explaining the intent.
+* Audited the whole tree for the same class: every other strchr-family
+  use stores into `const char *` or a boolean context — safe on any GCC.
+  `calloc` argument orders audited too (no transposed-args sites).
+* Verified after fix: clean full rebuild, 13/13 tests on GCC 14.2 (Debian).
+
 ## Date: 2026-10-17 (session 1, part 3)
 
 ### Working — proven by `make test` (13/13 pass)
@@ -86,7 +101,8 @@ not observed.
 ### Next
 
 1. Wayland surface path (xdg_shell + shm present + seat input).
-2. ws2_32 sockets (real tools need networking).
+2. SEH x64 table-based unwinding (.pdata/.xdata) so guest `__try`/`__except`
+   scope handlers actually run (crash capture already works).
 3. Vulkan surface (Xlib) + swapchain once a GPU/ICD is available; D3D9
    translation start (shader decode can be developed headless).
 4. Real-world app testing (Notepad-class tools, installers).

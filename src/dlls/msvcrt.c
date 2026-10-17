@@ -119,9 +119,12 @@ static WN_API char *ms_strncpy(char *d, const char *s, uint64_t n)
     return strncpy(d, s, (size_t)n);
 }
 static WN_API char *ms_strcat(char *d, const char *s) { return strcat(d, s); }
-static WN_API char *ms_strchr(const char *s, int32_t c) { return strchr(s, c); }
-static WN_API char *ms_strrchr(const char *s, int32_t c) { return strrchr(s, c); }
-static WN_API char *ms_strstr(const char *h, const char *n) { return strstr(h, n); }
+/* CRT contract: const-in, mutable-out (mirrors MSVC declarations).
+ * Explicit casts are deliberate: GCC 15's builtins const-propagate the first
+ * argument's qualifier into the return type, tripping -Werror=discarded-qualifiers. */
+static WN_API char *ms_strchr(const char *s, int32_t c) { return (char *)strchr(s, c); }
+static WN_API char *ms_strrchr(const char *s, int32_t c) { return (char *)strrchr(s, c); }
+static WN_API char *ms_strstr(const char *h, const char *n) { return (char *)strstr(h, n); }
 static WN_API char *ms_strupr(char *s)
 {
     for (char *p = s; *p; p++)
