@@ -4,45 +4,59 @@ Updated every session. Format: what works (with the test that proves it),
 what is broken, what is untested, what is next. Never claim success that was
 not observed.
 
-## Date: 2026-10-17 (session 1)
+## Date: 2026-10-17 (session 1, part 2)
 
-### Working
+### Working — proven by `make test` (10/10 pass)
 
-Nothing yet. Repository scaffolded, build system written, first code being
-written in this session. See "In progress" below.
+| Area | Proof |
+|------|-------|
+| PE32+ loading (map, relocs, imports, TLS dir, protections) | every test runs a real mingw-w64 exe |
+| PE DLL recursive loading (import DLLs from app dir) | t08 loads a real `libwinpthread-1.dll` |
+| ms_abi ABI bridge (guest calls builtins directly) | all tests |
+| TEB/PEB/GS-base, LDR lists | t03, t09 |
+| Console: WriteFile, WriteConsoleA, printf family (in-tree formatter with MS-ABI varargs decode) | t01, t02 |
+| argc/argv/env, GetCommandLine, GetEnvironmentVariable, CWD | t03 |
+| Files: create/read/write/CI-reopen/DeleteFile/GetFileSize/seek | t04 |
+| Directories + FindFirstFile/FindNextFile (Windows dot semantics) | t05 |
+| Threads: CreateThread/exit codes/WaitForSingleObject | t06 |
+| Critical sections (contended, 4x1000 ops) | t06 |
+| Events (auto/manual), semaphores, WFMO(any), recursive mutex | t07 |
+| Static TLS (`__thread`) + TlsAlloc/GetValue/SetValue cross-thread | t08 |
+| GetModuleHandle/LoadLibrary/GetProcAddress/GetModuleFileName | t09 |
+| VirtualAlloc/Protect/Query/Free + HeapAlloc loops (10k) | t10 |
+| SEH: signal capture -> VEH dispatch -> Windows-style crash report | crash reports observed; VEH used by CRT |
+| Loud stubs with call-site resolution (never fake success) | seen live (DuplicateHandle before it was implemented) |
+| Registry: file-backed tree + advapi32 basics | manual smoke (RegOpenKey/SetValue) |
 
-### In progress
+### Also observed working (not yet a named test)
 
-* PE loader (PE32+/PE32): map, relocations, imports, exports, TLS directory.
-* Windows ABI bridge: ms_abi builtin DLLs, TEB/PEB, GS-base setup.
-* kernel32 + msvcrt builtin subset sufficient for mingw-w64 console
-  executables (import surface measured from a real `hello.exe`).
+- `winnux --version`, `winnux run` CLI, WINNUX_LOG/TRACE env knobs
+- Crash-proof stub call reporter (raw-syscall first line)
 
-### Broken
+### Broken / partial
 
-* (nothing yet — nothing runs yet)
-
-### Untested
-
-* Wayland backend: not written yet.
-* Vulkan translation (D3D9/D3D11 → Vulkan): not written yet.
-* musl libc build: intended, not yet attempted.
-* 32-bit (PE32/i386) executables: not yet supported.
+- **SEH table-based unwinding (x64 .pdata/.xdata) not implemented** —
+  `__try`/`except` in guest code will not find handlers; unhandled guest
+  exceptions produce a crash report + exit code (no `RtlUnwind`).
+  `__C_specific_handler` returns CONTINUE_SEARCH (logged).
+- `SignalObjectAndWait`, APCs, `SetStdHandle` unimplemented (stubs).
+- Console input: ReadConsole works raw; no line editing/echo emulation.
+- Named kernel objects share one namespace but no cross-process sharing.
+- `SuspendThread` races documented in thread.c (SIGUSR1-based).
+- musl build not attempted yet.
 
 ### Environment notes
 
-* Toolchain: Debian 13, gcc 14.2 (x86_64), GNU make 4.4, git 2.47.
-* mingw-w64 cross compiler extracted locally (no root available) under
-  `/home/z/my-project/toolchain/root` — used ONLY to build test .exe files.
-* Xvfb present: GUI tests can run against a real X server here.
-* libX11.so.6 and libvulkan.so.1 present: backends can be exercised.
-* No GPU: Vulkan will enumerate whatever the loader exposes (possibly
-  nothing); performance claims must come from `winnux bench`, not assumptions.
+* mingw-w64 14.2 extracted locally under `/home/z/my-project/toolchain/root`
+  (no root on this box) — used ONLY to build test binaries.
+* Xvfb + libX11 + libvulkan present — GUI milestone testable here.
+* ASan/UBSan build (`make debug`) catches loader bugs: it found and we fixed
+  a missing export-table terminator and a stub-info realloc use-after-free.
 
 ### Next
 
-1. Vertical slice: PE loader + kernel32/msvcrt console subset, run a real
-   mingw-compiled `hello.exe` with working stdout.
-2. Test runner + growing test suite (files, threads, sync, TLS).
-3. ASan/UBSan + PE fuzzer hardening.
-4. X11 backend + user32/gdi32 window slice under Xvfb.
+1. Fuzz the PE loader under ASan (tests/fuzz) + fix everything found.
+2. X11 backend (dlopen libX11) + user32/gdi32 vertical slice under Xvfb.
+3. Wayland backend (hand-marshalled wire protocol).
+4. Vulkan loader + surface + bench; D3D9/GL translation begins.
+5. Real-world app testing (Notepad-class tools, installers).

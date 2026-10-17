@@ -41,24 +41,31 @@ int wn_file_open(const char *winpath, uint32_t access, uint32_t disposition,
 
     char host[4200];
     if (wn_path_resolve_ci(winpath, host, sizeof host) != 0) {
-        /* May still be creatable: resolve the parent directory exactly. */
+        /* Not found (possibly creatable). Translate through the full path
+         * (this applies the CWD for relative paths), then CI-resolve only
+         * the parent directory and append the literal file name. */
+        char fullhost[4200];
+        if (wn_path_win_to_host(winpath, fullhost, sizeof fullhost) != 0) {
+            wn_last_error_set(WN_ERR_INVALID_NAME);
+            return 0;
+        }
         size_t dl;
-        const char *base = wn_path_basename(winpath, &dl);
-        char dirpart[1024], dirhost[2100];
+        const char *base = wn_path_basename(fullhost, &dl);
+        char dirpart[4100];
         if (dl >= sizeof dirpart) {
             wn_last_error_set(WN_ERR_INVALID_NAME);
             return 0;
         }
-        memcpy(dirpart, winpath, dl);
+        memcpy(dirpart, fullhost, dl);
         dirpart[dl] = '\0';
-        if (!dl || !strcmp(dirpart, "\\")) {
-            snprintf(dirhost, sizeof dirhost, "%s/drive_c", g_proc.prefix);
-        } else if (wn_path_resolve_ci(dirpart, dirhost, sizeof dirhost) != 0) {
+        if (!dl)
+            snprintf(dirpart, sizeof dirpart, ".");
+        struct stat dst;
+        if (dl && stat(dirpart, &dst) != 0) {
             wn_last_error_set(WN_ERR_PATH_NOT_FOUND);
             return 0;
         }
-        snprintf(host, sizeof host, "%s/%s", dirhost, base);
-        (void)0;
+        snprintf(host, sizeof host, "%s/%s", dl ? dirpart : ".", base);
     }
 
     int flags = O_CLOEXEC;
@@ -71,8 +78,8 @@ int wn_file_open(const char *winpath, uint32_t access, uint32_t disposition,
     switch (disposition) {
     case 1: /* CREATE_NEW */          flags |= O_CREAT | O_EXCL; break;
     case 2: /* CREATE_ALWAYS */        flags |= O_CREAT | O_TRUNC; break;
-    case 3: /* OPEN_ALWAYS */          flags |= O_CREAT; break;
-    case 4: /* OPEN_EXISTING */        break;
+    case 3: /* OPEN_EXISTING */        break;
+    case 4: /* OPEN_ALWAYS */          flags |= O_CREAT; break;
     case 5: /* TRUNCATE_EXISTING */    flags |= O_TRUNC; break;
     default:
         wn_log(WN_LOG_WARN, "files: disposition %u unknown", disposition);
@@ -81,7 +88,7 @@ int wn_file_open(const char *winpath, uint32_t access, uint32_t disposition,
     }
 
     struct stat st;
-    if (disposition == 4 && stat(host, &st) != 0) {
+    if (disposition == 3 && stat(host, &st) != 0) {
         wn_last_error_set(errno == ENOENT ? WN_ERR_FILE_NOT_FOUND
                                           : WN_ERR_PATH_NOT_FOUND);
         return 0;
@@ -171,9 +178,10 @@ int wn_find_open(const char *winpattern, wn_find *out)
     char clean[1024];
     size_t dl;
     snprintf(clean, sizeof clean, "%s", winpattern);
+    /* Normalize separators to '/' so host-side splitting works. */
     for (char *q = clean; *q; q++)
-        if (*q == '/')
-            *q = '\\';
+        if (*q == '\\')
+            *q = '/';
     const char *base = wn_path_basename(clean, &dl);
     char dirpart[1024];
     if (dl >= sizeof dirpart)
@@ -181,14 +189,30 @@ int wn_find_open(const char *winpattern, wn_find *out)
     memcpy(dirpart, clean, dl);
     dirpart[dl] = '\0';
 
+    /* Translate the directory part through the full path machinery so
+     * relative patterns enumerate the CWD (not the prefix root). */
     char dirwin[1024], dirhost[4200];
-    if (!dl || !strcmp(dirpart, "\\")) {
-        snprintf(dirwin, sizeof dirwin, "C:\\");
+    if (!dl) {
+        char cwdwin[1024];
+        wn_path_get_cwd_win(cwdwin, sizeof cwdwin);
+        snprintf(dirhost, sizeof dirhost, "%s", cwdwin);
+        /* dirhost currently holds the Windows form; convert: */
+        if (wn_path_win_to_host(dirhost, dirhost, sizeof dirhost) != 0)
+            return 0;
     } else {
         snprintf(dirwin, sizeof dirwin, "%s", dirpart);
+        if (wn_path_win_to_host(dirwin, dirhost, sizeof dirhost) != 0)
+            return 0;
     }
-    if (wn_path_resolve_ci(dirwin, dirhost, sizeof dirhost) != 0)
-        return 0;
+    /* dirhost is a host path; make sure it exists (case may differ). */
+    struct stat dst;
+    if (stat(dirhost, &dst) != 0) {
+        char resolved[4200];
+        if (wn_path_resolve_ci(dl ? dirpart : ".", resolved, sizeof resolved) == 0)
+            snprintf(dirhost, sizeof dirhost, "%s", resolved);
+        else
+            return 0;
+    }
 
     snprintf(out->pattern, sizeof out->pattern, "%s", base);
     snprintf(out->dir_host, sizeof out->dir_host, "%s", dirhost);

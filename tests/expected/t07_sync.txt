@@ -1,0 +1,7 @@
+0
+T07 wfmo=0 (any)
+T07 sem=0,0,258 (want 0,0,258)
+T07 sem-after=0 (want 0)
+T07 mutex recursive=1 overrelease-fails=1
+T07 hits=3
+T07 SYNC OK

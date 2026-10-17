@@ -203,18 +203,17 @@ int wn_ms_fopen_create(const char *win, const char *mode, char *out, size_t cap)
 {
     if (!strchr(mode, 'w') && !strchr(mode, 'a'))
         return -1;
+    char fullhost[4200];
+    if (wn_path_win_to_host(win, fullhost, sizeof fullhost) != 0)
+        return -1;
     size_t dl;
-    const char *base = wn_path_basename(win, &dl);
-    char dirpart[1024], dirhost[2100];
+    const char *base = wn_path_basename(fullhost, &dl);
+    char dirpart[4100];
     if (dl >= sizeof dirpart)
         return -1;
-    memcpy(dirpart, win, dl);
+    memcpy(dirpart, fullhost, dl);
     dirpart[dl] = '\0';
-    if (!dl || !strcmp(dirpart, "\\"))
-        snprintf(dirhost, sizeof dirhost, "%s/drive_c", g_proc.prefix);
-    else if (wn_path_resolve_ci(dirpart, dirhost, sizeof dirhost) != 0)
-        return -1;
-    snprintf(out, cap, "%s/%s", dirhost, base);
+    snprintf(out, cap, "%s/%s", dl ? dirpart : ".", base);
     return 0;
 }
 
@@ -1021,4 +1020,5 @@ const wn_export_entry wn_msvcrt_exports[] = {
     { "vprintf", ms_vprintf },
     { "vsnprintf", ms_vsnprintf },
     { "vsprintf", ms_vsprintf },
+    { NULL, NULL },
 };

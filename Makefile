@@ -51,7 +51,7 @@ $(DBGTGT): $(DBGOBJS) | $(BIN)
 	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) -O1 -g -fsanitize=address,undefined \
 		-fno-omit-frame-pointer -o $@ $(DBGOBJS) $(LDLIBS)
 
-$(DBGOBJ)/%.o: src/%.c | $(DBGOBJ)
+$(DBGOBJ)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) -O1 -g -fsanitize=address,undefined \
 		-fno-omit-frame-pointer -c -o $@ $<

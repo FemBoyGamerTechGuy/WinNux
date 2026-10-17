@@ -1,0 +1,3 @@
+0
+T01 WriteFile OK
+T01 WriteConsoleA OK

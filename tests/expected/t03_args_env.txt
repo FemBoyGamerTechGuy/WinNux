@@ -1,0 +1,8 @@
+3
+~T03 argc=3
+~T03 argv[0]=
+T03 argv[1]=arg1
+T03 argv[2]=arg2
+T03 SystemRoot=C:\windows n=10
+~T03 cwd=
+~T03 cmdline=

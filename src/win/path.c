@@ -104,10 +104,13 @@ int wn_path_win_to_host(const char *win, char *out, size_t cap)
         wn_last_error_set(WN_ERR_INVALID_NAME);
         return -1;
     }
-    char rel[1024] = "";
     if (p[0] && p[1] == ':') {                 /* drive-absolute */
         char drive = p[0];
-        const char *rest = p[2] == '\\' ? p + 3 : p + 2;
+        char *rest = p[2] == '\\' ? p + 3 : p + 2;
+        /* Host paths need forward slashes: convert the rest in place. */
+        for (char *q = rest; *q; q++)
+            if (*q == '\\')
+                *q = '/';
         if (drive == 'Z' || drive == 'z') {
             snprintf(out, cap, "/%s", rest);
         } else if (drive == 'C' || drive == 'c') {
@@ -121,8 +124,11 @@ int wn_path_win_to_host(const char *win, char *out, size_t cap)
         return 0;
     }
     if (p[0] == '\\' && p[1] != '\\') {        /* rooted, no drive: C:\ */
-        snprintf(rel, sizeof rel, "%s", p + 1);
-        snprintf(out, cap, "%s/drive_c/%s", g_proc.prefix, rel);
+        char *rest = p + 1;
+        for (char *q = rest; *q; q++)
+            if (*q == '\\')
+                *q = '/';
+        snprintf(out, cap, "%s/drive_c/%s", g_proc.prefix, rest);
         free(p);
         return 0;
     }
@@ -146,15 +152,25 @@ void wn_path_host_to_win(const char *host, char *out, size_t cap)
     if (!strncmp(host, pl, n) && (host[n] == '/' || host[n] == '\0')) {
         const char *rest = host[n] ? host + n + 1 : "";
         snprintf(out, cap, "C:%s%s", *rest ? "\\" : "", rest);
-        return;
+    } else {
+        /* Host filesystem: expose through Z:. */
+        snprintf(out, cap, "Z:%s%s", host[0] == '/' ? "" : "/", host);
     }
-    /* Host filesystem: expose through Z:. */
-    snprintf(out, cap, "Z:%s%s", host[0] == '/' ? "" : "/", host);
+    /* Windows paths use backslashes. */
+    for (char *q = out; *q; q++)
+        if (*q == '/')
+            *q = '\\';
 }
 
-/* Case-insensitive component resolution. */
+/* Case-insensitive component resolution.
+ * (The length guard below makes the snprintfs safe; GCC cannot prove it,
+ * so the warning is locally disabled with a comment trail.) */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
 static int ci_lookup(const char *dir, const char *name, char *out, size_t cap)
 {
+    if (strlen(dir) + strlen(name) + 2 > cap)
+        return 0;
     /* Fast path first (exact case). */
     snprintf(out, cap, "%s/%s", dir, name);
     struct stat st;
@@ -175,6 +191,7 @@ static int ci_lookup(const char *dir, const char *name, char *out, size_t cap)
     closedir(d);
     return found;
 }
+#pragma GCC diagnostic pop
 
 int wn_path_resolve_ci(const char *win, char *out, size_t cap)
 {

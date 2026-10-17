@@ -1,0 +1,4 @@
+0
+T06 counter=4000 (want 4000)
+T06 codes=20,22,24,26
+T06 THREADS OK

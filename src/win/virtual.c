@@ -87,6 +87,23 @@ void *wn_virtual_alloc(void *hint, uint64_t size, uint32_t type, uint32_t prot)
 int wn_virtual_free(void *addr, uint64_t size, uint32_t type)
 {
     if (type & 0x8000 /* MEM_RELEASE */) {
+        if (size == 0) {
+            /* Windows: release the entire allocation. Find its region. */
+            pthread_mutex_lock(&g_reg_lock);
+            uint64_t s = 0, e = 0;
+            for (vregion *r = g_regions; r; r = r->next) {
+                if (r->start == (uint64_t)(uintptr_t)addr) {
+                    s = r->start;
+                    e = r->end;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_reg_lock);
+            if (!e || munmap(addr, (size_t)(e - s)) != 0)
+                return 0;
+            region_remove(s, e);
+            return 1;
+        }
         size = (size + 0xFFFF) & ~0xFFFFULL;
         if (munmap(addr, size) != 0)
             return 0;
@@ -153,11 +170,11 @@ int wn_virtual_protect(void *addr, uint64_t size, uint32_t newprot,
     return 1;
 }
 
-/* Fill MEMORY_BASIC_INFORMATION (x64 layout, 48 bytes). */
+/* Fill MEMORY_BASIC_INFORMATION (x64 layout, 48 bytes):
+ * Base@0, AllocationBase@8, AllocationProtect@16, RegionSize@24,
+ * State@32, Protect@36, Type@40. */
 int wn_virtual_query(void *addr, void *mbi)
 {
-    /* struct: BasePtr, AllocationBase, AllocationProtect, __align1,
-     * RegionSize, State, Protect, Type, __align2 */
     uint64_t *q = mbi;
     memset(q, 0, 48);
     uint64_t a = (uint64_t)(uintptr_t)addr;
@@ -166,11 +183,11 @@ int wn_virtual_query(void *addr, void *mbi)
         if (r->start <= a && r->end > a) {
             q[0] = r->start;                    /* BaseAddress */
             q[1] = r->start;                    /* AllocationBase */
-            *(uint32_t *)&q[2] = r->prot;       /* AllocationProtect */
-            q[4] = r->end - r->start;           /* RegionSize */
-            *(uint32_t *)&q[5] = 0x1000;        /* MEM_COMMIT */
-            *(uint32_t *)&q[6] = r->prot;       /* Protect */
-            *(uint32_t *)&q[7] = 0x20000;       /* MEM_PRIVATE */
+            *(uint32_t *)&q[2] = r->prot;       /* AllocationProtect @16 */
+            q[3] = r->end - r->start;           /* RegionSize @24 */
+            *(uint32_t *)&q[4] = 0x1000;        /* State: MEM_COMMIT @32 */
+            *(uint32_t *)((uint8_t *)&q[4] + 4) = r->prot;  /* Protect @36 */
+            *(uint32_t *)&q[5] = 0x20000;       /* Type: MEM_PRIVATE @40 */
             pthread_mutex_unlock(&g_reg_lock);
             return 1;
         }
@@ -197,10 +214,10 @@ int wn_virtual_query(void *addr, void *mbi)
             q[0] = s;
             q[1] = s;
             *(uint32_t *)&q[2] = p;
-            q[4] = e - s;
-            *(uint32_t *)&q[5] = (perms[0] == '-' && perms[1] == '-') ? 0x10000 /* MEM_FREE */ : 0x1000;
-            *(uint32_t *)&q[6] = p;
-            *(uint32_t *)&q[7] = 0x20000;
+            q[3] = e - s;
+            *(uint32_t *)&q[4] = (perms[0] == '-' && perms[1] == '-') ? 0x10000 /* MEM_FREE */ : 0x1000;
+            *(uint32_t *)((uint8_t *)&q[4] + 4) = p;
+            *(uint32_t *)&q[5] = 0x20000;
             ok = 1;
             break;
         }

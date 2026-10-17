@@ -1,0 +1,3 @@
+0
+T05 found=4 alpha=1 beta=1 (dots counted, Windows-style)
+T05 DIRS OK

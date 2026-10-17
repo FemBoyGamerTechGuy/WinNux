@@ -95,21 +95,6 @@ int wn_futex_wake(uint32_t *addr, int n)
 
 /* --- process create --------------------------------------------------------- */
 
-static void fill_default_env(wn_buf *b)
-{
-    /* A few Windows programs require these to exist. */
-    wn_buf_append_str(b, "SystemRoot=C:\\windows");
-    wn_buf_append(b, "\0", 1);
-    wn_buf_append_str(b, "SystemDrive=C:");
-    wn_buf_append(b, "\0", 1);
-    wn_buf_append_str(b, "TEMP=C:\\windows\\temp");
-    wn_buf_append(b, "\0", 1);
-    wn_buf_append_str(b, "TMP=C:\\windows\\temp");
-    wn_buf_append(b, "\0", 1);
-    wn_buf_append_str(b, "PATHEXT=.COM;.EXE;.BAT;.CMD");
-    wn_buf_append(b, "\0", 1);
-}
-
 uint32_t wn_process_create(const char *prefix, const char *exe_display_name)
 {
     memset(&g_proc, 0, sizeof g_proc);
@@ -164,11 +149,34 @@ uint32_t wn_process_create(const char *prefix, const char *exe_display_name)
 
     /* Environment block (UTF-16) + UTF-8 copy. */
     extern char **environ;
+    static const char *defaults[] = {
+        "SystemRoot=C:\\windows",
+        "SystemDrive=C:",
+        "TEMP=C:\\windows\\temp",
+        "TMP=C:\\windows\\temp",
+        "PATHEXT=.COM;.EXE;.BAT;.CMD",
+        NULL,
+    };
     wn_buf env16;
     wn_buf_init(&env16);
-    fill_default_env(&env16);
+    for (int d = 0; defaults[d]; d++) {
+        uint16_t *w = wn_utf8_to_utf16(defaults[d], NULL);
+        if (w) {
+            size_t l = 0;
+            while (w[l]) l++;
+            wn_buf_append(&env16, w, (l + 1) * 2);
+            free(w);
+        }
+    }
+    size_t nenv = 0;
+    for (char **e = environ; e && *e; e++) nenv++;
+    char **v = wn_xmalloc((nenv + 8) * sizeof(char *));
+    size_t i = 0;
+    for (int d = 0; defaults[d]; d++)
+        v[i++] = (char *)defaults[d];
     for (char **e = environ; e && *e; e++) {
         if (!wn_strcaseprefix(*e, "WINNUX_")) {  /* hide our own knobs */
+            v[i++] = *e;
             uint16_t *w = wn_utf8_to_utf16(*e, NULL);
             if (w) {
                 size_t l = 0;
@@ -178,17 +186,10 @@ uint32_t wn_process_create(const char *prefix, const char *exe_display_name)
             }
         }
     }
+    v[i] = NULL;
     wn_buf_append(&env16, "\0\0", 2);
     g_proc.env_utf16 = (uint16_t *)env16.data;
-    {
-        size_t n = 0;
-        for (char **e = environ; e && *e; e++) n++;
-        char **v = wn_xmalloc((n + 1) * sizeof(char *));
-        size_t i = 0;
-        for (char **e = environ; e && *e; e++) v[i++] = *e;
-        v[i] = NULL;
-        g_proc.env_utf8 = v;
-    }
+    g_proc.env_utf8 = v;
     g_proc.params->environment = g_proc.env_utf16;
 
     /* Set this (launcher) thread up with a TEB so early logging/stub code

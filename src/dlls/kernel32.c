@@ -781,7 +781,14 @@ static WN_API int32_t k32_WriteFile(wn_handle h, const void *buf, uint32_t n,
         return 0;
     wn_file *f = o->ptr;
     if (f->std_fd == 1 || f->std_fd == 2) {
-        int w = console_write(f->std_fd, buf, n);
+        /* Console semantics: translate \n only for real consoles; a
+         * redirected stream is a file and passes bytes through. */
+        int w;
+        if (f->is_console) {
+            w = console_write(f->std_fd, buf, n);
+        } else {
+            w = wn_file_write(f, buf, n);
+        }
         if (w < 0) {
             wn_last_error_set(WN_ERR_WRITE_FAULT);
             return 0;
@@ -1069,19 +1076,18 @@ static WN_API int32_t k32_CreateDirectoryA(const char *name, void *sa)
         wn_last_error_set(WN_ERR_ALREADY_EXISTS);
         return 0;
     }
-    char dirpart[1024], dirhost[2100];
-    size_t dl;
-    const char *base = wn_path_basename(name, &dl);
-    memcpy(dirpart, name, dl);
-    dirpart[dl] = '\0';
-    if (dl == 0)
-        snprintf(dirhost, sizeof dirhost, "%s/drive_c", g_proc.prefix);
-    else if (wn_path_resolve_ci(dirpart, dirhost, sizeof dirhost) != 0) {
-        wn_last_error_set(WN_ERR_PATH_NOT_FOUND);
+    char fullhost[4200];
+    if (wn_path_win_to_host(name, fullhost, sizeof fullhost) != 0) {
+        wn_last_error_set(WN_ERR_INVALID_NAME);
         return 0;
     }
-    char full[3200];
-    snprintf(full, sizeof full, "%s/%s", dirhost, base);
+    size_t dl;
+    const char *base = wn_path_basename(fullhost, &dl);
+    char dirpart[4100];
+    memcpy(dirpart, fullhost, dl);
+    dirpart[dl] = '\0';
+    char full[4200];
+    snprintf(full, sizeof full, "%s/%s", dl ? dirpart : ".", base);
     if (mkdir(full, 0777) != 0) {
         wn_last_error_set(errno == EEXIST ? WN_ERR_ALREADY_EXISTS
                                           : WN_ERR_ACCESS_DENIED);
@@ -1241,7 +1247,10 @@ static void find_dtor(void *p)
     wn_find_close(&k->f);
 }
 
-/* WIN32_FIND_DATAA x64 layout: 320 bytes. */
+/* WIN32_FIND_DATAA x64 layout (320 bytes):
+ * attrs@0, ftCreation@4, ftAccess@12, ftWrite@20 (FILETIME is 4-aligned),
+ * sizeHigh@28, sizeLow@32, reserved0@36, reserved1@40,
+ * cFileName@44[260], cAlternateFileName@304[14]. */
 static int fill_find_data(k32_find *k, void *data)
 {
     uint8_t *d = data;
@@ -1254,7 +1263,7 @@ static int fill_find_data(k32_find *k, void *data)
     *(uint32_t *)(d + 0) = attrs;
     *(uint32_t *)(d + 28) = (uint32_t)(size >> 32);
     *(uint32_t *)(d + 32) = (uint32_t)size;
-    memcpy(d + 44, name, strlen(name) + 1);
+    snprintf((char *)(d + 44), 260, "%s", name);
     return 1;
 }
 
@@ -1717,6 +1726,19 @@ static WN_API int32_t k32_SetErrorMode(uint32_t m)
     return 0;
 }
 
+static WN_API int32_t k32_GetThreadPriority(wn_handle h)
+{
+    (void)h;
+    return 0;   /* THREAD_PRIORITY_NORMAL */
+}
+
+static WN_API int32_t k32_SetThreadPriority(wn_handle h, int32_t prio)
+{
+    (void)h;
+    (void)prio;
+    return 1;   /* accepted; host scheduling unaffected (documented) */
+}
+
 static WN_API uint32_t k32_SetThreadAffinityMask(wn_handle h, uint64_t mask)
 {
     (void)h;
@@ -1776,6 +1798,42 @@ static WN_API void k32_RaiseException(uint32_t code, uint32_t flags,
     wn_seh_raise(code, flags, nparams, params);
 }
 
+static WN_API int32_t k32_DuplicateHandle(wn_handle src_proc, wn_handle src,
+                                          wn_handle tgt_proc, wn_handle *out,
+                                          uint32_t access, int32_t inherit,
+                                          uint32_t options)
+{
+    (void)src_proc;
+    (void)tgt_proc;
+    (void)access;
+    (void)inherit;
+    if (!out) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    if ((int64_t)(uintptr_t)src == -1) {        /* current process */
+        static int proc_obj;
+        *out = wn_handle_alloc(WN_HTYPE_PROCESS, &proc_obj);
+        return 1;
+    }
+    if ((int64_t)(uintptr_t)src == -2) {        /* current thread */
+        wn_thread *th = wn_thread_current();
+        if (!th) {
+            wn_last_error_set(WN_ERR_INVALID_HANDLE);
+            return 0;
+        }
+        *out = wn_handle_alloc(WN_HTYPE_THREAD, th);
+        return 1;
+    }
+    wn_object *o = wn_handle_acquire(src, 0);
+    if (!o)
+        return 0;
+    if (options & 1 /* DUPLICATE_CLOSE_SOURCE */)
+        wn_handle_close(src);
+    *out = src;    /* share the same handle value; refcount protects it */
+    return 1;
+}
+
 /* --- export table ------------------------------------------------------------------ */
 
 const wn_export_entry wn_kernel32_exports[] = {
@@ -1796,6 +1854,7 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "DeleteFileA", k32_DeleteFileA },
     { "DeleteFileW", k32_DeleteFileW },
     { "DisableThreadLibraryCalls", k32_DisableThreadLibraryCalls },
+    { "DuplicateHandle", k32_DuplicateHandle },
     { "EncodePointer", k32_EncodePointer },
     { "EnterCriticalSection", k32_EnterCriticalSection },
     { "ExitProcess", k32_ExitProcess },
@@ -1842,6 +1901,7 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "GetSystemInfo", k32_GetSystemInfo },
     { "GetSystemTime", k32_GetSystemTime },
     { "GetSystemTimeAsFileTime", k32_GetSystemTimeAsFileTime },
+    { "GetThreadPriority", k32_GetThreadPriority },
     { "GetTempPathA", k32_GetTempPathA },
     { "GetTickCount", k32_GetTickCount },
     { "GetTickCount64", k32_GetTickCount64 },
@@ -1900,6 +1960,8 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "SetLastError", k32_SetLastError },
     { "SetStdHandle", k32_SetStdHandle },
     { "SetThreadAffinityMask", k32_SetThreadAffinityMask },
+    { "SetThreadPriority", k32_SetThreadPriority },
+    { "SetThreadPriority", k32_SetThreadPriority },
     { "SetUnhandledExceptionFilter", k32_SetUnhandledExceptionFilter },
     { "Sleep", k32_Sleep },
     { "SleepEx", k32_SleepEx },

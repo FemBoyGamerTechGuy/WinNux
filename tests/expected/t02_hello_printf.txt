@@ -1,0 +1,3 @@
+0
+T02 printf 42 str X be
+T02 sprintf 00123|ab    |0000000000001000-ish

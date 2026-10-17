@@ -1,0 +1,5 @@
+0
+T10 query state=1000 prot=4 size=16777216
+T10 old-prot=4 (want 4)
+T10 heap sum=99990000 (want 99990000)
+T10 MEM OK

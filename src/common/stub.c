@@ -17,6 +17,7 @@
 
 #include <sys/mman.h>
 #include <string.h>
+#include <unistd.h>
 #include <stdlib.h>
 
 #define WN_STUB_AREA  (256u * 1024u)   /* 256 KiB => ~10k stubs */
@@ -31,7 +32,9 @@ typedef struct wn_stub_info {
 static uint8_t *g_stub_region;
 extern void wn_stub_entry_trampoline(void);
 
-static wn_stub_info *g_infos;      /* index i <-> stub i */
+/* Stable per-entry storage: trampolines embed &info in their code, so the
+ * info objects must never move (no realloc of the objects themselves). */
+static wn_stub_info **g_infos;     /* index i <-> stub i */
 static uint32_t g_info_count;
 
 WN_API void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
@@ -65,6 +68,15 @@ WN_API void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
     if (!info)
         return;
     info->hits++;
+    /* Crash-proof first line: raw write, no stdio, no formatting. */
+    if (info->hits == 1) {
+        const char msg[] = "[stub-call] ";
+        (void)!write(2, msg, sizeof msg - 1);
+        (void)!write(2, info->dll, strlen(info->dll));
+        (void)!write(2, "!", 1);
+        (void)!write(2, info->name, strlen(info->name));
+        (void)!write(2, "\n", 1);
+    }
     if (wn_log_level() >= WN_LOG_TRACE || info->hits == 1 || info->hits % 1000 == 0) {
         wn_log(WN_LOG_ERR, "STUB %s!%s(args: 0x%llx 0x%llx 0x%llx 0x%llx)",
                info->dll, info->name,
@@ -97,7 +109,7 @@ void *wn_stub_for(const char *dll, const char *name)
 {
     ensure_region();
     for (uint32_t i = 0; i < g_info_count; i++)
-        if (!strcmp(g_infos[i].dll, dll) && !strcmp(g_infos[i].name, name))
+        if (!strcmp(g_infos[i]->dll, dll) && !strcmp(g_infos[i]->name, name))
             return g_stub_region + (size_t)i * WN_STUB_SLOT;
 
     if ((uint64_t)(g_info_count + 1) * WN_STUB_SLOT > WN_STUB_AREA) {
@@ -106,13 +118,15 @@ void *wn_stub_for(const char *dll, const char *name)
     }
     uint32_t idx = g_info_count;
     g_infos = wn_xrealloc(g_infos, (idx + 1) * sizeof *g_infos);
-    g_infos[idx].dll = wn_xstrdup(dll);
-    g_infos[idx].name = wn_xstrdup(name);
-    g_infos[idx].hits = 0;
+    wn_stub_info *info = wn_xmalloc(sizeof *info);
+    info->dll = wn_xstrdup(dll);
+    info->name = wn_xstrdup(name);
+    info->hits = 0;
+    g_infos[idx] = info;
     g_info_count++;
 
     uint8_t *p = g_stub_region + (size_t)idx * WN_STUB_SLOT;
-    uint64_t info_addr = (uint64_t)(uintptr_t)&g_infos[idx];
+    uint64_t info_addr = (uint64_t)(uintptr_t)g_infos[idx];
     uint64_t entry_addr = (uint64_t)(uintptr_t)&wn_stub_entry_trampoline;
     if (info_addr < 0x100000000ULL) {
         *p++ = 0x41; *p++ = 0xBA; memcpy(p, &info_addr, 4); p += 4;   /* mov r10d,imm32 */

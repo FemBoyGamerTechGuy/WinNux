@@ -1,0 +1,5 @@
+0
+~T09 tick=
+T09 strlen=lld:5
+~T09 self=
+T09 MODULE OK

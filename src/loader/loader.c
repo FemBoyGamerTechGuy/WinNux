@@ -16,11 +16,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 /* Documented global: module list. */
 static wn_module *g_modules;
+/* Search directory of the exe being loaded (imports resolve before the exe
+ * is registered as g_proc.exe). */
+static char g_exe_load_dir[1100];
 
 wn_module *wn_module_list_head(void) { return g_modules; }
 
@@ -284,7 +288,18 @@ fail:
 wn_module *wn_module_load_exe(const char *host_path)
 {
     size_t dl;
-    const char *base = wn_path_basename(host_path, &dl);
+    /* Record the exe directory early: imports resolve during load, before
+     * the module is registered as g_proc.exe. */
+    {
+        char abspath[PATH_MAX];
+        if (realpath(host_path, abspath) != NULL)
+            snprintf(g_exe_load_dir, sizeof g_exe_load_dir, "%.*s",
+                     (int)(sizeof g_exe_load_dir - 1), abspath);
+        else
+            snprintf(g_exe_load_dir, sizeof g_exe_load_dir, "%.*s",
+                     (int)(sizeof g_exe_load_dir - 1), host_path);
+    }
+    const char *base = wn_path_basename(g_exe_load_dir, &dl);
     wn_module *m = load_pe(host_path, base, 1);
     if (!m)
         return NULL;
@@ -346,11 +361,12 @@ wn_module *wn_module_load_dll(const char *name, const char *dir)
     snprintf(windir, sizeof windir, "%s/drive_c/windows", g_proc.prefix);
     dirs[n++] = windir;
     char exedir[1100];
-    if (g_proc.exe) {
+    const char *exe_path = g_proc.exe ? g_proc.exe->path : g_exe_load_dir;
+    if (exe_path && exe_path[0]) {
         size_t dl;
-        wn_path_basename(g_proc.exe->path, &dl);
-        if (dl < sizeof exedir) {
-            memcpy(exedir, g_proc.exe->path, dl);
+        wn_path_basename(exe_path, &dl);
+        if (dl > 0 && dl < sizeof exedir) {
+            memcpy(exedir, exe_path, dl);
             exedir[dl] = '\0';
             dirs[n++] = exedir;
         }
