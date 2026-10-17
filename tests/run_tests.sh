@@ -13,6 +13,7 @@
 # reported as XFAIL (expected-fail) instead of FAIL, and never removed.
 
 set -u
+XVFB_PID=""
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$ROOT/bin/winnux"
 CASES="$ROOT/tests/cases"
@@ -70,7 +71,9 @@ run_one() {
         skip=$((skip+1))
         return
     fi
-    if ! "$MXGCC" -O2 -o "$exe" "$src" 2>>"$RESULTS/build.log"; then
+    libs=''
+    grep -lE '#include <windows.h>' "$src" >/dev/null 2>&1 && libs='-lgdi32 -luser32'
+    if ! "$MXGCC" -O2 -o "$exe" "$src" $libs 2>>"$RESULTS/build.log"; then
         echo "FAIL $name (build error, see results/build.log)"
         fail=$((fail+1)); failed_names="$failed_names $name(build)"
         return
@@ -79,9 +82,34 @@ run_one() {
     args=""
     [ -f "$CASES/$name.args" ] && args=$(cat "$CASES/$name.args")
 
+    # GUI tests need a display: start a private Xvfb when none is present.
+    disp_env=""
+    if [ -f "$CASES/$name.gui" ]; then
+        if [ -z "${DISPLAY:-}" ]; then
+            if command -v Xvfb >/dev/null 2>&1; then
+                if [ ! -f /tmp/.winnux-xvfb-$$.pid ]; then
+                    Xvfb :$$ -screen 0 1024x768x24 >/dev/null 2>&1 &
+                    XVFB_PID=$!
+                    echo $XVFB_PID > /tmp/.winnux-xvfb-$$.pid
+                    sleep 1.5
+                fi
+                disp_env="DISPLAY=:$$"
+            else
+                echo "SKIP $name (GUI test, no DISPLAY and no Xvfb)"
+                skip=$((skip+1))
+                return
+            fi
+        fi
+    fi
+
     actual="$RESULTS/$name.out"
-    timeout 30 "$BIN" run "$exe" $args >"$actual" 2>"$RESULTS/$name.err"
+    timeout 30 env $disp_env "$BIN" run "$exe" $args >"$actual" 2>"$RESULTS/$name.err"
     rc=$?
+    if [ -n "$XVFB_PID" ] && kill -0 $XVFB_PID 2>/dev/null; then
+        kill $XVFB_PID 2>/dev/null
+        rm -f /tmp/.winnux-xvfb-$$.pid
+        XVFB_PID=""
+    fi
     # Strip CR (console translation) for comparison.
     tr -d '\r' < "$actual" > "$actual.n"
 

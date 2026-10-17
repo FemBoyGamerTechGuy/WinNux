@@ -4,59 +4,60 @@ Updated every session. Format: what works (with the test that proves it),
 what is broken, what is untested, what is next. Never claim success that was
 not observed.
 
-## Date: 2026-10-17 (session 1, part 2)
+## Date: 2026-10-17 (session 1, part 3)
 
-### Working — proven by `make test` (10/10 pass)
+### Working — proven by `make test` (11/11 pass, GUI included)
 
 | Area | Proof |
 |------|-------|
-| PE32+ loading (map, relocs, imports, TLS dir, protections) | every test runs a real mingw-w64 exe |
-| PE DLL recursive loading (import DLLs from app dir) | t08 loads a real `libwinpthread-1.dll` |
-| ms_abi ABI bridge (guest calls builtins directly) | all tests |
-| TEB/PEB/GS-base, LDR lists | t03, t09 |
-| Console: WriteFile, WriteConsoleA, printf family (in-tree formatter with MS-ABI varargs decode) | t01, t02 |
-| argc/argv/env, GetCommandLine, GetEnvironmentVariable, CWD | t03 |
-| Files: create/read/write/CI-reopen/DeleteFile/GetFileSize/seek | t04 |
-| Directories + FindFirstFile/FindNextFile (Windows dot semantics) | t05 |
-| Threads: CreateThread/exit codes/WaitForSingleObject | t06 |
-| Critical sections (contended, 4x1000 ops) | t06 |
-| Events (auto/manual), semaphores, WFMO(any), recursive mutex | t07 |
-| Static TLS (`__thread`) + TlsAlloc/GetValue/SetValue cross-thread | t08 |
-| GetModuleHandle/LoadLibrary/GetProcAddress/GetModuleFileName | t09 |
-| VirtualAlloc/Protect/Query/Free + HeapAlloc loops (10k) | t10 |
-| SEH: signal capture -> VEH dispatch -> Windows-style crash report | crash reports observed; VEH used by CRT |
-| Loud stubs with call-site resolution (never fake success) | seen live (DuplicateHandle before it was implemented) |
-| Registry: file-backed tree + advapi32 basics | manual smoke (RegOpenKey/SetValue) |
+| PE32+ loading (map, relocs, imports, TLS, protections) + recursive PE DLL loading | all tests; t08 loads real `libwinpthread-1.dll` |
+| ms_abi ABI bridge, TEB/PEB/GS-base, LDR lists | all tests |
+| Console I/O + in-tree printf engine (MS-ABI varargs) | t01, t02 |
+| args/env/CWD, GetCommandLine | t03 |
+| Files (CI-reopen, delete, size, seek) | t04 |
+| Directories + FindFirstFile (Windows dot semantics) | t05 |
+| Threads + critical sections | t06 |
+| Events/semaphores/WFMO/recursive mutex | t07 |
+| Static `__thread` TLS + Tls API | t08 |
+| Module APIs | t09 |
+| VirtualAlloc/Protect/Query/Free + heap | t10 |
+| **GUI vertical slice: X11 via dlopen, window, message loop, WM_PAINT, GDI FillRect/TextOut (server-rendered fonts via glyph cache), timers, destroy** | **t11 under Xvfb** |
 
-### Also observed working (not yet a named test)
+### GUI architecture (as of this session)
 
-- `winnux --version`, `winnux run` CLI, WINNUX_LOG/TRACE env knobs
-- Crash-proof stub call reporter (raw-syscall first line)
+* `src/backends/`: backend abstraction; X11 implemented with **zero X11
+  headers** (dlopen + dlsym + wire-ABI overlay structs). Text rendering
+  draws glyphs server-side into a scratch pixmap and reads them back with
+  XGetImage — real fonts, no font library linked.
+* user32: classes, windows, message queue (eventfd wake), timers,
+  keysym->VK translation, DefWindowProc.
+* gdi32: DCs over software BGRA buffers; window DIB layout == X11 32bpp
+  ZPixmap, so present() is zero-conversion.
+* Wayland: hand-marshalled wire protocol; display connect + registry +
+  sync roundtrip verified; surface path (xdg_shell/shm) in progress —
+  init() currently fails honestly and the selector falls back to X11.
 
-### Broken / partial
+### Broken / partial (unchanged from part 2 unless noted)
 
-- **SEH table-based unwinding (x64 .pdata/.xdata) not implemented** —
-  `__try`/`except` in guest code will not find handlers; unhandled guest
-  exceptions produce a crash report + exit code (no `RtlUnwind`).
-  `__C_specific_handler` returns CONTINUE_SEARCH (logged).
-- `SignalObjectAndWait`, APCs, `SetStdHandle` unimplemented (stubs).
-- Console input: ReadConsole works raw; no line editing/echo emulation.
-- Named kernel objects share one namespace but no cross-process sharing.
-- `SuspendThread` races documented in thread.c (SIGUSR1-based).
-- musl build not attempted yet.
+- SEH table-based unwinding (x64 .pdata/.xwave) still not implemented.
+- MessageBox, dialogs, child windows, scrollbars: not implemented (stubs).
+- Graphics: only software rendering; Vulkan loader present but no
+  D3D/GL translation yet (`make bench` reports what exists).
+- musl build not attempted.
 
 ### Environment notes
 
-* mingw-w64 14.2 extracted locally under `/home/z/my-project/toolchain/root`
-  (no root on this box) — used ONLY to build test binaries.
-* Xvfb + libX11 + libvulkan present — GUI milestone testable here.
-* ASan/UBSan build (`make debug`) catches loader bugs: it found and we fixed
-  a missing export-table terminator and a stub-info realloc use-after-free.
+* Xvfb started automatically by the test runner for GUI cases.
+* ASan found and we fixed: missing msvcrt export terminator, stub-info
+  realloc use-after-free, XImage ABI offsets (my overlay struct had
+  wrong member alignment), GetMessage timer starvation (pure pump(-1)),
+  double-free in DestroyWindow.
 
 ### Next
 
-1. Fuzz the PE loader under ASan (tests/fuzz) + fix everything found.
-2. X11 backend (dlopen libX11) + user32/gdi32 vertical slice under Xvfb.
-3. Wayland backend (hand-marshalled wire protocol).
-4. Vulkan loader + surface + bench; D3D9/GL translation begins.
-5. Real-world app testing (Notepad-class tools, installers).
+1. PE-loader fuzzer under ASan (`make fuzz`) — hardening.
+2. Wayland surface path (xdg_shell + shm present + seat input).
+3. Vulkan: instance, surface via Xlib, swapchain; D3D9->Vulkan translation
+   start; `winnux bench` with real numbers.
+4. More Win32 surface: ws2_32 sockets, console input, more GDI (fonts,
+   dialogs), then real apps (Notepad-class, installers).
