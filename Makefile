@@ -24,7 +24,11 @@ OBJS    := $(patsubst src/%.c,$(OBJ)/%.o,$(SRCS))
 # into the product). Discovered via MXGCC env or PATH.
 MXGCC   ?= x86_64-w64-mingw32-gcc
 
-.PHONY: all clean debug check test fuzz
+# Install: put `winnux` on the user's PATH. Default is ~/.local/bin (no
+# root needed; on most distro default PATHs). Override: make install PREFIX=/usr/local
+INSTALL_PREFIX ?= $(HOME)/.local
+
+.PHONY: all clean debug check test fuzz install uninstall
 
 all: $(TARGET)
 
@@ -64,6 +68,19 @@ test check: $(TARGET)
 # PE-loader fuzzing (uses the sanitized debug build).
 fuzz: $(DBGTGT)
 	sh tests/fuzz/fuzz.sh
+
+install: $(TARGET)
+	mkdir -p $(INSTALL_PREFIX)/bin
+	install -m 755 $(TARGET) $(INSTALL_PREFIX)/bin/winnux
+	@echo "installed: $(INSTALL_PREFIX)/bin/winnux"
+	@case ":$$PATH:" in *":$(INSTALL_PREFIX)/bin:"*) \
+		echo "on PATH: yes";; \
+		*) echo "NOTE: $(INSTALL_PREFIX)/bin is not on your PATH - add it:"; \
+		echo "  export PATH=\"$$PATH:$(INSTALL_PREFIX)/bin\"  # in ~/.bashrc";; \
+	esac
+
+uninstall:
+	rm -f $(INSTALL_PREFIX)/bin/winnux
 
 clean:
 	rm -rf $(BIN) $(OBJ) $(DBGOBJ)

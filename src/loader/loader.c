@@ -313,69 +313,109 @@ wn_module *wn_module_load_exe(const char *host_path)
     return m;
 }
 
-/* DLL search: builtin registry first, then filesystem. */
+/* DLL search: builtin registry first, then filesystem.
+ * Names may arrive in any Windows shape: "kernel32", "KERNEL32.DLL",
+ * "C:\Windows\System32\kernel32.dll" (builtins win on basename match),
+ * or plain "myplugin.dll" (searched on disk, case-insensitively).
+ */
+/* Failed-load memo: apps retry missing optional DLLs; warn once, then fail
+ * quietly (still setting last error) so the log stays readable. */
+static char g_fail_memo[32][96];
+static int g_fail_memo_n;
+
+static void note_failed_load(const char *name)
+{
+    for (int i = 0; i < g_fail_memo_n; i++)
+        if (!strcmp(g_fail_memo[i], name))
+            return;                     /* already warned once */
+    if (g_fail_memo_n < 32) {
+        snprintf(g_fail_memo[g_fail_memo_n], sizeof g_fail_memo[0], "%s", name);
+        g_fail_memo_n++;
+    }
+    wn_log(WN_LOG_WARN, "loader: DLL '%s' not found -> ERROR_MOD_NOT_FOUND "
+           "(optional DLL; subsequent attempts fail quietly)", name);
+}
+
 wn_module *wn_module_load_dll(const char *name, const char *dir)
 {
-    /* Callers may pass full paths ("C:\windows\system32\kernel32.dll" -
-     * PuTTY does exactly that). Our builtins ARE the system32, so match on
-     * the basename; an explicit non-builtin path maps to the prefix and
-     * loads as a file. */
+    /* Basename + does it carry an extension? */
     const char *base = name;
     for (const char *p = name; p && *p; p++)
         if (*p == '\\' || *p == '/')
             base = p + 1;
-    const char *norm = wn_dll_normalize_name(base);
-
-    wn_module *found = wn_module_find(norm);
-    if (found) {
-        found->refcount++;
-        if (found->loading) {
-            wn_log(WN_LOG_WARN, "loader: circular import of '%s'", norm);
-        }
-        return found;
+    int had_path = base != name;      /* explicit path vs. bare search name */
+    const char *dot = strrchr(base, '.');
+    char with_ext[160];
+    if (!dot) {
+        /* Windows appends .dll when the name has none. */
+        snprintf(with_ext, sizeof with_ext, "%.*s.dll",
+                 (int)(sizeof with_ext - 5), base);
+        base = with_ext;
     }
 
-    /* Builtin? */
-    for (const wn_builtin_dll *b = wn_builtin_table; b->name; b++) {
-        if (wn_strcaseeq(b->name, norm)) {
-            wn_module *m = module_register(WN_MOD_BUILTIN, b->name, NULL);
-            m->builtin = b;
-            m->base = builtin_image();
-            m->size = 0x1000;
-            extern void wn_builtin_subsys_init(void);
-            wn_builtin_subsys_init();
-            if (b->init)
-                b->init();
-            wn_log(WN_LOG_DEBUG, "loader: builtin '%s' activated", m->name);
-            return m;
+    /* Already loaded? (case-insensitive; normalize api-sets) */
+    {
+        const char *norm = wn_dll_normalize_name(base);
+        wn_module *found = wn_module_find(norm);
+        if (found) {
+            found->refcount++;
+            if (found->loading)
+                wn_log(WN_LOG_WARN, "loader: circular import of '%s'", norm);
+            return found;
         }
     }
 
-    /* Explicit path? Try mapping it before the directory search. */
-    if (base != name) {
+    /* Builtin? (case-insensitive registry match) */
+    {
+        const char *norm = wn_dll_normalize_name(base);
+        for (const wn_builtin_dll *b = wn_builtin_table; b->name; b++) {
+            if (wn_strcaseeq(b->name, norm)) {
+                wn_module *m = module_register(WN_MOD_BUILTIN, b->name, NULL);
+                m->builtin = b;
+                m->base = builtin_image();
+                m->size = 0x1000;
+                extern void wn_builtin_subsys_init(void);
+                wn_builtin_subsys_init();
+                if (b->init)
+                    b->init();
+                wn_log(WN_LOG_DEBUG, "loader: builtin '%s' activated", m->name);
+                return m;
+            }
+        }
+    }
+
+    /* Explicit path? Try mapping it before the directory search. Windows
+     * appends .dll to extension-less paths too ("C:\dir\mylib" ->
+     * C:\dir\mylib.dll). */
+    if (had_path) {
         char host[2100];
-        if (wn_path_resolve_ci(name, host, sizeof host) == 0 ||
-            wn_path_win_to_host(name, host, sizeof host) == 0) {
-            struct stat st;
-            if (stat(host, &st) == 0 && S_ISREG(st.st_mode))
-                return load_pe(host, base, 0);
+        char with_ext_path[1100];
+        const char *cands[2] = { name, NULL };
+        size_t nl = strlen(name);
+        if (nl < sizeof with_ext_path - 5 &&
+            !(nl > 4 && !strncasecmp(name + nl - 4, ".dll", 4))) {
+            snprintf(with_ext_path, sizeof with_ext_path, "%s.dll", name);
+            cands[1] = with_ext_path;
         }
-        wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
-        wn_log(WN_LOG_ERR, "loader: DLL '%s' not found (path did not resolve)",
-               name);
+        for (int c = 0; cands[c]; c++) {
+            if (wn_path_resolve_ci(cands[c], host, sizeof host) == 0 ||
+                wn_path_win_to_host(cands[c], host, sizeof host) == 0) {
+                struct stat st;
+                if (stat(host, &st) == 0 && S_ISREG(st.st_mode))
+                    return load_pe(host, base, 0);
+            }
+        }
+        wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
+        note_failed_load(name);
         return NULL;
     }
 
-    /* Filesystem search. */
+    /* Filesystem search (case-insensitive per directory). */
     char cand[1100];
-    const char *fname = strrchr(name, '\\');
-    if (fname)
-        name = fname + 1;
     const char *dirs[6];
     int n = 0;
-    if (dir && *dir) {
+    if (dir && *dir)
         dirs[n++] = dir;
-    }
     char sysdir[1100];
     snprintf(sysdir, sizeof sysdir, "%s/drive_c/windows/system32",
              g_proc.prefix);
@@ -395,19 +435,20 @@ wn_module *wn_module_load_dll(const char *name, const char *dir)
         }
     }
     dirs[n++] = ".";
-    /* PATH entries. */
     for (int i = 0; i < n; i++) {
-        snprintf(cand, sizeof cand, "%s/%s", dirs[i], name);
-        struct stat st;
-        if (stat(cand, &st) == 0 && S_ISREG(st.st_mode)) {
-            wn_module *m = load_pe(cand, name, 0);
-            if (m)
-                return m;
-            return NULL;   /* load error already logged */
+        if (wn_path_lookup_ci(dirs[i], base, cand, sizeof cand)) {
+            struct stat st;
+            if (stat(cand, &st) == 0 && S_ISREG(st.st_mode)) {
+                wn_module *m = load_pe(cand, base, 0);
+                if (m)
+                    return m;
+                return NULL;   /* load error already logged */
+            }
         }
     }
-    wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
-    wn_log(WN_LOG_ERR, "loader: DLL '%s' not found (searched builtin, app "
+    wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
+    note_failed_load(name);
+    wn_log(WN_LOG_DEBUG, "loader: DLL '%s' not found (searched builtin, app "
            "dir, system32, windows, cwd)", name);
     return NULL;
 }

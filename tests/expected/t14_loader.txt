@@ -1,0 +1,15 @@
+0
+ok: LoadLibraryA("kernel32")
+ok: kernel32!Beep by bare-module handle
+ok: GetSystemDirectoryA
+ok: LoadLibraryA(system32\IMM32.DLL) case-insensitive
+ok: FindFirstFileA(system32\IMM32.DLL)
+ok: LoadLibraryA("wship6.dll") fails
+ok: GetLastError() == ERROR_MOD_NOT_FOUND
+ok: GetProcAddress missing fails
+ok: GetLastError() == ERROR_PROC_NOT_FOUND
+ok: GetModuleHandleA("KERNEL32")
+ok: module identity across case
+ok: GetWindowsDirectoryA
+ok: kernel32.dll file exists via windows dir path
+t14 loader: PASS (0 failures)

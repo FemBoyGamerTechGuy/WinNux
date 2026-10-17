@@ -88,6 +88,55 @@ static int file_exists(const char *p)
     return stat(p, &st) == 0;
 }
 
+/* Resolve the user-supplied app argument to a host path:
+ *   - absolute host path        (/home/z/putty.exe)
+ *   - relative host path        (./putty.exe, putty.exe)
+ *   - Windows drive path        (C:\apps\putty.exe, Z:\home\z\putty.exe)
+ *   - bare name                 (putty -> PATH search + .exe/.EXE probing)
+ * Requires g_proc.prefix to be decided (done in wn_process_create). */
+static char *resolve_app_path(const char *arg)
+{
+    size_t l = strlen(arg);
+    /* Windows drive letter? (Accept 'C:/...' too.) */
+    if (l >= 2 && arg[1] == ':' &&
+        ((arg[0] >= 'A' && arg[0] <= 'Z') || (arg[0] >= 'a' && arg[0] <= 'z'))) {
+        char host[2100];
+        if (wn_path_resolve_ci(arg, host, sizeof host) == 0 && file_exists(host))
+            return wn_xstrdup(host);
+        return NULL;
+    }
+    /* Host-style: absolute or relative. */
+    if (file_exists(arg))
+        return wn_xstrdup(arg);
+    if (arg[0] != '/' && arg[0] != '.' && !strchr(arg, '/')) {
+        /* Bare name: probe PATH (and cwd) with .exe/.EXE suffixes. */
+        static const char *exts[] = { "", ".exe", ".EXE", ".Exe", NULL };
+        char *found = NULL;
+        char dirbuf[8192];
+        const char *path_env = getenv("PATH");
+        snprintf(dirbuf, sizeof dirbuf, "%s", path_env ? path_env : "");
+        char *save = NULL;
+        for (char *d = strtok_r(dirbuf, ":", &save); d && !found;
+             d = strtok_r(NULL, ":", &save)) {
+            for (int e = 0; exts[e] && !found; e++) {
+                char cand[8600];
+                snprintf(cand, sizeof cand, "%s/%s%s", d, arg, exts[e]);
+                if (file_exists(cand))
+                    found = wn_xstrdup(cand);
+            }
+        }
+        /* cwd probes (strtok loop above only sees PATH dirs). */
+        for (int e = 0; exts[e] && !found; e++) {
+            char cand[4200];
+            snprintf(cand, sizeof cand, "%s%s", arg, exts[e]);
+            if (file_exists(cand))
+                found = wn_xstrdup(cand);
+        }
+        return found;
+    }
+    return NULL;
+}
+
 static int cmd_run(int argc, char **argv)
 {
     /* Options before the exe path. */
@@ -116,20 +165,32 @@ static int cmd_run(int argc, char **argv)
                 "[--log LEVEL] app.exe [args...]\n");
         return 2;
     }
-    const char *exe_path = argv[i];
-    if (!file_exists(exe_path)) {
-        fprintf(stderr, "winnux: cannot find '%s'\n", exe_path);
-        return 127;
-    }
+    const char *exe_arg = argv[i];
 
     wn_log_init();
-    if (wn_process_create(g_cli.prefix, exe_path) != 0)
+    if (wn_process_create(g_cli.prefix, exe_arg) != 0)
         return 1;
     if (wn_path_prefix_init(g_proc.prefix) != 0)
         return 1;
     wn_path_init_cwd_from_host();
     wn_registry_init();
     wn_module_init();
+    wn_dll_sync_placeholders();
+
+    /* Resolve the app path (host / windows / bare name + PATH). */
+    char *exe_path = resolve_app_path(exe_arg);
+    if (!exe_path) {
+        fprintf(stderr, "winnux: cannot find '%s' (looked in cwd, PATH, and "
+                "as a C:/Z: windows path)\n", exe_arg);
+        return 127;
+    }
+    /* Make it absolute: the guest sees argv[0] as a Windows path, and the
+     * working directory can legitimately change during startup. */
+    char abs_exe[4096];
+    if (realpath(exe_path, abs_exe))
+        snprintf(abs_exe, sizeof abs_exe, "%s", exe_path);   /* realpath failed: keep as-is */
+    free(exe_path);
+    exe_path = wn_xstrdup(abs_exe[0] ? abs_exe : exe_arg);
 
     wn_module *exe = wn_module_load_exe(exe_path);
     if (!exe)

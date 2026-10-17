@@ -40,6 +40,10 @@ void wn_path_init_cwd_from_host(void);
 /* The prefix directory (host form). */
 const char *wn_path_prefix(void);
 
+/* Case-insensitive lookup of `name` inside host dir `dir`. Returns 1 and
+ * fills out (size cap) with "<dir>/<actual-name>" on hit, 0 on miss. */
+int  wn_path_lookup_ci(const char *dir, const char *name, char *out, size_t cap);
+
 /* True when the Windows path names a directory-style device we do not
  * support (CON, NUL, ...): returns such device names for the caller to log. */
 const char *wn_path_is_device(const char *win);

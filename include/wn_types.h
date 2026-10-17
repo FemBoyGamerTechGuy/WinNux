@@ -78,11 +78,11 @@ typedef uint32_t wn_ntstatus;
 #define WN_ERR_ALREADY_EXISTS        183
 #define WN_ERR_FILE_EXISTS           80
 #define WN_ERR_INVALID_NAME          123
+#define WN_ERR_MOD_NOT_FOUND         126
+#define WN_ERR_PROC_NOT_FOUND        127
 #define WN_ERR_DIR_NOT_EMPTY         145
 #define WN_ERR_MORE_DATA             234
 #define WN_ERR_NO_MORE_ITEMS         259
-#define WN_ERR_MOD_NOT_FOUND         126
-#define WN_ERR_PROC_NOT_FOUND        127
 #define WN_ERR_NOT_OWNER             288
 #define WN_ERR_ENVVAR_NOT_FOUND      203
 

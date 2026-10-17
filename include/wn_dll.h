@@ -51,4 +51,11 @@ extern const wn_builtin_dll wn_builtin_table[];
  * Returns canonical name (static storage or the input). */
 const char *wn_dll_normalize_name(const char *name);
 
+/* Create placeholder files in <prefix>/drive_c/windows/system32 for every
+ * builtin DLL (Wine-style: the file exists so apps that stat it, enumerate
+ * it, or LoadLibrary it by full path succeed; the loader maps the basename
+ * to the in-process builtin). Idempotent; derives from wn_builtin_table at
+ * runtime so new builtins are picked up automatically. Returns 0 on success. */
+int  wn_dll_sync_placeholders(void);
+
 #endif /* WN_DLL_H */

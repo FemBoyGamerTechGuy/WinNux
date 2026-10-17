@@ -97,3 +97,42 @@ const char *wn_dll_normalize_name(const char *name)
         return "kernelbase.dll";   /* core/system api-sets -> kernel surface */
     return name;
 }
+
+/* --- placeholder file sync ---------------------------------------------------
+ * Every builtin gets a file in drive_c/windows/system32 so that stat(),
+ * FindFirstFile, and full-path LoadLibrary all see a Windows-shaped tree.
+ * The loader still resolves the *builtin* (basenames match builtins first),
+ * so these files are never parsed as PE. Wine uses the same trick.
+ * Idempotent; runs off wn_builtin_table so new builtins appear automatically.
+ */
+#include <stdio.h>
+#include <sys/stat.h>
+
+int wn_dll_sync_placeholders(void)
+{
+    char sysdir[2100];
+    snprintf(sysdir, sizeof sysdir, "%s/drive_c/windows/system32",
+             g_proc.prefix);
+    int made = 0;
+    for (const wn_builtin_dll *b = wn_builtin_table; b->name; b++) {
+        char path[2200];
+        snprintf(path, sizeof path, "%s/%s", sysdir, b->name);
+        struct stat st;
+        if (stat(path, &st) == 0)
+            continue;                     /* already present (any content) */
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            wn_log(WN_LOG_WARN, "prefix: cannot create placeholder %s", path);
+            continue;
+        }
+        /* Wine uses zero-byte files; a marker line is friendlier to humans
+         * poking at the tree, and costs nothing. */
+        fprintf(f, "WinNux builtin %s\n", b->name);
+        fclose(f);
+        made++;
+    }
+    if (made)
+        wn_log(WN_LOG_DEBUG, "prefix: created %d builtin placeholder(s) in "
+               "system32", made);
+    return 0;
+}

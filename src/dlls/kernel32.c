@@ -175,7 +175,7 @@ static WN_API wn_handle k32_GetModuleHandleA(const char *name)
         m = wn_module_find(buf);
     }
     if (!m) {
-        wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
+        wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
         return NULL;
     }
     return (wn_handle)(uintptr_t)m->base;
@@ -293,14 +293,14 @@ static WN_API uint32_t k32_GetModuleFileNameW(wn_handle mod, uint16_t *out, uint
 static wn_handle load_module_by_name(const char *name, int flags)
 {
     (void)flags;
+    /* The loader itself handles extension-less names (appends .dll),
+     * full system32 paths, and case-insensitivity. No blind retry here:
+     * a failed load must set ERROR_MOD_NOT_FOUND exactly once, quietly. */
     wn_module *m = wn_module_load_dll(name, NULL);
     if (!m) {
-        char buf[128];
-        snprintf(buf, sizeof buf, "%s.dll", name);
-        m = wn_module_load_dll(buf, NULL);
-    }
-    if (!m)
+        wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
         return NULL;
+    }
     return (wn_handle)(uintptr_t)m->base;
 }
 

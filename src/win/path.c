@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,22 +42,63 @@ static int mkdir_p(const char *path)
     return 0;
 }
 
+/* Current user name for the profile tree (Windows-style, no spaces). */
+static void prefix_user(char *out, size_t cap)
+{
+    const char *u = getenv("USER");
+    if (!u || !*u) {
+        struct passwd *pw = getpwuid(getuid());
+        u = pw ? pw->pw_name : "user";
+    }
+    /* Windows profile dirs munge spaces etc.; keep it simple + safe. */
+    size_t o = 0;
+    for (size_t i = 0; u[i] && o + 1 < cap; i++)
+        if (u[i] != ' ')
+            out[o++] = (u[i] >= 'A' && u[i] <= 'Z') ? (char)(u[i] + 32) : u[i];
+    out[o] = '\0';
+}
+
 int wn_path_prefix_init(const char *prefix)
 {
     if (mkdir_p(prefix) != 0) {
         wn_log(WN_LOG_ERR, "prefix: cannot create %s: %s", prefix, strerror(errno));
         return -1;
     }
+    char user[64];
+    prefix_user(user, sizeof user);
     char p[2100];
-    const char *dirs[] = { "drive_c", "drive_c/windows",
-                           "drive_c/windows/system32",
-                           "drive_c/windows/temp",
-                           "drive_c/Program Files", NULL };
+    char userdir[2100];
+    snprintf(userdir, sizeof userdir, "%s/drive_c/users/%s", prefix, user);
+    const char *dirs[] = {
+        "drive_c",
+        "drive_c/windows",
+        "drive_c/windows/system32",
+        "drive_c/windows/syswow64",      /* populated when 32-bit lands */
+        "drive_c/windows/temp",
+        "drive_c/Program Files",
+        "drive_c/Program Files (x86)",
+        "drive_c/users",
+        userdir,                         /* C:\Users\<name> */
+        "drive_c/users/Public",
+        NULL };
     for (int i = 0; dirs[i]; i++) {
-        snprintf(p, sizeof p, "%s/%s", prefix, dirs[i]);
+        if (dirs[i][0] == '/')
+            snprintf(p, sizeof p, "%s", dirs[i]);
+        else
+            snprintf(p, sizeof p, "%s/%s", prefix, dirs[i]);
         if (mkdir(p, 0777) != 0 && errno != EEXIST) {
             wn_log(WN_LOG_WARN, "prefix: cannot create %s: %s", p, strerror(errno));
             return -1;
+        }
+    }
+    /* Registry files exist (possibly empty) so tools can stat them. */
+    const char *regfiles[] = { "system.reg", "user.reg", "userdiff.reg", NULL };
+    for (int i = 0; regfiles[i]; i++) {
+        snprintf(p, sizeof p, "%s/%s", prefix, regfiles[i]);
+        if (access(p, F_OK) != 0) {
+            FILE *f = fopen(p, "w");
+            if (f)
+                fclose(f);
         }
     }
     return 0;
@@ -162,12 +204,10 @@ void wn_path_host_to_win(const char *host, char *out, size_t cap)
             *q = '\\';
 }
 
-/* Case-insensitive component resolution.
- * (The length guard below makes the snprintfs safe; GCC cannot prove it,
- * so the warning is locally disabled with a comment trail.) */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-static int ci_lookup(const char *dir, const char *name, char *out, size_t cap)
+/* Case-insensitive file lookup inside one host directory. Fills out with
+ * "<dir>/<actual-name>" when found (exact case first, then readdir scan).
+ * Returns 1 on hit, 0 on miss. Exported for the loader's DLL search. */
+int wn_path_lookup_ci(const char *dir, const char *name, char *out, size_t cap)
 {
     if (strlen(dir) + strlen(name) + 2 > cap)
         return 0;
@@ -190,6 +230,16 @@ static int ci_lookup(const char *dir, const char *name, char *out, size_t cap)
     }
     closedir(d);
     return found;
+}
+
+/* Case-insensitive component resolution.
+ * (The length guard below makes the snprintfs safe; GCC cannot prove it,
+ * so the warning is locally disabled with a comment trail.) */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+static int ci_lookup(const char *dir, const char *name, char *out, size_t cap)
+{
+    return wn_path_lookup_ci(dir, name, out, cap);
 }
 #pragma GCC diagnostic pop
 

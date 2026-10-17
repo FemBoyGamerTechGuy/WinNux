@@ -654,96 +654,121 @@ static int vformat_core(emit_fn emit, void *ctx, const char *fmt, char **ap)
 
 /* --- printf family ----------------------------------------------------------------------- */
 
-static WN_API int64_t ms_vsprintf(char *dst, const char *fmt, va_list ap);
-static WN_API int64_t ms_vsnprintf(char *dst, uint64_t cap, const char *fmt, va_list ap);
+/* MS-va_list note (2026-10, found via putty/t14 debugging):
+ * SysV <stdarg.h> va_list is an ARRAY type: passing it to another function
+ * passes its ADDRESS (by reference), so `ms_vsnprintf(..., va_list ap)` +
+ * `(char*)ap` read the va_list POINTER ITSELF as the first argument - every
+ * sprintf/snprintf with %s produced garbage. GCC lowers va_start correctly
+ * only when the walk stays inside one function.
+ *
+ * Correct model (matches Windows x64, where va_list is a plain char*):
+ *   - every variadic export uses __builtin_ms_va_start and extracts
+ *     `char *argp = (char *)ap` IN THE SAME FUNCTION;
+ *   - v-family exports take `char *ap` BY VALUE (that IS what guests pass);
+ *   - the formatter always receives char** and advances its own copy. */
+typedef __builtin_ms_va_list wn_ms_va;
 
-static WN_API int64_t ms_printf(const char *fmt, ...)
+static int64_t vprintf_impl(const char *fmt, char *argp)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    char *argp = (char *)ap;
     struct emit_fd e = { 1, isatty(1), 0 };
     vformat_core(emit_to_fd, &e, fmt, &argp);
-    va_end(ap);
     return (int64_t)e.total;
 }
 
-static WN_API int64_t ms_vprintf(const char *fmt, va_list ap)
+static int64_t vfprintf_impl(int fd, const char *fmt, char *argp)
 {
-    char *argp = (char *)ap;
-    struct emit_fd e = { 1, isatty(1), 0 };
+    struct emit_fd e = { fd, isatty(fd), 0 };
     vformat_core(emit_to_fd, &e, fmt, &argp);
     return (int64_t)e.total;
+}
+
+static int64_t vsprintf_impl(char *dst, const char *fmt, char *argp)
+{
+    struct emit_buf b = { dst, (size_t)-1 };
+    vformat_core(emit_to_buf, &b, fmt, &argp);
+    return (int64_t)strlen(dst);
+}
+
+static int64_t vsnprintf_impl(char *dst, uint64_t cap, const char *fmt,
+                              char *argp)
+{
+    if (!dst || cap == 0) {
+        /* measure only: count bytes. */
+        size_t total = 0;
+        vformat_core(emit_count, &total, fmt, &argp);
+        return (int64_t)total;
+    }
+    struct emit_buf b = { dst, (size_t)cap };
+    vformat_core(emit_to_buf, &b, fmt, &argp);
+    return (int64_t)strlen(dst);
+}
+
+static WN_API int64_t ms_printf(const char *fmt, ...)
+{
+    wn_ms_va ap;
+    __builtin_ms_va_start(ap, fmt);
+    int64_t r = vprintf_impl(fmt, (char *)ap);
+    __builtin_ms_va_end(ap);
+    return r;
+}
+
+/* v-family: Windows va_list is char* into the caller's spill area. */
+static WN_API int64_t ms_vprintf(const char *fmt, char *ap)
+{
+    return vprintf_impl(fmt, ap);
 }
 
 static WN_API int64_t ms_fprintf(wn_ms_file *f, const char *fmt, ...)
 {
     f = ms_file_of(f);
     if (!f) {
-        wn_log(WN_LOG_ERR, "msvcrt: fprintf(bad FILE* %p)", (void *)f);
+        wn_log(WN_LOG_ERR, "msvcrt: fprintf(bad FILE*) %p", (void *)f);
         return -1;
     }
-    va_list ap;
-    va_start(ap, fmt);
-    char *argp = (char *)ap;
-    struct emit_fd e = { f->fd, isatty(f->fd), 0 };
-    vformat_core(emit_to_fd, &e, fmt, &argp);
-    va_end(ap);
-    return (int64_t)e.total;
+    wn_ms_va ap;
+    __builtin_ms_va_start(ap, fmt);
+    int64_t r = vfprintf_impl(f->fd, fmt, (char *)ap);
+    __builtin_ms_va_end(ap);
+    return r;
 }
 
-static WN_API int64_t ms_vfprintf(wn_ms_file *f, const char *fmt, va_list ap)
+static WN_API int64_t ms_vfprintf(wn_ms_file *f, const char *fmt, char *ap)
 {
     f = ms_file_of(f);
     if (!f) {
-        wn_log(WN_LOG_ERR, "msvcrt: vfprintf(bad FILE*)");
+        wn_log(WN_LOG_ERR, "msvcrt: vfprintf(bad FILE*) %p", (void *)f);
         return -1;
     }
-    char *argp = (char *)ap;
-    struct emit_fd e = { f->fd, isatty(f->fd), 0 };
-    vformat_core(emit_to_fd, &e, fmt, &argp);
-    return (int64_t)e.total;
+    return vfprintf_impl(f->fd, fmt, ap);
 }
 
 static WN_API int64_t ms_sprintf(char *dst, const char *fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    int64_t r = ms_vsprintf(dst, fmt, ap);
-    va_end(ap);
+    wn_ms_va ap;
+    __builtin_ms_va_start(ap, fmt);
+    int64_t r = vsprintf_impl(dst, fmt, (char *)ap);
+    __builtin_ms_va_end(ap);
     return r;
 }
 
-static WN_API int64_t ms_vsprintf(char *dst, const char *fmt, va_list ap)
+static WN_API int64_t ms_vsprintf(char *dst, const char *fmt, char *ap)
 {
-    char *argp = (char *)ap;
-    struct emit_buf b = { dst, (size_t)-1 };
-    vformat_core(emit_to_buf, &b, fmt, &argp);
-    return (int64_t)strlen(dst);
+    return vsprintf_impl(dst, fmt, ap);
 }
 
 static WN_API int64_t ms_snprintf(char *dst, uint64_t cap, const char *fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    int64_t r = ms_vsnprintf(dst, cap, fmt, ap);
-    va_end(ap);
+    wn_ms_va ap;
+    __builtin_ms_va_start(ap, fmt);
+    int64_t r = vsnprintf_impl(dst, cap, fmt, (char *)ap);
+    __builtin_ms_va_end(ap);
     return r;
 }
 
-static WN_API int64_t ms_vsnprintf(char *dst, uint64_t cap, const char *fmt, va_list ap)
+static WN_API int64_t ms_vsnprintf(char *dst, uint64_t cap, const char *fmt,
+                                   char *ap)
 {
-    if (!dst || cap == 0) {
-        /* measure only: count bytes. */
-        char *argp = (char *)ap;
-        size_t total = 0;
-        vformat_core(emit_count, &total, fmt, &argp);
-        return (int64_t)total;
-    }
-    char *argp = (char *)ap;
-    struct emit_buf b = { dst, (size_t)cap };
-    vformat_core(emit_to_buf, &b, fmt, &argp);
-    return (int64_t)strlen(dst);
+    return vsnprintf_impl(dst, cap, fmt, ap);
 }
 
 static WN_API int64_t ms_puts(const char *s)
