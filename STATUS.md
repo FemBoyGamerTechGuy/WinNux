@@ -15,9 +15,18 @@ not observed.
 | **putty.exe** (official x64, MSVC) | **STARTS: all 348 imports resolve; creates a window** | Xvfb window tree shows `PuTTY: hidden timing window` (scripts/xprobe); fatal box "Unable to load any WinSock library" ELIMINATED by path-aware LoadLibrary + wsock32 |
 | 7zr.exe (32-bit) | analyzed only | `winnux imports` parses its PE32 import table; runtime = WoW64 TODO (P2) |
 
-PuTTY runs until its config dialog: remaining blockers are the dialog
-engine + child controls + GDI fonts (TODO.md P0). Its abort/SEH path calls
-RtlLookupFunctionEntry/RtlUnwind — confirming the SEH milestone priority.
+**UPDATE (same session): PuTTY's CONFIGURATION DIALOG EXISTS.** The dialog
+engine landed: .rsrc resource walking (FindResourceA/LoadResource/
+LockResource/SizeofResource), DLGTEMPLATE/DLGTEMPLATEEX parsing (incl. the
+EX item layout and MAKEINTRESOURCE id resolution), child windows with
+offscreen surfaces composed onto the parent, builtin control classes
+(Button/Edit/Static/ListBox/ComboBox), DialogBoxParam modal loop. Proof:
+`xprobe :95` shows `PuTTY Configuration` + the log shows its real control
+tree (STATIC/EDIT/BUTTON ids 1041..1050 from the embedded template), zero
+crashes; screenshot saved via scripts/xprobe. Remaining for putty: visual
+fidelity (window sizing/painting), dialog message navigation, GDI fonts —
+see TODO.md P0. Its abort/SEH path calls RtlLookupFunctionEntry/RtlUnwind —
+confirming the SEH milestone priority.
 
 ### New: `winnux imports <exe> [-v]`
 
