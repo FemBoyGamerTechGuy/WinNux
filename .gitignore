@@ -1,0 +1,23 @@
+# Build artifacts
+bin/
+obj/
+obj-dbg/
+*.o
+*.a
+
+# Test artifacts
+tests/bin/
+tests/results/
+tests/fuzz/corpus/
+tests/fuzz/crashes/
+*.exe
+
+# Editor / OS noise
+*~
+*.swp
+.DS_Store
+
+# Never commit secrets
+*.token
+*.secret
+.env
