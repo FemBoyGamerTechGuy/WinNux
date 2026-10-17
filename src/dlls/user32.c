@@ -1128,6 +1128,11 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
         g_bwin_count++;
     }
 
+    /* The backend creates X windows at (0,0); honor the requested position
+     * (owner-relative dialogs, apps that pre-position their windows). */
+    if ((x != 0 || y != 0) && be->win_move_resize)
+        be->win_move_resize(win->bwin, x, y, w, h);
+
     if (style & 0x10000000 /* WS_VISIBLE */)
         u32_ShowWindow((uint64_t)(uintptr_t)hwnd, 5);
 
@@ -2312,6 +2317,20 @@ static uint64_t create_dialog_from_template(uint64_t hinst,
     (void)menu;
     (void)cls;
     (void)tit;
+
+    /* DS_SETFONT templates carry a font section AFTER the title that must
+     * be skipped before the items, or every item parse misaligns (putty's
+     * About box rendered only 2 of its controls and NO text until this
+     * was fixed): DLGTEMPLATE: WORD pointsize + WCHAR fontname[];
+     * DLGTEMPLATEEX: WORD pointsize + WORD weight + BYTE italic +
+     * BYTE charset + WCHAR fontname[]. */
+    if (style & 0x40 /* DS_SETFONT */) {
+        p += is_ex ? 3 : 1;              /* pointsize(+weight/italic/charset) */
+        while (p < end && *p)            /* fontname (NUL-terminated UTF-16) */
+            p++;
+        p++;                             /* the NUL */
+        p = (const uint16_t *)dlg_dword_align(p);
+    }
 
     /* dialog window itself: class #32770, a TOP-LEVEL owned popup (the
      * WS_CHILD bit is never set for dialogs). Template coordinates are
