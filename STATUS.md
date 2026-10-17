@@ -61,6 +61,38 @@ via IsDialogMessage but no end-to-end session creation yet — see TODO P0).
 and sqlite3.exe (`SELECT id, upper(name)` → `1|ALPHA 2|BETA 3|GAMMA`)
 re-verified; putty 40s ASan/UBSan soak clean.
 
+### The X11 input path was dead — now it is alive (same session, part 2)
+
+Synthetic clicks (scripts/dev/xtree.c "click" mode, XSendEvent) proved the
+whole X11 event path had never worked: events reached handle_event, then
+vanished. Three bugs fixed:
+
+1. **win_for compared X window IDs against stored priv POINTERS** — could
+   never match, so Expose/Key/Button/Motion dispatch was all dead (painting
+   worked only because generate_paints drives present() from timers).
+   Fixed with a backend-local xwin→bwin map (x11_backend.c winmap_*).
+2. **xkey overlay had `uint32_t time`** where LP64 X11 `Time` is 8 bytes
+   (unsigned long) — every field after it shifted by 4: coordinates wrong,
+   button read from `state`. Fixed: time is uint64_t, x@64/y@68,
+   state@80, keycode/button@84.
+3. **Dialog windows were message black holes**: class #32770 used ctl_proc
+   which never forwarded to the guest dlgproc. Now every dialog message
+   (WM_COMMAND from controls, WM_CLOSE, ...) is routed to putty's dlgproc;
+   a synthetic click on the OK button makes putty's own handlers run
+   (proven: putty called RegisterWindowMessageA + ReleaseCapture in
+   direct response).
+
+Also: WS_VISIBLE children now set their visible flag at creation
+(previously only ShowWindow set it — dialog controls were invisible to
+hit-testing); SetCapture/ReleaseCapture/GetCapture (mouse capture routing)
+and RegisterWindowMessageA/W (ids ≥ 0xC000) are real.
+
+**Proof of the full chain**: XSendEvent click at (80,500) → x11 trace →
+user32 mouse handler (correct button + coords) → hit-test to the Button
+child → WM_LBUTTONDOWN → ctl_proc → WM_COMMAND → dialog proc → guest
+dlgproc → putty's handler code executes. Zero ASan/UBSan reports with
+clicks; 15/15 suite.
+
 ## Date: 2026-10-17 (session 3)
 
 ### Real applications (the headline)

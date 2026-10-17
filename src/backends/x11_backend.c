@@ -42,12 +42,13 @@ typedef struct {
 typedef struct {
     xany any;
     wnx_Window root, subwindow;
-    uint32_t time;
-    int32_t x, y, x_root, y_root;
-    uint32_t state;
-    uint32_t keycode;
-    int32_t same_screen;
-} xkey;                        /* also XButtonEvent shape */
+    uint64_t time;             /* LP64: Time is unsigned long = 8 bytes! */
+    int32_t x, y;              /* 64, 68 */
+    int32_t x_root, y_root;    /* 72, 76 */
+    uint32_t state;            /* 80 */
+    uint32_t keycode;          /* 84 — button number in XButtonEvent */
+    int32_t same_screen;       /* 88 */
+} xkey;                        /* XKeyEvent AND XButtonEvent shape */
 
 typedef struct {
     xany any;
@@ -237,6 +238,42 @@ typedef struct {
     wnx_Window xwin;
 } x11_win_priv;
 
+/* X window id -> wn_bwin map, owned by THIS backend. The old scheme
+ * (user32's g_bwins storing b->priv pointers and x11 comparing them
+ * against window IDs) never matched — the whole input/expose path was
+ * silently dead (found via synthetic clicks: events arrived at
+ * handle_event and then vanished in win_for). */
+#define X11_MAX_WINS 256
+static struct { wnx_Window xwin; wn_bwin *b; } g_winmap[X11_MAX_WINS];
+static int g_winmap_n;
+
+static void winmap_add(wnx_Window x, wn_bwin *b)
+{
+    if (g_winmap_n < X11_MAX_WINS) {
+        g_winmap[g_winmap_n].xwin = x;
+        g_winmap[g_winmap_n].b = b;
+        g_winmap_n++;
+    }
+}
+
+static void winmap_del(wnx_Window x)
+{
+    for (int i = 0; i < g_winmap_n; i++)
+        if (g_winmap[i].xwin == x) {
+            g_winmap[i] = g_winmap[g_winmap_n - 1];
+            g_winmap_n--;
+            return;
+        }
+}
+
+static wn_bwin *win_for(wnx_Window xwin)
+{
+    for (int i = 0; i < g_winmap_n; i++)
+        if (g_winmap[i].xwin == xwin)
+            return g_winmap[i].b;
+    return NULL;
+}
+
 static wn_bwin *x11_win_create(int w, int h, const char *title, void *userdata)
 {
     wn_bwin *b = wn_xcalloc(1, sizeof *b);
@@ -252,14 +289,17 @@ static wn_bwin *x11_win_create(int w, int h, const char *title, void *userdata)
     pXSelectInput(g_dpy, p->xwin, XEVENT_MASK);
     if (g_wm_delete)
         pXSetWMProtocols(g_dpy, p->xwin, &g_wm_delete, 1);
+    winmap_add(p->xwin, b);
     return b;
 }
 
 static void x11_win_destroy(wn_bwin *b)
 {
     x11_win_priv *p = b->priv;
-    if (p && p->xwin)
+    if (p && p->xwin) {
+        winmap_del(p->xwin);
         pXDestroyWindow(g_dpy, p->xwin);
+    }
     free(p);
     free(b->pixels);
     free(b);
@@ -308,12 +348,6 @@ static void dispatch(wn_bwin *b, int type, int x, int y, int val, int val2)
     wn_backend_event_cb(&ev);
 }
 
-/* Find the wn_bwin for an X window. */
-static wn_bwin *win_for(wnx_Window xwin)
-{
-    extern wn_bwin *wn_user32_bwin_for(void *xwin_ptr);
-    return wn_user32_bwin_for((void *)(uintptr_t)xwin);
-}
 
 static void handle_event(void *raw)
 {

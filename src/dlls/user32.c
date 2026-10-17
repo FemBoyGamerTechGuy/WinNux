@@ -103,6 +103,7 @@ static uint64_t g_paint_counter;
 /* focus + activation (single-GUI-thread model). */
 static uint64_t g_focus_hwnd;       /* 0 = unset */
 static uint64_t g_active_hwnd;      /* 0 = unset */
+static uint64_t g_capture_hwnd;    /* mouse capture window (SetCapture) */
 static uint64_t g_desktop_hwnd;     /* 0 = not created yet */
 
 /* hwnd registry (parallel to the handle table, for reverse lookup). */
@@ -278,16 +279,26 @@ void wn_backend_event_cb(const wn_backend_event *ev)
                  (uint64_t)(uint32_t)ev->val, 0);
         break;
     case WN_BEV_MOUSE_MOVE:
-        post_msg(h, WN_WM_MOUSEMOVE, 0,
+        post_msg(g_capture_hwnd ? g_capture_hwnd : h, WN_WM_MOUSEMOVE, 0,
                  (int64_t)(((uint64_t)(uint16_t)ev->x) |
                            ((uint64_t)(uint16_t)ev->y << 16)));
         break;
     case WN_BEV_MOUSE_BUTTON: {
+        wn_log(WN_LOG_TRACE, "user32: mouse button win=%llx val=%d btn=%d "
+               "at %d,%d", (unsigned long long)h, ev->val, ev->val2,
+               ev->x, ev->y);
         uint32_t msg = 0;
         uint64_t wp = 1 /* MK_LBUTTON */;
         if (ev->val2 == 1)      msg = ev->val ? WN_WM_LBUTTONDOWN : WN_WM_LBUTTONUP;
         else if (ev->val2 == 3) { msg = ev->val ? WN_WM_RBUTTONDOWN : WN_WM_RBUTTONUP; wp = 2; }
         if (msg) {
+            /* Captured window eats all button messages (Windows contract). */
+            if (g_capture_hwnd) {
+                post_msg(g_capture_hwnd, msg, wp,
+                         (int64_t)(((uint64_t)(uint16_t)ev->x) |
+                                   ((uint64_t)(uint16_t)ev->y << 16)));
+                break;
+            }
             /* hit-test: deliver to the deepest visible child under the
              * cursor, with coordinates translated to its origin. */
             uint64_t target = h;
@@ -528,6 +539,53 @@ static WN_API uint64_t u32_GetActiveWindow(void)
 static WN_API uint64_t u32_GetForegroundWindow(void)
 {
     return g_active_hwnd;
+}
+
+/* --- mouse capture + registered messages ------------------------------------
+ * SetCapture/ReleaseCapture route mouse messages to the captured window;
+ * RegisterWindowMessage returns a unique id >= 0xC000 (Windows contract).
+ * Putty's button handlers call ReleaseCapture on every click. */
+static uint32_t g_next_regmsg = 0xC000;
+
+static WN_API uint64_t u32_SetCapture(uint64_t hwnd)
+{
+    uint64_t old = g_capture_hwnd;
+    if (win_from_hwnd(hwnd))
+        g_capture_hwnd = hwnd;
+    return old;
+}
+
+static WN_API int32_t u32_ReleaseCapture(void)
+{
+    int32_t had = g_capture_hwnd != 0;
+    g_capture_hwnd = 0;
+    return had;
+}
+
+static WN_API uint64_t u32_GetCapture(void)
+{
+    return g_capture_hwnd;
+}
+
+static WN_API uint32_t u32_RegisterWindowMessageA(const char *name)
+{
+    if (!name || !*name) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (g_next_regmsg >= 0xFFFF)
+        return 0;
+    wn_log(WN_LOG_DEBUG, "user32: RegisterWindowMessageA('%s') -> 0x%04X",
+           name, g_next_regmsg);
+    return g_next_regmsg++;
+}
+
+static WN_API uint32_t u32_RegisterWindowMessageW(const uint16_t *name)
+{
+    char *a = name ? wn_utf16_to_utf8(name, 256) : NULL;
+    uint32_t r = a ? u32_RegisterWindowMessageA(a) : 0;
+    free(a);
+    return r;
 }
 
 /* Desktop pseudo-window: offscreen surface, no backend window, never shown.
@@ -866,6 +924,11 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
         user32_set_wtext_utf8(win, win->title);
         win->style = style;
         win->ex_style = ex_style;
+        /* WS_VISIBLE children must be hit-testable/composable immediately:
+         * the dialog engine creates children with WS_VISIBLE and never
+         * calls ShowWindow on them (found via putty: clicks fell through
+         * to the dialog because every child's visible flag was 0). */
+        win->visible = (style & 0x10000000u) ? 1 : 0;
         win->bwin = wn_xcalloc(1, sizeof(wn_bwin));
         win->bwin->width = win->cw;
         win->bwin->height = win->ch;
@@ -1593,6 +1656,18 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
         return 0;
+    /* #32770 dialog: every message goes to the guest dlgproc (WM_COMMAND
+     * from child controls, WM_CLOSE, ...). Without this the dialog was a
+     * black hole: clicks produced WM_COMMANDs that vanished in ctl_proc's
+     * default case. */
+    if (w->is_dialog && w->dlgproc) {
+        typedef WN_API int64_t (*dlgproc_fn)(uint64_t, uint32_t, uint64_t,
+                                             int64_t);
+        int64_t r = ((dlgproc_fn)(uintptr_t)w->dlgproc)(hwnd, msg, wp, lp);
+        if (r)
+            return (uint64_t)r;
+        return u32_DefWindowProcA(hwnd, msg, wp, lp);
+    }
     const char *cls = w->cls ? w->cls->name : "";
     ctl_kind k = ctl_kind_of(cls);
     switch (msg) {
@@ -2504,6 +2579,11 @@ const wn_export_entry wn_user32_exports[] = {
     { "SetWindowPos", u32_SetWindowPos },
     { "ShowWindow", u32_ShowWindow },
     { "MoveWindow", u32_MoveWindow },
+    { "SetCapture", u32_SetCapture },
+    { "ReleaseCapture", u32_ReleaseCapture },
+    { "GetCapture", u32_GetCapture },
+    { "RegisterWindowMessageA", u32_RegisterWindowMessageA },
+    { "RegisterWindowMessageW", u32_RegisterWindowMessageW },
     { "TranslateMessage", u32_TranslateMessage },
     { "UpdateWindow", u32_UpdateWindow },
     { "DialogBoxParamA", u32_DialogBoxParamA },
