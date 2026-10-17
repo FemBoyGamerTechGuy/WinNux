@@ -103,6 +103,17 @@ MsgWaitForMultipleObjects (queue-aware wait with 0-timeout handle
 probes through the sync engine). Push buttons now draw 3D frames +
 dotted focus rects; disabled controls paint gray text (COLOR_GRAYTEXT).
 
+### Dialog-engine fixes found by the About-box screenshots
+
+DS_SETFONT dialog templates carry a font section after the title
+(pointsize + fontname, plus weight/italic/charset in EX form) that the
+item parser did not skip — every item after the first misaligned, which
+is why putty's About box created only 2 controls and rendered no text.
+With the skip: the About box renders its full text (595 dark + 1532
+antialiased pixels measured in the region). Top-level windows also
+honor their requested creation position now (X windows were born at
+(0,0); the About box lands at (280,160), fully on-screen).
+
 ### 32-bit (WoW64) groundwork — source-level
 
 `make check32` compiles the whole tree with -m32 (i386) when a multilib
@@ -123,8 +134,12 @@ the runtime (Wine's model: 32-bit process, 32-bit X11 via dlopen).
 15/15 tests (t14/t15 updated: wship6 is now a real DLL so the
 missing-DLL test uses a permanently-missing name; text-extent checks
 accept proportional metrics). lua.exe and sqlite3.exe re-verified.
-Putty: 40s ASan soak clean; interactions verified via xtree (clicks,
-key typing, About modal cycle, WM_DELETE close). Known gaps: putty's
+Putty: 40s ASan soak clean (x2); interactions verified via xtree
+(clicks, key typing, About modal cycle, WM_DELETE close). ASan exit-time
+notes: memory CORRUPTION is zero everywhere; LeakSanitizer still flags
+the per-thread TEB allocation (24B, freed-never at process death —
+freeing it inside wn_process_exit is riskier than the leak) — the
+exe_path strdup leak from cmd_run was fixed. Known gaps: putty's
 Open button fires WM_COMMAND(BN_CLICKED) into its dlgproc but no
 session launch follows (next session's target: trace the wndproc path
 from WM_COMMAND to launch — likely needs the config→registry save and

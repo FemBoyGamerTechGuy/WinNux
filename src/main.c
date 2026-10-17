@@ -215,7 +215,9 @@ static int cmd_run(int argc, char **argv)
     if (!wn_thread_create(exe->pe.stack_reserve, guest_entry_shim, 0, 0, &th, NULL))
         return 1;
     pthread_join(th->pthread, NULL);
-    wn_process_exit(g_proc.exe ? 0 : 0);
+    int rv = g_proc.exe ? 0 : 0;
+    free(exe_path);   /* exit-time leak flagged by LeakSanitizer */
+    wn_process_exit(rv);
     return 0;
 }
 
