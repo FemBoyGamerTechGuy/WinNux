@@ -56,9 +56,9 @@ static int wl_connect(const char *socket_name)
         close(fd);
         return -1;
     }
-    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%.107s", path);
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
-        wn_log(WN_LOG_INFO, "wayland: connect %s: %s", path, strerror(errno));
+        wn_log(WN_LOG_INFO, "wayland: connect failed: %s", strerror(errno));
         close(fd);
         return -1;
     }

@@ -14,6 +14,7 @@
 #include "wn_dll.h"
 #include "wn_pe.h"
 #include "wn_util.h"
+#include "wn_vulkan_loader.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -163,11 +164,16 @@ static int cmd_bench(void)
     printf("WinNux %s bench (%s, %d cpus visible)\n", WINNUX_VERSION,
            "x86_64-linux", (int)sysconf(_SC_NPROCESSORS_ONLN));
 
-    /* Loader throughput: map+reloc a synthetic PE repeatedly. */
-    const char *exe = "bin/winnux";
+    /* Loader throughput: map+reloc a real Windows PE repeatedly. */
+    const char *seed = NULL;
     struct stat st;
-    if (stat(exe, &st) == 0 && st.st_size > 0x400) {
-        FILE *f = fopen(exe, "rb");
+    static const char *cands[] = { "tests/bin/t01_hello_write.exe",
+                                   "tests/bin/t02_hello_printf.exe", NULL };
+    for (int i = 0; cands[i] && !seed; i++)
+        if (stat(cands[i], &st) == 0)
+            seed = cands[i];
+    if (seed && st.st_size > 0x400) {
+        FILE *f = fopen(seed, "rb");
         if (f) {
             uint8_t *data = wn_xmalloc((size_t)st.st_size);
             size_t got = fread(data, 1, (size_t)st.st_size, f);
@@ -178,17 +184,22 @@ static int cmd_bench(void)
                 uint64_t t0 = wn_monotonic_ns();
                 for (int i = 0; i < N; i++) {
                     wn_pe_image img;
-                    if (wn_pe_map(data, got, exe, &img) == 0)
+                    if (wn_pe_map(data, got, seed, &img) == 0) {
+                        wn_pe_apply_relocations(&img);
                         wn_pe_unmap(&img);
+                    }
                 }
                 uint64_t t1 = wn_monotonic_ns();
-                printf("  pe-map:      %d mappings in %.2f ms (%.2f us/map)\n",
-                       N, (t1 - t0) / 1e6, (t1 - t0) / 1e3 / N);
+                printf("  pe-map:      %d map+reloc in %.2f ms (%.2f us/image, "
+                       "%.1f MB/s)\n", N, (t1 - t0) / 1e6, (t1 - t0) / 1e3 / N,
+                       (double)got * N / ((t1 - t0) / 1e9) / 1e6);
             } else {
-                printf("  pe-map:      skipped (not a PE; host ELF)\n");
+                printf("  pe-map:      seed invalid\n");
             }
             free(data);
         }
+    } else {
+        printf("  pe-map:      no PE seed (run make test first)\n");
     }
 
     /* futex ping-pong cost. */
@@ -202,7 +213,8 @@ static int cmd_bench(void)
         printf("  futex-wake:  %d no-op wakes in %.2f ms\n", N, (t1 - t0) / 1e6);
     }
 
-    /* Software memset throughput (GDI path preview). */
+    /* Software fill throughput (GDI path) — checksummed so it cannot be
+     * optimized away. */
     {
         size_t bytes = 64u << 20;
         uint8_t *b = malloc(bytes);
@@ -210,20 +222,17 @@ static int cmd_bench(void)
             uint64_t t0 = wn_monotonic_ns();
             memset(b, 0x5A, bytes);
             uint64_t t1 = wn_monotonic_ns();
-            printf("  memset:      %.2f GB/s\n", bytes / ((t1 - t0) / 1e9) / 1e9);
+            volatile uint64_t sink = 0;
+            for (size_t i = 0; i < bytes; i += 4096)
+                sink += b[i];
+            printf("  memset:      %.2f GB/s (checksum %llu)\n",
+                   (double)bytes / ((t1 - t0) / 1e9) / 1e9,
+                   (unsigned long long)sink);
             free(b);
         }
     }
 
-    /* Vulkan availability (dlopen only). */
-    {
-        void *v = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-        if (v)
-            printf("  vulkan:      loader present (instance+surface: graphics "
-                   "stack pending, see STATUS.md)\n");
-        else
-            printf("  vulkan:      not available (software fallback path)\n");
-    }
+    wn_vk_report();
     return 0;
 }
 
