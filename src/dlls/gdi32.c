@@ -11,7 +11,9 @@
 #include "wn_handle.h"
 #include "wn_log.h"
 #include "wn_util.h"
+#include "wn_font.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,6 +46,7 @@ typedef struct gdi_obj {
         int bk_mode;                /* TRANSPARENT=1, OPAQUE=2 */
         int cur_x, cur_y;           /* MoveTo position */
         struct gdi_obj *cur_bitmap;
+        struct gdi_obj *cur_font;   /* selected HFONT (NULL = default) */
     } dc;
     /* object state */
     uint32_t color;                 /* brush/pen COLORREF */
@@ -53,6 +56,12 @@ typedef struct gdi_obj {
         int bpp;
         int bottom_up;
     } bmp;
+    struct {                        /* font (LOGFONT distilled) */
+        int height;                 /* requested cell height (px, >0) */
+        int weight;                 /* >=700 = bold */
+        int italic;
+        char face[64];              /* informational */
+    } font;
 } gdi_obj;
 
 static wn_handle gdi_new(gdi_obj *o)
@@ -107,60 +116,119 @@ static void fill_rect_rgb(gdi_obj *dc, int l, int t, int r, int b, uint32_t rgb)
     }
 }
 
-/* --- text (backend server-side rasterizer, glyph cache) --------------------------- */
+/* --- text: embedded bitmap font engine ----------------------------------------------
+ *
+ * Every glyph is an 8x16 1-bit cell (wn_font.h). We nearest-neighbor scale
+ * to the font's cell height; bold/italic pick their atlas, with a synthesis
+ * fallback (bold = OR with 1px shift, italic = 1px shear).
+ */
 
-typedef struct {
-    int w, h;
-    uint32_t *rgb;      /* glyph pixels, 0 = transparent */
-} glyph;
-
-static glyph *g_glyphs[256];
-
-static glyph *glyph_get(unsigned char c)
+/* effective metrics for the DC's current font */
+static void font_metrics(gdi_obj *dc, int *cell_h, int *adv)
 {
-    extern int wn_backend_glyph_render(unsigned char c, int *w, int *h,
-                                       uint32_t **rgb);
-    if (c == 0)
-        return NULL;
-    if (!g_glyphs[c]) {
-        int w, h;
-        uint32_t *rgb;
-        if (wn_backend_glyph_render(c, &w, &h, &rgb) != 0)
-            return NULL;
-        glyph *g = wn_xmalloc(sizeof *g);
-        g->w = w;
-        g->h = h;
-        g->rgb = rgb;
-        g_glyphs[c] = g;
+    int h = WN_FONT_CELL_H;
+    if (dc->dc.cur_font && dc->dc.cur_font->font.height > 0)
+        h = dc->dc.cur_font->font.height;
+    if (h < 5)
+        h = 5;
+    *cell_h = h;
+    *adv = (h * WN_FONT_ADVANCE + WN_FONT_CELL_H - 1) / WN_FONT_CELL_H;
+}
+
+static void draw_glyph_cell(gdi_obj *dc, const unsigned char *rows,
+                            int x, int y, int cell_h, uint32_t rgb)
+{
+    for (int py = 0; py < cell_h; py++) {
+        int sy = py * WN_FONT_CELL_H / cell_h;
+        if (sy >= WN_FONT_CELL_H)
+            sy = WN_FONT_CELL_H - 1;
+        unsigned char row = rows[sy];
+        int dy = dc->dc.dib_bottom_up ? dc->dc.h - 1 - (y + py) : y + py;
+        if (dy < 0 || dy >= dc->dc.h)
+            continue;
+        uint8_t *line = dc->dc.pixels + (size_t)dy * dc->dc.stride;
+        for (int px = 0; px < WN_FONT_ADVANCE; px++) {
+            if (!(row & (0x80 >> px)))
+                continue;
+            int sx = px;
+            int dx = x + px;
+            if (dx < 0 || dx >= dc->dc.w)
+                continue;
+            (void)sx;
+            put_px(line + (size_t)dx * 4, rgb);
+        }
     }
-    return g_glyphs[c];
+}
+
+/* map one UTF-16 codepoint to atlas rows (never NULL: missing box) */
+static const unsigned char *glyph_rows(uint32_t cp, gdi_obj *dc)
+{
+    int bold = dc->dc.cur_font && dc->dc.cur_font->font.weight >= 700;
+    int ital = dc->dc.cur_font && dc->dc.cur_font->font.italic;
+    const unsigned char *g = wn_font_glyph(cp, bold, ital);
+    if (g)
+        return g;
+    /* synthesis fallback: base glyph + style transform is approximated by
+     * drawing the plain glyph twice with 1px offset (bold) */
+    if ((bold || ital) && cp <= 0xFF) {
+        g = wn_font_glyph(cp, 0, 0);
+        if (g)
+            return g;
+    }
+    return wn_font_missing();
+}
+
+/* UTF-16 text draw; returns the x advance consumed. */
+static int draw_text16(gdi_obj *dc, int x, int y,
+                       const uint16_t *s, size_t n)
+{
+    uint32_t rgb = colorref_to_u32(dc->dc.text_color);
+    uint32_t bk = colorref_to_u32(dc->dc.bk_color);
+    int cell_h, adv;
+    font_metrics(dc, &cell_h, &adv);
+    int bold = dc->dc.cur_font && dc->dc.cur_font->font.weight >= 700;
+    int cx = x;
+    for (size_t i = 0; i < n; i++) {
+        if (!s[i])
+            break;
+        const unsigned char *g = glyph_rows(s[i], dc);
+        if (dc->dc.bk_mode == 2 /*OPAQUE*/)
+            fill_rect_rgb(dc, cx, y, cx + adv, y + cell_h, bk);
+        draw_glyph_cell(dc, g, cx, y, cell_h, rgb);
+        if (bold) {
+            /* bold synthesis when only the book glyph exists */
+            if (s[i] <= 0xFF && !wn_font_glyph(s[i], 1, 0) &&
+                wn_font_glyph(s[i], 0, 0))
+                draw_glyph_cell(dc, g, cx + 1, y, cell_h, rgb);
+        }
+        cx += adv;
+    }
+    return cx - x;
+}
+
+/* Default DC font lazily materialized so cur_font is always valid. */
+static gdi_obj *default_font(gdi_obj *dc)
+{
+    static gdi_obj *def;
+    (void)dc;
+    if (!def) {
+        def = wn_xcalloc(1, sizeof *def);
+        def->kind = GDI_FONT;
+        def->font.height = WN_FONT_CELL_H;
+        def->font.weight = 400;
+        snprintf(def->font.face, sizeof def->font.face, "System");
+    }
+    return def;
 }
 
 static void draw_text_into(gdi_obj *dc, int x, int y, const char *s, size_t n)
 {
-    uint32_t rgb = colorref_to_u32(dc->dc.text_color);
-    uint32_t bgrgb = colorref_to_u32(dc->dc.bk_color);
-    int cx = x;
-    for (size_t i = 0; i < n; i++) {
-        glyph *g = glyph_get((unsigned char)s[i]);
-        if (!g)
-            continue;
-        if (dc->dc.bk_mode == 2 /* OPAQUE */)
-            fill_rect_rgb(dc, cx, y, cx + g->w, y + g->h, bgrgb);
-        for (int gy = 0; gy < g->h; gy++) {
-            int dy = dc->dc.dib_bottom_up ? dc->dc.h - 1 - (y + gy) : y + gy;
-            if (dy < 0 || dy >= dc->dc.h)
-                continue;
-            for (int gx = 0; gx < g->w; gx++) {
-                int dx = cx + gx;
-                if (dx < 0 || dx >= dc->dc.w)
-                    continue;
-                if (g->rgb[gy * g->w + gx] & 0xFFFFFF)
-                    put_px(dc->dc.pixels + (size_t)dy * dc->dc.stride + dx * 4, rgb);
-            }
-        }
-        cx += g->w;
-    }
+    /* ANSI entry: treat bytes as Latin-1 (maps onto the atlas directly). */
+    uint16_t w[4096];
+    size_t m = n < 4096 ? n : 4096;
+    for (size_t i = 0; i < m; i++)
+        w[i] = (unsigned char)s[i];
+    draw_text16(dc, x, y, w, m);
 }
 
 /* --- window DCs ---------------------------------------------------------------------- */
@@ -313,9 +381,21 @@ static WN_API wn_handle g32_CreateDIBSection(wn_handle hdc, const void *bmi,
 static WN_API wn_handle g32_SelectObject(wn_handle hdc, wn_handle obj)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_MEMORY);
-    gdi_obj *o = gdi_get(obj, GDI_BITMAP);
-    if (!dc || !o) {
-        /* Selecting brushes/pens into DCs is state we do not need yet. */
+    if (!dc)
+        return (wn_handle)0;
+    gdi_obj *o = wn_handle_get(obj, WN_HTYPE_GFX) ?
+                 ((wn_object *)wn_handle_get(obj, WN_HTYPE_GFX))->ptr : NULL;
+    if (!o)
+        return (wn_handle)0;
+    if (o->kind == GDI_FONT) {
+        wn_handle old = (wn_handle)(uintptr_t)dc->dc.cur_font;
+        if (!old)
+            old = (wn_handle)(uintptr_t)default_font(dc);
+        dc->dc.cur_font = o;
+        return old;
+    }
+    if (o->kind != GDI_BITMAP) {
+        /* brushes/pens: accepted, state not tracked yet */
         return (wn_handle)0;
     }
     wn_handle old = (wn_handle)0;
@@ -413,7 +493,7 @@ WN_API uint32_t g32_SetTextColor(wn_handle hdc, uint32_t color)
     return old;
 }
 
-static WN_API uint32_t g32_SetBkColor(wn_handle hdc, uint32_t color)
+WN_API uint32_t g32_SetBkColor(wn_handle hdc, uint32_t color)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
     if (!dc)
@@ -440,6 +520,8 @@ WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
     if (!dc || !s)
         return 0;
     size_t n = count < 0 ? strlen(s) : (size_t)count;
+    if (!dc->dc.cur_font)
+        dc->dc.cur_font = default_font(dc);
     draw_text_into(dc, x, y, s, n);
     return 1;
 }
@@ -447,12 +529,20 @@ WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
 static WN_API int32_t g32_TextOutW(wn_handle hdc, int x, int y,
                                    const uint16_t *s, int32_t count)
 {
-    char *a = wn_utf16_to_utf8(s, count < 0 ? 4096 : (size_t)count);
-    if (!a)
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !s)
         return 0;
-    int32_t r = g32_TextOutA(hdc, x, y, a, (int32_t)strlen(a));
-    free(a);
-    return r;
+    size_t n = 0;
+    if (count < 0) {
+        while (s[n] && n < 65536)
+            n++;
+    } else {
+        n = (size_t)count;
+    }
+    if (!dc->dc.cur_font)
+        dc->dc.cur_font = default_font(dc);
+    draw_text16(dc, x, y, s, n);
+    return 1;
 }
 
 static WN_API uint32_t g32_SetPixel(wn_handle hdc, int32_t x, int32_t y, uint32_t color)
@@ -511,7 +601,7 @@ static WN_API int32_t g32_LineTo(wn_handle hdc, int32_t x, int32_t y)
     return 1;
 }
 
-static WN_API int32_t g32_Rectangle(wn_handle hdc, int l, int t, int r, int b)
+WN_API int32_t g32_Rectangle(wn_handle hdc, int l, int t, int r, int b)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
     if (!dc)
@@ -634,10 +724,335 @@ static WN_API int32_t g32_GetDeviceCaps(wn_handle hdc, int32_t idx)
 
 /* --- export table ----------------------------------------------------------------------------- */
 
+/* --- fonts --------------------------------------------------------------------------- */
+
+/* LOGFONTA x64: lfHeight@0(4), lfWidth@4, lfEscapement@8, lfOrientation@0xC,
+ * lfWeight@0x10, lfItalic@0x14(byte), lfUnderline@0x15, lfStrikeOut@0x16,
+ * lfCharSet@0x17, lfOutPrecision@0x18, ..., lfFaceName@0x1C[32]. */
+
+static gdi_obj *font_from_logfont(const void *lf, int wide)
+{
+    if (!lf)
+        return NULL;
+    gdi_obj *f = wn_xcalloc(1, sizeof *f);
+    f->kind = GDI_FONT;
+    const uint8_t *b = lf;
+    int32_t h = *(const int32_t *)(const void *)b;
+    f->font.height = h < 0 ? -h + (h < -12 ? 4 : 3)   /* char height -> cell */
+                  : (h > 0 ? h : WN_FONT_CELL_H);
+    if (f->font.height < 5)
+        f->font.height = 5;
+    f->font.weight = *(const int32_t *)(const void *)(b + 0x10);
+    f->font.italic = b[0x14] ? 1 : 0;
+    const char *face = wide ? NULL : (const char *)(b + 0x1C);
+    if (wide) {
+        const uint16_t *wface = (const uint16_t *)(const void *)(b + 0x1C);
+        char *d = f->font.face;
+        for (size_t i = 0; i + 1 < sizeof f->font.face && wface[i]; i++)
+            d[i] = (char)(wface[i] < 128 ? wface[i] : '?');
+    } else if (face) {
+        snprintf(f->font.face, sizeof f->font.face, "%.*s",
+                 (int)sizeof f->font.face - 1, face);
+    }
+    return f;
+}
+
+static WN_API wn_handle g32_CreateFontIndirectA(const void *lf)
+{
+    gdi_obj *f = font_from_logfont(lf, 0);
+    return f ? gdi_new(f) : (wn_handle)0;
+}
+
+static WN_API wn_handle g32_CreateFontIndirectW(const void *lf)
+{
+    gdi_obj *f = font_from_logfont(lf, 1);
+    return f ? gdi_new(f) : (wn_handle)0;
+}
+
+/* CreateFontA/W: 14 args, all in registers+stack; distill into LOGFONTA. */
+static WN_API wn_handle g32_CreateFontA(int32_t height, int32_t width,
+                                        int32_t escapement, int32_t orient,
+                                        int32_t weight, uint32_t italic,
+                                        uint32_t underline, uint32_t strike,
+                                        uint32_t charset, uint32_t outprec,
+                                        uint32_t clipprec, uint32_t quality,
+                                        uint32_t pitch, const char *face)
+{
+    uint8_t lf[0x3C];
+    memset(lf, 0, sizeof lf);
+    *(int32_t *)(void *)lf = height;
+    *(int32_t *)(void *)(lf + 0x10) = weight;
+    lf[0x14] = (uint8_t)italic;
+    lf[0x15] = (uint8_t)underline;
+    lf[0x16] = (uint8_t)strike;
+    lf[0x17] = (uint8_t)charset;
+    if (face)
+        snprintf((char *)lf + 0x1C, 32, "%.*s", 31, face);
+    (void)width; (void)escapement; (void)orient;
+    (void)outprec; (void)clipprec; (void)quality; (void)pitch;
+    return g32_CreateFontIndirectA(lf);
+}
+
+static WN_API wn_handle g32_CreateFontW(int32_t height, int32_t width,
+                                        int32_t escapement, int32_t orient,
+                                        int32_t weight, uint32_t italic,
+                                        uint32_t underline, uint32_t strike,
+                                        uint32_t charset, uint32_t outprec,
+                                        uint32_t clipprec, uint32_t quality,
+                                        uint32_t pitch, const uint16_t *face)
+{
+    char aface[32] = "";
+    if (face) {
+        size_t i = 0;
+        while (face[i] && i < 31) {
+            aface[i] = (char)(face[i] < 128 ? face[i] : '?');
+            i++;
+        }
+    }
+    return g32_CreateFontA(height, width, escapement, orient, weight, italic,
+                           underline, strike, charset, outprec, clipprec,
+                           quality, pitch, aface);
+}
+
+/* TEXTMETRICA x64: tmHeight@0(4), tmAscent@4, tmDescent@8, tmInternalLeading@0xC,
+ * tmExternalLeading@0x10, tmAveCharWidth@0x14, tmMaxCharWidth@0x18,
+ * tmWeight@0x1C, tmItalic@0x20 ... tmPitchAndFamily@0x54. 56+ bytes. */
+static WN_API int32_t g32_GetTextMetricsA(wn_handle hdc, void *tm)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !tm)
+        return 0;
+    gdi_obj *f = dc->dc.cur_font ? dc->dc.cur_font : default_font(dc);
+    int cell_h, adv;
+    font_metrics(dc, &cell_h, &adv);
+    memset(tm, 0, 0x58);
+    int32_t *v = tm;
+    v[0] = cell_h;                        /* tmHeight */
+    v[1] = cell_h - 3;                    /* tmAscent */
+    v[2] = 3;                             /* tmDescent */
+    v[3] = 2;                             /* tmInternalLeading */
+    v[4] = 0;                             /* tmExternalLeading */
+    v[5] = adv;                           /* tmAveCharWidth */
+    v[6] = adv;                           /* tmMaxCharWidth */
+    v[7] = f->font.weight;                /* tmWeight */
+    ((uint8_t *)tm)[0x20] = (uint8_t)f->font.italic;
+    ((uint8_t *)tm)[0x54] = 0x01;         /* FIXED_PITCH-ish */
+    return 1;
+}
+
+static WN_API int32_t g32_GetTextMetricsW(wn_handle hdc, void *tm)
+{
+    return g32_GetTextMetricsA(hdc, tm);   /* same layout for the fields we set */
+}
+
+static WN_API int32_t g32_GetTextExtentPoint32A(wn_handle hdc,
+                                                const char *s, int32_t count,
+                                                void *size)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !s || !size)
+        return 0;
+    size_t n = count < 0 ? strlen(s) : (size_t)count;
+    int cell_h, adv;
+    font_metrics(dc, &cell_h, &adv);
+    int32_t *sz = size;
+    sz[0] = (int32_t)(n * (size_t)adv);
+    sz[1] = cell_h;
+    return 1;
+}
+
+static WN_API int32_t g32_GetTextExtentPoint32W(wn_handle hdc,
+                                                const uint16_t *s,
+                                                int32_t count, void *size)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !s || !size)
+        return 0;
+    size_t n = 0;
+    if (count < 0) {
+        while (s[n] && n < 65536)
+            n++;
+    } else {
+        n = (size_t)count;
+    }
+    int cell_h, adv;
+    font_metrics(dc, &cell_h, &adv);
+    int32_t *sz = size;
+    sz[0] = (int32_t)(n * (size_t)adv);
+    sz[1] = cell_h;
+    return 1;
+}
+
+/* DrawTextA/W: single-line + DT_CALCRECT + word-wrap basics.
+ * DT_*: LEFT 0, CENTER 6, RIGHT 2, VCENTER 0x24, TOP 0, BOTTOM 8,
+ * CALCRECT 0x400, SINGLELINE 0x20, NOPREFIX 0x100, WORDBREAK 0x10. */
+static int32_t draw_text_common(gdi_obj *dc, const uint16_t *s, size_t n,
+                                void *rect, uint32_t fmt)
+{
+    if (!rect)
+        return 0;
+    int32_t *r = rect;
+    int cell_h, adv;
+    font_metrics(dc, &cell_h, &adv);
+    uint32_t f = fmt ? fmt : 0;   /* DT_LEFT|DT_TOP is 0 */
+    int calc = (f & 0x400) != 0;
+    /* wrap: split at spaces/newlines when WORDBREAK */
+    int max_w = r[2] - r[0];
+    int lines = 1;
+    int widest = 0;
+    int cur = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '\n') {
+            if (cur > widest) widest = cur;
+            cur = 0;
+            lines++;
+            continue;
+        }
+        cur += adv;
+        if ((f & 0x10) && max_w > adv && cur > max_w) {
+            if (cur - adv > widest) widest = cur - adv;
+            cur = adv;
+            lines++;
+        }
+    }
+    if (cur > widest) widest = cur;
+    int text_h = lines * cell_h;
+    if (calc) {
+        r[2] = r[0] + widest;
+        r[3] = r[1] + text_h;
+        return text_h;
+    }
+    /* vertical placement */
+    int y0 = r[1];
+    if (f & 8 /*BOTTOM*/)
+        y0 = r[3] - text_h;
+    else if (f & 0x20 /*VCENTER*/)
+        y0 = r[1] + (r[3] - r[1] - text_h) / 2;
+    /* draw line by line */
+    size_t i = 0;
+    int line_idx = 0;
+    while (i < n && line_idx < lines) {
+        size_t start = i, len = 0;
+        int wpx = 0;
+        while (i < n && s[i] != '\n') {
+            if ((f & 0x10) && max_w > adv && wpx + adv > max_w)
+                break;
+            wpx += adv;
+            len++;
+            i++;
+        }
+        int x0 = r[0];
+        if ((f & 2) /*RIGHT*/)
+            x0 = r[2] - wpx;
+        else if ((f & 6) == 6 /*CENTER*/)
+            x0 = r[0] + (r[2] - r[0] - wpx) / 2;
+        draw_text16(dc, x0, y0 + line_idx * cell_h, s + start, len);
+        if (i < n && s[i] == '\n')
+            i++;
+        line_idx++;
+    }
+    return text_h;
+}
+
+WN_API int32_t g32_DrawTextA(wn_handle hdc, const char *s,
+                                    int32_t count, void *rect, uint32_t fmt)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !rect)
+        return 0;
+    if (!s)
+        return 0;
+    size_t n = count < 0 ? strlen(s) : (size_t)count;
+    if (count == 0)
+        return 0;
+    if (!dc->dc.cur_font)
+        dc->dc.cur_font = default_font(dc);
+    uint16_t w[4096];
+    size_t m = n < 4096 ? n : 4096;
+    for (size_t i = 0; i < m; i++)
+        w[i] = (unsigned char)s[i];
+    return draw_text_common(dc, w, m, rect, fmt);
+}
+
+WN_API int32_t g32_DrawTextW(wn_handle hdc, const uint16_t *s,
+                                    int32_t count, void *rect, uint32_t fmt)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !rect || !s)
+        return 0;
+    size_t n = 0;
+    if (count < 0) {
+        while (s[n] && n < 65536)
+            n++;
+    } else {
+        n = (size_t)count;
+    }
+    if (!dc->dc.cur_font)
+        dc->dc.cur_font = default_font(dc);
+    uint16_t w[4096];
+    size_t m = n < 4096 ? n : 4096;
+    memcpy(w, s, m * 2);
+    return draw_text_common(dc, w, m, rect, fmt);
+}
+
+/* Control-painting helpers shared with user32's builtin controls. */
+
+WN_API int32_t g32_DefaultFontHeight(void)
+{
+    return WN_FONT_CELL_H;
+}
+
+/* checkbox / radio frames, Windows-classic style */
+WN_API void g32_DrawCtlFrame(wn_handle hdc, int x, int y, int radio, int state)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return;
+    uint32_t box = state ? 0 : 0x00FFFFFF;
+    uint32_t mark = state ? 0x00000000 : 0x00000000;
+    uint32_t shad = 0x00808080;
+    /* shadow + box */
+    int r_[4];
+    r_[0] = x + 1; r_[1] = y + 1; r_[2] = x + 13; r_[3] = y + 13;
+    wn_handle b1 = g32_CreateSolidBrush(shad);
+    g32_FillRect(hdc, r_, b1);
+    wn_handle_close(b1);
+    r_[0] = x; r_[1] = y; r_[2] = x + 12; r_[3] = y + 12;
+    wn_handle b2 = g32_CreateSolidBrush(box);
+    g32_FillRect(hdc, r_, b2);
+    wn_handle_close(b2);
+    if (state) {
+        wn_handle b3 = g32_CreateSolidBrush(mark);
+        if (radio) {
+            r_[0] = x + 3; r_[1] = y + 3; r_[2] = x + 9; r_[3] = y + 9;
+        } else {
+            /* check mark: two thick strokes */
+            int32_t m1[4] = { x + 2, y + 6, x + 4, y + 8 };
+            int32_t m2[4] = { x + 4, y + 8, x + 9, y + 3 };
+            g32_FillRect(hdc, m1, b3);
+            g32_FillRect(hdc, m2, b3);
+            wn_handle_close(b3);
+            return;
+        }
+        g32_FillRect(hdc, r_, b3);
+        wn_handle_close(b3);
+    }
+}
+
 const wn_export_entry wn_gdi32_exports[] = {
     { "BitBlt", g32_BitBlt },
     { "CreateCompatibleDC", g32_CreateCompatibleDC },
     { "CreateDIBSection", g32_CreateDIBSection },
+    { "CreateFontA", g32_CreateFontA },
+    { "CreateFontIndirectA", g32_CreateFontIndirectA },
+    { "CreateFontIndirectW", g32_CreateFontIndirectW },
+    { "CreateFontW", g32_CreateFontW },
+    { "DrawTextA", g32_DrawTextA },
+    { "DrawTextW", g32_DrawTextW },
+    { "GetTextExtentPoint32A", g32_GetTextExtentPoint32A },
+    { "GetTextExtentPoint32W", g32_GetTextExtentPoint32W },
+    { "GetTextMetricsA", g32_GetTextMetricsA },
+    { "GetTextMetricsW", g32_GetTextMetricsW },
     { "CreatePen", g32_CreatePen },
     { "CreateSolidBrush", g32_CreateSolidBrush },
     { "DeleteDC", g32_DeleteDC },

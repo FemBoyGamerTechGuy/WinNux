@@ -1823,6 +1823,227 @@ static WN_API int32_t k32_lstrcmpiA(const char *a, const char *b)
     }
 }
 
+/* --- locale / Unicode (real implementations over generated BMP tables) ------ */
+
+#include "wn_unicode.h"
+
+static WN_API int32_t k32_lstrcmpW(const uint16_t *a, const uint16_t *b)
+{
+    a = a ? a : (const uint16_t *)L""; b = b ? b : (const uint16_t *)L"";
+    while (*a && *a == *b) { a++; b++; }
+    return (int32_t)*a - (int32_t)*b;
+}
+
+static WN_API int32_t k32_lstrcmpiW(const uint16_t *a, const uint16_t *b)
+{
+    a = a ? a : (const uint16_t *)L""; b = b ? b : (const uint16_t *)L"";
+    for (;;) {
+        uint32_t ca = wn_uni_to_lower(*a), cb = wn_uni_to_lower(*b);
+        if (ca != cb || !*a)
+            return (int32_t)ca - (int32_t)cb;
+        a++; b++;
+    }
+}
+
+/* GetStringTypeW: per-character Windows classes. info[] gets one WORD per
+ * character (not flags-ORed together - see MSDN: "array of 16-bit values"). */
+static WN_API int32_t k32_GetStringTypeW(uint32_t info_type,
+                                         const uint16_t *src, int32_t count,
+                                         uint16_t *info)
+{
+    if (!src || !info || count < -1)
+        return 0;
+    size_t n = count < 0 ? (size_t)k32_lstrlenW(src) : (size_t)count;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t cp = src[i];
+        switch (info_type) {
+        case 1 /*CT_CTYPE1*/:
+            info[i] = (uint16_t)wn_uni_ctype1(cp);
+            break;
+        case 2 /*CT_CTYPE2*/:
+            info[i] = (uint16_t)wn_uni_ctype2(cp);
+            break;
+        case 3 /*CT_CTYPE3*/:
+            info[i] = (uint16_t)wn_uni_ctype3(cp);
+            break;
+        default:
+            wn_log(WN_LOG_WARN, "kernel32: GetStringTypeW type %u unsupported",
+                   info_type);
+            wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static WN_API int32_t k32_GetStringTypeA(uint32_t locale, uint32_t info_type,
+                                         const char *src, int32_t count,
+                                         uint16_t *info)
+{
+    (void)locale;
+    if (!src || !info || count < -1)
+        return 0;
+    size_t n = count < 0 ? strlen(src) : (size_t)count;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t cp = (unsigned char)src[i];
+        switch (info_type) {
+        case 1: info[i] = (uint16_t)wn_uni_ctype1(cp); break;
+        case 2: info[i] = (uint16_t)wn_uni_ctype2(cp); break;
+        case 3: info[i] = (uint16_t)wn_uni_ctype3(cp); break;
+        default:
+            wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+#define LCMAP_LOWERCASE          0x00000100
+#define LCMAP_UPPERCASE          0x00000200
+#define LCMAP_SORTKEY            0x00000400
+#define LCMAP_BYTEREV            0x00000800
+#define LCMAP_HIRAGANA           0x00100000
+#define LCMAP_KATAKANA           0x00200000
+#define LCMAP_HALFWIDTH          0x00400000
+#define LCMAP_FULLWIDTH          0x00800000
+
+/* LCMapStringW: case mapping + Win32-style sort keys.
+ * Sortkey layout (approximation of WinNls, deterministic):
+ *   primary weights (2 bytes BE, case-folded) | 0x01
+ *   case weights (0x12 upper / 0x22 lower)     | 0x01 0x00
+ * gives correct case-insensitive ordering and stable case ordering. */
+static size_t lc_map_case(const uint16_t *src, size_t n, uint16_t *dst,
+                          size_t cap, int upper)
+{
+    for (size_t i = 0; i < n; i++) {
+        uint32_t m = upper ? wn_uni_to_upper(src[i]) : wn_uni_to_lower(src[i]);
+        if (dst) {
+            if (i >= cap)
+                return 0;
+            dst[i] = (uint16_t)m;
+        }
+    }
+    return n;
+}
+
+static size_t lc_sortkey(const uint16_t *src, size_t n, char *dst, size_t cap)
+{
+    size_t need = 1;   /* trailing 0x01 0x00 handled below */
+    for (size_t i = 0; i < n; i++) {
+        uint32_t p = wn_uni_to_lower(src[i]);
+        uint32_t w = p < 0x100 ? 0x100 + p : p;   /* weights start above 0xFF */
+        need += 2;
+        if (!dst)
+            continue;
+        if (need + 2 > cap)
+            return 0;                       /* too small */
+        size_t o = i * 2;
+        dst[o] = (char)(w >> 8);
+        dst[o + 1] = (char)(w & 0xFF);
+    }
+    if (!dst)
+        return need + n + 2;
+    if (need + n + 2 > cap)
+        return 0;
+    size_t o = n * 2;
+    dst[o++] = 0x01;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t c1 = wn_uni_ctype1(src[i]);
+        dst[o++] = (c1 & 0x0001) /*C1_UPPER*/ ? 0x12 : 0x22;
+    }
+    dst[o++] = 0x01;
+    dst[o++] = 0x00;
+    return o;
+}
+
+static WN_API int32_t k32_LCMapStringW(uint32_t locale, uint32_t flags,
+                                       const uint16_t *src, int32_t srclen,
+                                       uint16_t *dst, int32_t dstlen)
+{
+    (void)locale;    /* single-locale system; LOCALE_INVARIANT et al. accepted */
+    if (!src || srclen < -1)
+        return 0;
+    size_t n = srclen < 0 ? (size_t)k32_lstrlenW(src) : (size_t)srclen;
+    if (n == 0) {
+        if (dst && dstlen > 0)
+            dst[0] = 0;
+        return dst || dstlen ? 1 : 0;
+    }
+    if (flags & LCMAP_SORTKEY) {
+        /* MSDN: with LCMAP_SORTKEY, cchDest is the buffer size in BYTES. */
+        size_t k = lc_sortkey(src, n, dst ? (char *)dst : NULL,
+                              dst ? (size_t)dstlen : 0);
+        if (!k) {
+            wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+            return 0;
+        }
+        return (int32_t)k;
+    }
+    if (flags & (LCMAP_HIRAGANA | LCMAP_KATAKANA | LCMAP_HALFWIDTH |
+                 LCMAP_FULLWIDTH)) {
+        wn_log(WN_LOG_WARN, "kernel32: LCMapStringW kana/width mapping "
+               "flags 0x%x not supported (identity)", flags);
+    }
+    int upper = (flags & LCMAP_UPPERCASE) != 0;
+    if ((flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE)) == 0) {
+        wn_log(WN_LOG_WARN, "kernel32: LCMapStringW unsupported flags 0x%x",
+               flags);
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (!dst) {                      /* size query */
+        size_t need = n + 1;
+        return need > 0x7FFFFFFF ? 0 : (int32_t)need;
+    }
+    if ((size_t)dstlen < n + 1) {
+        wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if (flags & LCMAP_BYTEREV)
+        wn_log(WN_LOG_WARN, "kernel32: LCMapStringW BYTEREV combined with "
+               "case mapping (applied after mapping)");
+    size_t r = lc_map_case(src, n, dst, (size_t)dstlen, upper);
+    if (!r) {
+        wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    dst[n] = 0;
+    if (flags & LCMAP_BYTEREV) {
+        for (size_t i = 0; i < n; i++) {
+            uint16_t v = dst[i];
+            dst[i] = (uint16_t)((v >> 8) | (v << 8));
+        }
+    }
+    return (int32_t)(n + 1);
+}
+
+static WN_API int32_t k32_LCMapStringA(uint32_t locale, uint32_t flags,
+                                       const char *src, int32_t srclen,
+                                       char *dst, int32_t dstlen)
+{
+    if (!src)
+        return 0;
+    size_t n = srclen < 0 ? strlen(src) : (size_t)srclen;
+    uint16_t *w = wn_utf8_to_utf16_n(src, n);
+    if (!w)
+        return 0;
+    uint16_t tmp[1024];
+    uint16_t *out = (size_t)dstlen > 1024 ? wn_xmalloc((size_t)dstlen * 2) : tmp;
+    int32_t r = k32_LCMapStringW(locale, flags, w, (int32_t)n, out,
+                                 (int32_t)dstlen);
+    free(w);
+    if (r && dst && !(flags & LCMAP_SORTKEY)) {
+        /* ASCII-safe narrow copy */
+        size_t m = (size_t)r - 1;
+        for (size_t i = 0; i < m; i++)
+            dst[i] = (char)out[i];
+        dst[m] = '\0';
+    }
+    if (out != tmp)
+        free(out);
+    return r;
+}
+
 static WN_API char *k32_lstrcpyA(char *dst, const char *src)
 {
     if (!dst || !src)
@@ -2464,6 +2685,12 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "LocalFree", k32_LocalFree },
     { "lstrcmpA", k32_lstrcmpA },
     { "lstrcmpiA", k32_lstrcmpiA },
+    { "lstrcmpiW", k32_lstrcmpiW },
+    { "lstrcmpW", k32_lstrcmpW },
+    { "GetStringTypeA", k32_GetStringTypeA },
+    { "GetStringTypeW", k32_GetStringTypeW },
+    { "LCMapStringA", k32_LCMapStringA },
+    { "LCMapStringW", k32_LCMapStringW },
     { "lstrcpyA", k32_lstrcpyA },
     { "lstrcpynA", k32_lstrcpynA },
     { "lstrlenA", k32_lstrlenA },

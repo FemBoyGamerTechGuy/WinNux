@@ -1,0 +1,28 @@
+0
+ok: GetStringTypeW ctype1
+ok: A = UPPER|ALPHA|XDIGIT
+ok: z = LOWER|ALPHA
+ok: 9 = DIGIT|XDIGIT
+ok: space = SPACE|BLANK
+ok: GetStringTypeW non-ASCII
+ok: U+00E9 lowercase
+ok: U+4E2D alpha (CJK)
+ok: LCMapStringW uppercase len
+ok: LCMapStringW uppercase content (sharp-s variant)
+ok: LCMapStringW lowercase
+ok: sortkey lengths equal
+ok: sortkey case-insensitive primary weights
+ok: sortkey apple < banana
+ok: GetUserNameA
+ok: GetUserNameA name+length
+user: present (1 chars)
+ok: lstrcmpiW equal
+ok: lstrcmpiW ordering
+ok: CreateFontA
+ok: GetTextMetricsA
+ok: metrics sane (cell + advance)
+ok: GetTextExtentPoint32A
+ok: extent = n * advance
+ok: DrawTextA DT_CALCRECT
+ok: DeleteObject(font)
+t15 locale+font: PASS (0 failures)

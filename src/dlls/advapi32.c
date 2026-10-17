@@ -6,6 +6,7 @@
 #include "wn_process.h"
 #include "wn_util.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -190,6 +191,68 @@ static WN_API int32_t adv_RegEnumValueA(wn_handle h, uint32_t idx, char *name,
     return 0;
 }
 
+/* GetUserName: real account name from the passwd database. */
+#include <pwd.h>
+#include <unistd.h>
+
+static void account_name(char *out, size_t cap)
+{
+    const char *u = getenv("USER");
+    if (!u || !*u) {
+        struct passwd *pw = getpwuid(getuid());
+        u = pw ? pw->pw_name : "user";
+    }
+    snprintf(out, cap, "%s", u);
+}
+
+static WN_API int32_t adv_GetUserNameA(char *buf, uint32_t *cap)
+{
+    if (!buf || !cap || *cap == 0) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    char name[256];
+    account_name(name, sizeof name);
+    size_t need = strlen(name) + 1;
+    if (need > *cap) {
+        *cap = (uint32_t)need;
+        wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    memcpy(buf, name, need);
+    *cap = (uint32_t)need;
+    return 1;
+}
+
+static WN_API int32_t adv_GetUserNameW(uint16_t *buf, uint32_t *cap)
+{
+    if (!buf || !cap || *cap == 0) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    char name[256];
+    account_name(name, sizeof name);
+    uint16_t *w = wn_utf8_to_utf16_n(name, strlen(name));
+    if (!w) {
+        wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    size_t n = 0;
+    while (w[n])
+        n++;
+    size_t need = n + 1;
+    if (need > *cap) {
+        *cap = (uint32_t)need;
+        wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+        free(w);
+        return 0;
+    }
+    memcpy(buf, w, need * 2);
+    *cap = (uint32_t)need;
+    free(w);
+    return 1;
+}
+
 const wn_export_entry wn_advapi32_exports[] = {
     { "RegCloseKey", adv_RegCloseKey },
     { "RegCreateKeyExA", adv_RegCreateKeyExA },
@@ -202,5 +265,7 @@ const wn_export_entry wn_advapi32_exports[] = {
     { "RegQueryValueExW", adv_RegQueryValueExW },
     { "RegSetValueExA", adv_RegSetValueExA },
     { "RegSetValueExW", adv_RegSetValueExW },
+    { "GetUserNameA", adv_GetUserNameA },
+    { "GetUserNameW", adv_GetUserNameW },
     { NULL, NULL },
 };
