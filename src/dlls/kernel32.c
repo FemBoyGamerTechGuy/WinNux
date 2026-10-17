@@ -2097,6 +2097,200 @@ static WN_API int32_t k32_IsProcessorFeaturePresent(uint32_t f)
     }
 }
 
+
+/* ========================================================================== */
+/* Resources: .rsrc directory walking (RT_* by id or name)                     */
+/* ========================================================================== */
+
+typedef struct wn_res_handle {
+    uint64_t  magic;      /* 'WNRH' */
+    wn_module *mod;
+    uint32_t  rva;
+    uint32_t  size;
+} wn_res_handle;
+
+#define WN_RES_MAGIC 0x574E5248ULL
+
+/* One resource directory node: 16-byte header + entries. */
+static const uint8_t *res_dir_base(wn_module *m)
+{
+    if (m->kind != WN_MOD_PE)
+        return NULL;
+    const wn_image_dos_header *dos = (const void *)m->pe.base;
+    const wn_image_optional_header64 *oh =
+        (const void *)(m->pe.base + dos->e_lfanew + 4
+                      + sizeof(wn_image_file_header));
+    const wn_image_data_directory *d = &oh->dirs[WN_IMAGE_DIR_RESOURCE];
+    if (!d->virtual_address || !d->size)
+        return NULL;
+    return wn_pe_rva(&m->pe, d->virtual_address, 16);
+}
+
+/* Match an entry name/id against the caller's LPCSTR (id in low word or
+ * string). Returns 1 on match. */
+static int res_entry_matches(wn_module *m, const uint8_t *dirbase,
+                             uint32_t name_field, const char *want)
+{
+    (void)m;
+    (void)dirbase;
+    if (!want)
+        return 0;
+    if (name_field & 0x80000000u) {
+        /* named entry: UTF-16 string at offset (relative to dir base) */
+        const uint8_t *sp = dirbase + (name_field & 0x7FFFFFFFu);
+        uint16_t len;
+        memcpy(&len, sp, 2);
+        const uint16_t *w = (const uint16_t *)(const void *)(sp + 2);
+        /* string compare with the ANSI want (case-insensitive) */
+        for (uint16_t i = 0; i < len; i++) {
+            uint32_t c1 = w[i];
+            char a = want[i] ? want[i] : 0;
+            uint32_t c2 = (uint8_t)a;
+            if (c1 < 128)
+                c1 = (uint32_t)toupper((int)c1);
+            if (c2 < 128)
+                c2 = (uint32_t)toupper((int)c2);
+            if (c1 != c2)
+                return 0;
+            if (want[i] == 0)
+                return i + 1 == len;   /* exact length match required */
+        }
+        return want[len] == 0;
+    }
+    /* id entry: compare against MAKEINTRESOURCE id (low 16 bits) or the
+     * numeric string form ("123"). */
+    uint32_t id = name_field & 0xFFFF;
+    if (((uintptr_t)want >> 16) == 0)
+        return id == (uint32_t)(uintptr_t)want;
+    char num[16];
+    snprintf(num, sizeof num, "%u", id);
+    return wn_strcaseeq(num, want);
+}
+
+/* Walk one level: find the entry matching want. dir = absolute pointer to
+ * the directory. Returns the entry's offset field, or 0. */
+static uint32_t res_find_in_dir(wn_module *m, const uint8_t *dirbase,
+                                const uint8_t *dir, const char *want)
+{
+    uint16_t nnamed, nid;
+    memcpy(&nnamed, dir + 12, 2);
+    memcpy(&nid, dir + 14, 2);
+    uint32_t n = (uint32_t)nnamed + nid;
+    const uint8_t *ent = dir + 16;
+    for (uint32_t i = 0; i < n && i < 4096; i++) {
+        uint32_t name_field, offset;
+        memcpy(&name_field, ent + 0, 4);
+        memcpy(&offset, ent + 4, 4);
+        if (res_entry_matches(m, dirbase, name_field, want)) {
+            if (!(offset & 0x80000000u))
+                return 0;   /* leaf pointer must be a data entry */
+            return offset & 0x7FFFFFFFu;   /* subdir offset */
+        }
+        ent += 8;
+    }
+    return 0;
+}
+
+static wn_res_handle *res_make(wn_module *m, uint32_t rva, uint32_t size)
+{
+    wn_res_handle *h = wn_xmalloc(sizeof *h);
+    h->magic = WN_RES_MAGIC;
+    h->mod = m;
+    h->rva = rva;
+    h->size = size;
+    return h;
+}
+
+static wn_module *mod_or_exe(uint64_t hmod)
+{
+    if (!hmod)
+        return g_proc.exe;
+    return wn_module_from_addr((const void *)(uintptr_t)hmod, NULL);
+}
+
+WN_API uint64_t k32_FindResourceA(uint64_t hmod, const char *name,
+                                         const char *type)
+{
+    wn_module *m = mod_or_exe(hmod);
+    const uint8_t *base = m ? res_dir_base(m) : NULL;
+    if (!base || !name || !type) {
+        wn_last_error_set(1814 /* ERROR_RESOURCE_TYPE_NOT_FOUND */);
+        return 0;
+    }
+    /* level 1: type */
+    uint32_t off = res_find_in_dir(m, base, base, type);
+    if (!off) {
+        wn_last_error_set(1813 /* ERROR_RESOURCE_NAME_NOT_FOUND */);
+        return 0;
+    }
+    /* level 2: name */
+    off = res_find_in_dir(m, base, base + off, name);
+    if (!off) {
+        wn_last_error_set(1813);
+        return 0;
+    }
+    /* level 3: language - take the first entry */
+    {
+        const uint8_t *dir = base + off;
+        uint16_t nnamed, nid;
+        memcpy(&nnamed, dir + 12, 2);
+        memcpy(&nid, dir + 14, 2);
+        uint32_t n = (uint32_t)nnamed + nid;
+        if (n == 0) {
+            wn_last_error_set(1813);
+            return 0;
+        }
+        uint32_t leaf_off;
+        memcpy(&leaf_off, dir + 16 + 4, 4);
+        if (leaf_off & 0x80000000u) {
+            wn_last_error_set(1812 /* ERROR_INVALID_RESOURCE_DATA_TYPE */);
+            return 0;
+        }
+        const uint8_t *leaf = base + leaf_off;
+        uint32_t rva, size;
+        memcpy(&rva, leaf + 0, 4);
+        memcpy(&size, leaf + 4, 4);
+        if (!wn_pe_rva(&m->pe, rva, size > 0xFFFF ? 0xFFFF : size)) {
+            wn_last_error_set(1812);
+            return 0;
+        }
+        return (uint64_t)(uintptr_t)res_make(m, rva, size);
+    }
+}
+
+static WN_API uint64_t k32_LoadResource(uint64_t hmod, uint64_t hres)
+{
+    (void)hmod;
+    wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
+    if (!h || h->magic != WN_RES_MAGIC) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    return hres;
+}
+
+WN_API void *k32_LockResource(uint64_t hres)
+{
+    wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
+    if (!h || h->magic != WN_RES_MAGIC)
+        return NULL;
+    void *p = wn_pe_rva(&h->mod->pe, h->rva,
+                        h->size > 0xFFFF ? 0xFFFF : h->size);
+    if (!p)
+        wn_log(WN_LOG_WARN, "kernel32: resource rva 0x%x out of image",
+               h->rva);
+    return p;
+}
+
+static WN_API uint32_t k32_SizeofResource(uint64_t hmod, uint64_t hres)
+{
+    (void)hmod;
+    wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
+    if (!h || h->magic != WN_RES_MAGIC)
+        return 0;
+    return h->size;
+}
+
 static WN_API int32_t k32_Beep(uint32_t freq, uint32_t dur)
 {
     (void)freq;
@@ -2345,5 +2539,9 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "OutputDebugStringA", k32_OutputDebugStringA },
     { "OutputDebugStringW", k32_OutputDebugStringW },
     { "MulDiv", k32_MulDiv },
+    { "FindResourceA", k32_FindResourceA },
+    { "LoadResource", k32_LoadResource },
+    { "LockResource", k32_LockResource },
+    { "SizeofResource", k32_SizeofResource },
     { NULL, NULL },
 };

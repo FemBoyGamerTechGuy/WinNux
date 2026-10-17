@@ -352,7 +352,7 @@ WN_API int32_t g32_FillRect(wn_handle hdc, const void *rect, wn_handle brush)
     return 1;
 }
 
-static WN_API wn_handle g32_CreateSolidBrush(uint32_t color)
+WN_API wn_handle g32_CreateSolidBrush(uint32_t color)
 {
     gdi_obj *br = wn_xcalloc(1, sizeof *br);
     br->kind = GDI_BRUSH;
@@ -403,7 +403,7 @@ static WN_API wn_handle g32_GetStockObject(int32_t idx)
     return stock[idx];
 }
 
-static WN_API uint32_t g32_SetTextColor(wn_handle hdc, uint32_t color)
+WN_API uint32_t g32_SetTextColor(wn_handle hdc, uint32_t color)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
     if (!dc)
@@ -423,7 +423,7 @@ static WN_API uint32_t g32_SetBkColor(wn_handle hdc, uint32_t color)
     return old;
 }
 
-static WN_API int32_t g32_SetBkMode(wn_handle hdc, int32_t mode)
+WN_API int32_t g32_SetBkMode(wn_handle hdc, int32_t mode)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
     if (!dc)
@@ -433,7 +433,7 @@ static WN_API int32_t g32_SetBkMode(wn_handle hdc, int32_t mode)
     return old;
 }
 
-static WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
+WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
                                    const char *s, int32_t count)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);

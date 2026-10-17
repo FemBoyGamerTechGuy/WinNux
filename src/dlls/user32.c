@@ -52,7 +52,7 @@ typedef struct wn_timer {
 } wn_timer;
 
 typedef struct wn_window {
-    wn_bwin *bwin;            /* backend window */
+    wn_bwin *bwin;            /* backend window (top-level) or child surface */
     wn_wndclass *cls;
     uint64_t hinstance;
     uint64_t userdata;
@@ -61,6 +61,18 @@ typedef struct wn_window {
     int in_destroy;
     int paint_pending;
     struct { int l, t, r, b; } dirty;    /* damage rect; l<0 = clean */
+    /* child window support */
+    uint64_t parent;          /* 0 = top level */
+    int wx, wy;               /* position in parent (pixels) */
+    int cw, ch;               /* size (pixels) */
+    uint64_t id;              /* control id (HMENU slot) */
+    int is_child;
+    /* dialog support */
+    int is_dialog;
+    int dlg_done;
+    int64_t dlg_result;
+    uint64_t dlgproc;
+    uint64_t dlg_param;
 } wn_window;
 
 /* Documented globals: GUI state (single-GUI-thread model for v1). */
@@ -351,14 +363,16 @@ static WN_API uint64_t u32_RegisterClassW(const void *wc)
     return u32_RegisterClassA(&wcA);
 }
 
+static wn_wndclass *builtin_control_class(const char *name);
+static void compose_child(wn_window *child);
+
 static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_name,
                                            const char *title, uint32_t style,
                                            int x, int y, int w, int h,
                                            uint64_t parent, uint64_t menu,
                                            uint64_t hinst, void *param)
 {
-    (void)ex_style; (void)parent; (void)menu; (void)x; (void)y;
-    if (ensure_gui() != 0) {
+    if (ensure_gui() != 0 && !parent) {
         wn_last_error_set(WN_ERR_NOT_SUPPORTED);
         return 0;
     }
@@ -367,8 +381,45 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
         if (g_classes[i].used && wn_strcaseeq(g_classes[i].name, cls_name))
             cls = &g_classes[i];
     if (!cls) {
-        wn_last_error_set(1407 /* ERROR_CLASS_DOES_NOT_EXIST */);
-        return 0;
+        cls = builtin_control_class(cls_name);
+        if (!cls) {
+            wn_last_error_set(1407 /* ERROR_CLASS_DOES_NOT_EXIST */);
+            return 0;
+        }
+    }
+    if (parent) {
+        wn_window *pw = win_from_hwnd(parent);
+        if (!pw) {
+            wn_last_error_set(WN_ERR_INVALID_HANDLE);
+            return 0;
+        }
+        /* Child window: own offscreen surface, composed onto the parent. */
+        wn_window *win = wn_xcalloc(1, sizeof *win);
+        win->cls = cls;
+        win->hinstance = hinst;
+        win->userdata = (uint64_t)(uintptr_t)param;
+        win->parent = parent;
+        win->is_child = 1;
+        win->id = menu;
+        win->wx = x;
+        win->wy = y;
+        win->cw = w > 0 ? w : 64;
+        win->ch = h > 0 ? h : 20;
+        snprintf(win->title, sizeof win->title, "%s", title ? title : "");
+        win->bwin = wn_xcalloc(1, sizeof(wn_bwin));
+        win->bwin->width = win->cw;
+        win->bwin->height = win->ch;
+        win->bwin->stride = win->cw * 4;
+        win->bwin->pixels = wn_xmalloc((size_t)win->cw * win->ch * 4 + 64);
+        memset(win->bwin->pixels, 0xFF, (size_t)win->cw * win->ch * 4);
+        wn_handle hwnd = register_hwnd(win);
+        (void)ex_style;
+        post_msg((uint64_t)(uintptr_t)hwnd, WN_WM_CREATE, 0, 0);
+        wn_log(WN_LOG_DEBUG, "user32: CreateWindow child '%s' id=%llu "
+               "hwnd=0x%llx %dx%d at %d,%d", cls_name,
+               (unsigned long long)menu, (unsigned long long)(uintptr_t)hwnd,
+               win->cw, win->ch, x, y);
+        return (uint64_t)(uintptr_t)hwnd;
     }
     const wn_backend *be = wn_backend_get();
     if (!be || !be->win_create) {
@@ -432,9 +483,21 @@ static WN_API int32_t u32_DestroyWindow(uint64_t hwnd)
     if (w->in_destroy)
         return 1;
     w->in_destroy = 1;
+    /* Destroy children first (Windows order). */
+    for (int i = 0; i < g_hwnd_count; i++) {
+        wn_window *c = g_hwnds[i].win;
+        if (c && c->parent == hwnd && !c->in_destroy)
+            u32_DestroyWindow((uint64_t)(uintptr_t)g_hwnds[i].h);
+    }
     /* WM_DESTROY goes through the proc directly (in-order with calls). */
     if (w->cls && w->cls->proc)
         w->cls->proc(hwnd, WN_WM_DESTROY, 0, 0);
+    if (w->is_child) {
+        /* Child surfaces are ours; the backend never saw them. */
+        free(w->bwin->pixels);
+        free(w->bwin);
+        w->bwin = NULL;
+    }
     const wn_backend *be = wn_backend_get();
     if (be && be->win_destroy && w->bwin) {
         for (int i = 0; i < g_bwin_count; i++) {
@@ -740,17 +803,6 @@ static WN_API int32_t u32_GetWindowRect(uint64_t hwnd, void *rect)
     return 1;
 }
 
-static WN_API int32_t u32_SetWindowTextA(uint64_t hwnd, const char *text)
-{
-    wn_window *w = win_from_hwnd(hwnd);
-    if (!w)
-        return 0;
-    snprintf(w->title, sizeof w->title, "%s", text ? text : "");
-    const wn_backend *be = wn_backend_get();
-    if (be && be->win_set_title && w->bwin)
-        be->win_set_title(w->bwin, w->title);
-    return 1;
-}
 
 static WN_API int32_t u32_IsWindow(uint64_t hwnd)
 {
@@ -779,6 +831,492 @@ extern WN_API int32_t g32_EndPaint(uint64_t hwnd, const void *ps);
 extern WN_API wn_handle g32_GetDC(uint64_t hwnd);
 extern WN_API int32_t g32_ReleaseDC(uint64_t hwnd, wn_handle hdc);
 extern WN_API int32_t g32_FillRect(wn_handle hdc, const void *rect, wn_handle brush);
+
+
+/* ========================================================================== */
+/* Builtin control classes + dialog engine                                     */
+/* ========================================================================== */
+
+extern WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
+                                   const char *s, int32_t count);
+extern WN_API uint32_t g32_SetTextColor(wn_handle hdc, uint32_t color);
+extern WN_API int32_t g32_SetBkMode(wn_handle hdc, int32_t mode);
+extern WN_API wn_handle g32_CreateSolidBrush(uint32_t color);
+extern WN_API wn_handle g32_SelectObject(wn_handle hdc, wn_handle obj);
+
+#define WN_WM_PAINT      0x000F
+#define WN_WM_COMMAND    0x0111
+#define WN_WM_INITDIALOG 0x0110
+#define WN_WM_SETTEXT    0x000C
+#define WN_WM_GETTEXT    0x000D
+#define WN_BS_DEFPUSHBUTTON 0x0001
+#define WN_WS_CHILD      0x40000000
+
+/* Blit a child surface onto its parent (same 32bpp BGRA layout). */
+static void compose_child(wn_window *child)
+{
+    if (!child || !child->parent || !child->bwin)
+        return;
+    wn_window *pw = win_from_hwnd(child->parent);
+    if (!pw || !pw->bwin || !pw->bwin->pixels || !child->bwin->pixels)
+        return;
+    int cw = child->bwin->width, ch = child->bwin->height;
+    int pw_w = pw->bwin->width, pw_h = pw->bwin->height;
+    for (int row = 0; row < ch; row++) {
+        int py = child->wy + row;
+        if (py < 0 || py >= pw_h)
+            continue;
+        int x0 = child->wx < 0 ? -child->wx : 0;
+        int x1 = cw;   /* clamp to parent width */
+        if (child->wx + cw > pw_w)
+            x1 = pw_w - child->wx;
+        if (x1 <= x0)
+            continue;
+        memcpy(pw->bwin->pixels + (size_t)py * pw->bwin->stride
+                 + (size_t)(child->wx + x0) * 4,
+               child->bwin->pixels + (size_t)row * child->bwin->stride
+                 + (size_t)x0 * 4,
+               (size_t)(x1 - x0) * 4);
+    }
+    if (pw->dirty.l < 0) {
+        pw->dirty.l = child->wx;
+        pw->dirty.t = child->wy;
+        pw->dirty.r = child->wx + cw;
+        pw->dirty.b = child->wy + ch;
+    } else {
+        if (child->wx < pw->dirty.l) pw->dirty.l = child->wx;
+        if (child->wy < pw->dirty.t) pw->dirty.t = child->wy;
+        if (child->wx + cw > pw->dirty.r) pw->dirty.r = child->wx + cw;
+        if (child->wy + ch > pw->dirty.b) pw->dirty.b = child->wy + ch;
+    }
+}
+
+static void compose_children_of(uint64_t parent)
+{
+    for (int i = 0; i < g_hwnd_count; i++) {
+        wn_window *c = g_hwnds[i].win;
+        if (c && c->parent == parent)
+            compose_child(c);
+    }
+}
+
+/* --- builtin control proc ------------------------------------------------- */
+
+typedef enum { CTL_BUTTON, CTL_STATIC, CTL_EDIT, CTL_LISTBOX, CTL_COMBO,
+               CTL_SCROLLBAR } ctl_kind;
+
+static ctl_kind ctl_kind_of(const char *cls)
+{
+    if (wn_strcaseeq(cls, "Button"))    return CTL_BUTTON;
+    if (wn_strcaseeq(cls, "Static"))    return CTL_STATIC;
+    if (wn_strcaseeq(cls, "Edit"))      return CTL_EDIT;
+    if (wn_strcaseeq(cls, "ListBox"))   return CTL_LISTBOX;
+    if (wn_strcaseeq(cls, "ComboBox"))  return CTL_COMBO;
+    return CTL_SCROLLBAR;
+}
+
+static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
+                                int64_t lp)
+{
+    (void)wp;
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    switch (msg) {
+    case WN_WM_PAINT: {
+        wn_handle hdc = g32_GetDC(hwnd);
+        if (!hdc)
+            return 0;
+        ctl_kind k = ctl_kind_of(w->cls->name);
+        uint32_t face = k == CTL_EDIT || k == CTL_LISTBOX ? 0x00FFFFFF
+                                                          : 0x00C8D0D4;
+        int32_t rect[4] = { 0, 0, w->bwin->width, w->bwin->height };
+        wn_handle bg = g32_CreateSolidBrush(face);
+        g32_FillRect(hdc, rect, bg);
+        wn_handle_close(bg);
+        /* flat 3D-ish border */
+        wn_handle dark = g32_CreateSolidBrush(0x00606060);
+        wn_handle lite = g32_CreateSolidBrush(0x00FFFFFF);
+        int32_t top[4]  = { 0, 0, w->bwin->width, 1 };
+        int32_t lef[4]  = { 0, 0, 1, w->bwin->height };
+        int32_t bot[4]  = { 0, w->bwin->height - 1, w->bwin->width,
+                            w->bwin->height };
+        int32_t rig[4]  = { w->bwin->width - 1, 0, w->bwin->width,
+                            w->bwin->height };
+        g32_FillRect(hdc, top, k == CTL_STATIC ? lite : dark);
+        g32_FillRect(hdc, lef, k == CTL_STATIC ? lite : dark);
+        g32_FillRect(hdc, bot, lite);
+        g32_FillRect(hdc, rig, lite);
+        wn_handle_close(dark);
+        wn_handle_close(lite);
+        if (w->title[0]) {
+            g32_SetTextColor(hdc, 0);
+            g32_SetBkMode(hdc, 1 /* TRANSPARENT */);
+            g32_TextOutA(hdc, 6, (w->bwin->height - 12) / 2, w->title, -1);
+        }
+        g32_ReleaseDC(hwnd, hdc);
+        compose_child(w);
+        return 0;
+    }
+    case 0x0201 /* WM_LBUTTONDOWN */:
+        if (ctl_kind_of(w->cls->name) == CTL_BUTTON && w->parent) {
+            post_msg(w->parent, WN_WM_COMMAND,
+                     (w->id & 0xFFFF) | (0 /*BN_CLICKED*/ << 16),
+                     (int64_t)hwnd);
+        }
+        return 0;
+    case WN_WM_SETTEXT:
+        snprintf(w->title, sizeof w->title, "%s",
+                 lp ? (const char *)(uintptr_t)lp : "");
+        compose_child(w);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Register a builtin control class on first use. */
+static wn_wndclass *builtin_control_class(const char *name)
+{
+    static const char *known[] = { "Button", "Edit", "Static", "ListBox",
+                                   "ComboBox", "ScrollBar", "#32770", NULL };
+    for (int i = 0; known[i]; i++) {
+        if (!wn_strcaseeq(name, known[i]))
+            continue;
+        for (int c = 0; c < 32; c++) {
+            if (!g_classes[c].used) {
+                snprintf(g_classes[c].name, sizeof g_classes[c].name, "%s",
+                         known[i]);
+                g_classes[c].proc = ctl_proc;
+                g_classes[c].used = 1;
+                wn_log(WN_LOG_DEBUG, "user32: builtin control class '%s'",
+                       known[i]);
+                return &g_classes[c];
+            }
+        }
+    }
+    return NULL;
+}
+
+/* --- dialog template parsing ---------------------------------------------- */
+
+/* sz_Or_Ord: 0xFFFF + WORD id, or a NUL-terminated UTF-16 string. */
+static const uint16_t *dlg_read_szorord(const uint16_t *p, const uint16_t *end,
+                                        uint16_t *id_out, char *out, size_t cap)
+{
+    if (p >= end)
+        return p;
+    if (*p == 0xFFFF) {
+        if (id_out)
+            *id_out = p[1];
+        if (out && cap)
+            out[0] = 0;
+        return p + 2;
+    }
+    const uint16_t *q = p;
+    size_t n = 0;
+    while (q < end && *q) {
+        if (out && n + 1 < cap)
+            out[n] = (char)*q;   /* ASCII fold (dialog text is ANSI in templates) */
+        q++;
+        n++;
+    }
+    if (out && cap)
+        out[n < cap ? n : cap - 1] = 0;
+    if (id_out)
+        *id_out = 0xFFFF;
+    return q + 1;
+}
+
+static const uint32_t *dlg_dword_align(const void *p)
+{
+    uintptr_t a = (uintptr_t)p;
+    a = (a + 3) & ~(uintptr_t)3;
+    return (const uint32_t *)a;
+}
+
+/* Dialog class atom -> class name. */
+static const char *dlg_atom_class(uint16_t atom)
+{
+    switch (atom) {
+    case 0x0080: return "Button";
+    case 0x0081: return "Edit";
+    case 0x0082: return "Static";
+    case 0x0083: return "ListBox";
+    case 0x0084: return "ScrollBar";
+    case 0x0085: return "ComboBox";
+    default: return NULL;
+    }
+}
+
+/* Approx dialog-base-unit conversion (font metrics come with real fonts). */
+#define DLG_X(n) ((int)((n) * 4 / 2 + ((n) & 1)))
+#define DLG_Y(n) ((int)((n) * 8 / 2))
+
+static uint64_t create_dialog_from_template(uint64_t hinst,
+                                            const void *tmpl, uint64_t parent,
+                                            uint64_t dlgproc, uint64_t param,
+                                            int32_t force_visible)
+{
+    /* Template argument may be a MAKEINTRESOURCE id -> resolve RT_DIALOG
+     * from the module's resources first (this is what PuTTY does). */
+    if (((uintptr_t)tmpl >> 16) == 0) {
+        extern WN_API uint64_t k32_FindResourceA(uint64_t, const char *,
+                                                 const char *);
+        extern WN_API void *k32_LockResource(uint64_t);
+        char rid[16];
+        snprintf(rid, sizeof rid, "%u", (unsigned)(uintptr_t)tmpl);
+        uint64_t hres = k32_FindResourceA(hinst, rid,
+                                          (const char *)(uintptr_t)5 /*RT_DIALOG*/);
+        if (!hres) {
+            wn_log(WN_LOG_ERR, "user32: dialog resource %u not found", 
+                   (unsigned)(uintptr_t)tmpl);
+            wn_last_error_set(1814);
+            return 0;
+        }
+        const void *locked = k32_LockResource(hres);
+        if (!locked)
+            return 0;
+        wn_log(WN_LOG_DEBUG, "user32: dialog template from resource #%u",
+               (unsigned)(uintptr_t)tmpl);
+        tmpl = locked;
+    }
+    const uint16_t *p = tmpl;
+    const uint16_t *end = p + 4096 * 64;   /* generous bound; templates are small */
+    uint32_t style, ex_style;
+    int nitems;
+    int32_t x, y, cx, cy;
+    char title[128];
+    const uint16_t *menu, *cls, *tit;
+
+    int is_ex = (p[0] == 1 && p[1] == 0xFFFF);
+    if (is_ex) {
+        /* DLGTEMPLATEEX */
+        const uint8_t *b = tmpl;
+        p = (const uint16_t *)(b + 4 + 4);   /* skip ver+sig, helpID */
+        style = *(const uint32_t *)(const void *)p; p += 2;
+        ex_style = *(const uint32_t *)(const void *)p; p += 2;
+        nitems = *p++;
+        x = (int16_t)*p++; y = (int16_t)*p++;
+        cx = (int16_t)*p++; cy = (int16_t)*p++;
+        menu = p; p = dlg_read_szorord(p, end, NULL, NULL, 0);
+        cls = p;  p = dlg_read_szorord(p, end, NULL, NULL, 0);
+        tit = p;  p = dlg_read_szorord(p, end, NULL, title, sizeof title);
+    } else {
+        /* DLGTEMPLATE */
+        style = *(const uint32_t *)(const void *)p; p += 2;
+        ex_style = *(const uint32_t *)(const void *)p; p += 2;
+        nitems = *p++;
+        x = (int16_t)*p++; y = (int16_t)*p++;
+        cx = (int16_t)*p++; cy = (int16_t)*p++;
+        menu = p; p = dlg_read_szorord(p, end, NULL, NULL, 0);
+        cls = p;  p = dlg_read_szorord(p, end, NULL, NULL, 0);
+        tit = p;  p = dlg_read_szorord(p, end, NULL, title, sizeof title);
+    }
+    (void)menu;
+    (void)cls;
+    (void)tit;
+
+    /* dialog window itself (class #32770 -> our trampoline) */
+    uint64_t hwnd = u32_CreateWindowExA(ex_style, "#32770", title,
+                                        style | (force_visible ? 0x10000000u : 0),
+                                        DLG_X(x), DLG_Y(y),
+                                        DLG_X(cx), DLG_Y(cy),
+                                        parent, 0, hinst, 0);
+    if (!hwnd)
+        return 0;
+    wn_window *dw = win_from_hwnd(hwnd);
+    dw->is_dialog = 1;
+    dw->dlgproc = dlgproc;
+    dw->dlg_param = param;
+
+    /* items */
+    for (int i = 0; i < nitems; i++) {
+        p = (const uint16_t *)dlg_dword_align(p);
+        if (p >= end)
+            break;
+        uint32_t istyle, iex;
+        int32_t ix, iy, icx, icy;
+        uint64_t iid;
+        if (is_ex) {
+            /* DLGITEMTEMPLATEEX: helpID(4) exStyle(4) style(4) x,y,cx,cy(2x4)
+             * id(4!) class title extra(2) */
+            p += 2;                                   /* helpID */
+            iex = *(const uint32_t *)(const void *)p; p += 2;
+            istyle = *(const uint32_t *)(const void *)p; p += 2;
+            ix = (int16_t)*p++; iy = (int16_t)*p++;
+            icx = (int16_t)*p++; icy = (int16_t)*p++;
+            iid = *(const uint32_t *)(const void *)p; p += 2;
+        } else {
+            /* DLGITEMTEMPLATE: style(4) exStyle(4) x,y,cx,cy id(2!) */
+            istyle = *(const uint32_t *)(const void *)p; p += 2;
+            iex = *(const uint32_t *)(const void *)p; p += 2;
+            ix = (int16_t)*p++; iy = (int16_t)*p++;
+            icx = (int16_t)*p++; icy = (int16_t)*p++;
+            iid = *p++;
+        }
+        char icls[64], ititle[160];
+        uint16_t cls_id = 0xFFFF;
+        p = dlg_read_szorord(p, end, &cls_id, icls, sizeof icls);
+        p = dlg_read_szorord(p, end, NULL, ititle, sizeof ititle);
+        uint16_t extra = *p++;
+        p += extra / 2;
+        const char *class_name = NULL;
+        if (cls_id != 0xFFFF) {
+            class_name = dlg_atom_class(cls_id);
+            if (!class_name) {
+                wn_log(WN_LOG_WARN, "user32: dialog item class atom 0x%x "
+                       "unknown", cls_id);
+                continue;
+            }
+        } else if (icls[0]) {
+            class_name = icls;
+        }
+        if (!class_name) {
+            wn_log(WN_LOG_WARN, "user32: dialog item without class");
+            continue;
+        }
+        u32_CreateWindowExA(iex, class_name, ititle,
+                            istyle | WN_WS_CHILD | 0x10000000u /*WS_VISIBLE*/,
+                            DLG_X(ix), DLG_Y(iy), DLG_X(icx), DLG_Y(icy),
+                            hwnd, iid, hinst, 0);
+    }
+
+    /* WM_INITDIALOG -> guest dlgproc */
+    if (dlgproc) {
+        typedef WN_API int64_t (*dlgproc_fn)(uint64_t, uint32_t, uint64_t,
+                                             int64_t);
+        ((dlgproc_fn)(uintptr_t)dlgproc)(hwnd, WN_WM_INITDIALOG, 0,
+                                         (int64_t)param);
+    }
+    compose_children_of(hwnd);
+    if (dw->visible)
+        u32_ShowWindow(hwnd, 5);
+    return hwnd;
+}
+
+/* DialogBox: modal-ish loop until EndDialog. */
+static WN_API int64_t u32_DialogBoxParamA(uint64_t hinst, const void *tmpl,
+                                          uint64_t parent, uint64_t dlgproc,
+                                          uint64_t param)
+{
+    uint64_t hwnd = create_dialog_from_template(hinst, tmpl, parent, dlgproc,
+                                                param, 1);
+    if (!hwnd)
+        return -1;
+    wn_window *dw = win_from_hwnd(hwnd);
+    wn_msg m;
+    while (!dw->dlg_done) {
+        int32_t r = u32_GetMessageA(&m, 0, 0, 0);
+        if (r <= 0)
+            break;
+        u32_DispatchMessageA(&m);
+    }
+    int64_t result = dw->dlg_result;
+    u32_DestroyWindow(hwnd);
+    return result;
+}
+
+static WN_API uint64_t u32_CreateDialogParamA(uint64_t hinst, const void *tmpl,
+                                              uint64_t parent, uint64_t dlgproc,
+                                              uint64_t param)
+{
+    return create_dialog_from_template(hinst, tmpl, parent, dlgproc, param, 0);
+}
+
+static WN_API void u32_EndDialog(uint64_t hwnd, int64_t result)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !w->is_dialog) {
+        wn_log(WN_LOG_WARN, "user32: EndDialog on non-dialog hwnd 0x%llx",
+               (unsigned long long)hwnd);
+        return;
+    }
+    w->dlg_result = result;
+    w->dlg_done = 1;
+    post_msg(hwnd, 0, 0, 0);   /* wake the modal loop */
+}
+
+static WN_API uint64_t u32_GetDlgItem(uint64_t hwnd, int32_t id)
+{
+    for (int i = 0; i < g_hwnd_count; i++) {
+        wn_window *c = g_hwnds[i].win;
+        if (c && c->parent == hwnd && (int64_t)c->id == id)
+            return (uint64_t)(uintptr_t)g_hwnds[i].h;
+    }
+    wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+    return 0;
+}
+
+static WN_API int32_t u32_IsDialogMessageA(void *msg)
+{
+    (void)msg;
+    return 0;   /* no tab navigation yet (documented) */
+}
+
+static WN_API int32_t u32_SetDlgItemTextA(uint64_t hwnd, int32_t id,
+                                          const char *text)
+{
+    uint64_t c = u32_GetDlgItem(hwnd, id);
+    if (!c)
+        return 0;
+    wn_window *w = win_from_hwnd(c);
+    if (w && w->cls && w->cls->proc)
+        return (int32_t)w->cls->proc(c, WN_WM_SETTEXT, 0,
+                                     (int64_t)(uintptr_t)text);
+    return 0;
+}
+
+/* --- window text + longs --------------------------------------------------- */
+
+static WN_API int32_t u32_SetWindowTextA(uint64_t hwnd, const char *text)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    snprintf(w->title, sizeof w->title, "%s", text ? text : "");
+    if (w->is_child) {
+        compose_child(w);
+    }
+    return 1;
+}
+
+static WN_API int32_t u32_GetWindowTextA(uint64_t hwnd, char *buf, int32_t max)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !buf || max <= 0)
+        return 0;
+    snprintf(buf, (size_t)max, "%s", w->title);
+    return (int32_t)strlen(buf);
+}
+
+static WN_API int64_t u32_GetWindowLongPtrA(uint64_t hwnd, int32_t idx)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    if (idx == -21 /* GWL_USERDATA */)
+        return (int64_t)w->userdata;
+    if (idx == -16 /* GWL_STYLE */)
+        return 0;
+    return 0;
+}
+
+static WN_API int64_t u32_SetWindowLongPtrA(uint64_t hwnd, int32_t idx,
+                                            int64_t val)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    if (idx == -21) {
+        int64_t old = (int64_t)w->userdata;
+        w->userdata = (uint64_t)val;
+        return old;
+    }
+    wn_log(WN_LOG_WARN, "user32: SetWindowLongPtr index %d unsupported",
+           idx);
+    return 0;
+}
 
 /* --- export table ----------------------------------------------------------------- */
 
@@ -845,6 +1383,16 @@ const wn_export_entry wn_user32_exports[] = {
     { "ShowWindow", u32_ShowWindow },
     { "TranslateMessage", u32_TranslateMessage },
     { "UpdateWindow", u32_UpdateWindow },
+    { "DialogBoxParamA", u32_DialogBoxParamA },
+    { "CreateDialogParamA", u32_CreateDialogParamA },
+    { "EndDialog", u32_EndDialog },
+    { "GetDlgItem", u32_GetDlgItem },
+    { "IsDialogMessageA", u32_IsDialogMessageA },
+    { "SetDlgItemTextA", u32_SetDlgItemTextA },
+    { "SetWindowTextA", u32_SetWindowTextA },
+    { "GetWindowTextA", u32_GetWindowTextA },
+    { "GetWindowLongPtrA", u32_GetWindowLongPtrA },
+    { "SetWindowLongPtrA", u32_SetWindowLongPtrA },
     { "MessageBoxA", u32_MessageBoxA },
     { "MessageBoxW", u32_MessageBoxW },
     { NULL, NULL },
