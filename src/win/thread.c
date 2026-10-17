@@ -150,6 +150,7 @@ static void *wn_thread_trampoline(void *arg)
     wn_log(WN_LOG_TRACE, "thread %u entering start 0x%llx", th->tid,
            (unsigned long long)(uintptr_t)ctx.start);
     uint64_t rv = ctx.start(ctx.param);
+    wn_fls_run_callbacks();
     wn_thread_exit((uint32_t)rv);
 }
 

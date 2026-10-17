@@ -95,18 +95,33 @@ int wn_futex_wake(uint32_t *addr, int n)
 
 /* --- process create --------------------------------------------------------- */
 
+/* Default prefix: $WINNUX_HOME/default, else ~/.WinNux/default (documented
+ * environment layout; self-contained prefixes under one root). */
+void wn_prefix_default(char *out, size_t cap)
+{
+    const char *home = getenv("WINNUX_HOME");
+    if (home && *home) {
+        snprintf(out, cap, "%s/default", home);
+        return;
+    }
+    home = getenv("HOME");
+    snprintf(out, cap, "%s/.WinNux/default", home ? home : "/tmp");
+}
+
 uint32_t wn_process_create(const char *prefix, const char *exe_display_name)
 {
     memset(&g_proc, 0, sizeof g_proc);
     g_proc.pid = getpid();
     g_proc.process_heap = WN_PROCESS_HEAP_HANDLE;
 
-    /* Prefix: WINNUX_PREFIX, else ~/.winnux/default. */
+    /* Prefix: --prefix arg > WINNUX_PREFIX env > WINNUX_HOME/default >
+     * ~/.WinNux/default. */
     const char *p = prefix;
     char def[1024];
+    if (!p || !*p)
+        p = getenv("WINNUX_PREFIX");
     if (!p || !*p) {
-        const char *home = getenv("HOME");
-        snprintf(def, sizeof def, "%s/.winnux/default", home ? home : "/tmp");
+        wn_prefix_default(def, sizeof def);
         p = def;
     }
     snprintf(g_proc.prefix, sizeof g_proc.prefix, "%s", p);

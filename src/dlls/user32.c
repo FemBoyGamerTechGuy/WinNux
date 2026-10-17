@@ -782,6 +782,42 @@ extern WN_API int32_t g32_FillRect(wn_handle hdc, const void *rect, wn_handle br
 
 /* --- export table ----------------------------------------------------------------- */
 
+
+/* MessageBox: no dialog engine yet, so the box is PRINTED (loudly) and we
+ * answer IDOK. This keeps apps running and makes their complaints visible
+ * in the log - a deliberate diagnostic aid, not a fake window. */
+static WN_API int32_t u32_MessageBoxA(uint64_t hwnd, const char *text,
+                                      const char *caption, uint32_t type)
+{
+    (void)hwnd;
+    (void)type;
+    wn_log(WN_LOG_ERR, "MSGBOX '%s': %s",
+           caption ? caption : "", text ? text : "");
+    return 1;   /* IDOK */
+}
+
+static WN_API int32_t u32_MessageBoxW(uint64_t hwnd, const uint16_t *text,
+                                      const uint16_t *caption, uint32_t type)
+{
+    (void)hwnd;
+    (void)type;
+    char *t = NULL, *c = NULL;
+    if (text) {
+        size_t l = 0;
+        while (text[l]) l++;
+        t = wn_utf16_to_utf8(text, l);
+    }
+    if (caption) {
+        size_t l = 0;
+        while (caption[l]) l++;
+        c = wn_utf16_to_utf8(caption, l);
+    }
+    wn_log(WN_LOG_ERR, "MSGBOX '%s': %s", c ? c : "", t ? t : "");
+    free(t);
+    free(c);
+    return 1;   /* IDOK */
+}
+
 const wn_export_entry wn_user32_exports[] = {
     { "BeginPaint", g32_BeginPaint },
     { "CreateWindowExA", u32_CreateWindowExA },
@@ -809,5 +845,7 @@ const wn_export_entry wn_user32_exports[] = {
     { "ShowWindow", u32_ShowWindow },
     { "TranslateMessage", u32_TranslateMessage },
     { "UpdateWindow", u32_UpdateWindow },
+    { "MessageBoxA", u32_MessageBoxA },
+    { "MessageBoxW", u32_MessageBoxW },
     { NULL, NULL },
 };

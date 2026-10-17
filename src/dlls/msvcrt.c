@@ -816,6 +816,105 @@ static WN_API wn_ms_file *ms_fopen(const char *path, const char *mode)
     return f;
 }
 
+/* _wfopen: wide path -> same engine as fopen. */
+static WN_API wn_ms_file *ms__wfopen(const uint16_t *wpath, const char *mode)
+{
+    if (!wpath || !mode)
+        return NULL;
+    size_t l = 0;
+    while (wpath[l])
+        l++;
+    char *path = wn_utf16_to_utf8(wpath, l);
+    if (!path)
+        return NULL;
+    wn_ms_file *f = ms_fopen(path, mode);
+    free(path);
+    return f;
+}
+
+/* _fileno: FILE* -> host fd (std shells have fixed 0/1/2). */
+static WN_API int32_t ms__fileno(wn_ms_file *f)
+{
+    f = ms_file_of(f);
+    if (!f)
+        return -1;
+    return f->fd;
+}
+
+/* _isatty: real. */
+static WN_API int32_t ms__isatty(int32_t fd)
+{
+    return isatty(fd);
+}
+
+/* _access / _waccess: existence + mode bits via the mapped path. */
+static WN_API int32_t ms__access(const char *path, int32_t mode)
+{
+    if (!path)
+        return -1;
+    char host[2100];
+    if (wn_path_resolve_ci(path, host, sizeof host) != 0) {
+        if (wn_path_win_to_host(path, host, sizeof host) != 0)
+            return -1;
+    }
+    if (access(host, mode & 7) != 0)
+        return -1;
+    return 0;
+}
+
+static WN_API int32_t ms__waccess(const uint16_t *wpath, int32_t mode)
+{
+    if (!wpath)
+        return -1;
+    size_t l = 0;
+    while (wpath[l])
+        l++;
+    char *path = wn_utf16_to_utf8(wpath, l);
+    if (!path)
+        return -1;
+    int32_t r = ms__access(path, mode);
+    free(path);
+    return r;
+}
+
+
+/* fgets: line read straight off the fd (FILE shells are unbuffered). */
+static WN_API char *ms_fgets(char *buf, int32_t n, wn_ms_file *f)
+{
+    f = ms_file_of(f);
+    if (!f || !buf || n <= 0)
+        return NULL;
+    size_t got = 0;
+    while (got + 1 < (size_t)n) {
+        char c;
+        ssize_t r = read(f->fd, &c, 1);
+        if (r != 1) {
+            if (r == 0)
+                f->eof = 1;
+            if (got == 0)
+                return NULL;
+            break;
+        }
+        buf[got++] = c;
+        if (c == '\n')
+            break;
+    }
+    buf[got] = 0;
+    return buf;
+}
+
+/* _setmode: TEXT/BINARY accepted (no translation performed - documented);
+ * UTF modes rejected honestly. Returns the previous mode. */
+static WN_API int32_t ms__setmode(int32_t fd, int32_t mode)
+{
+    if (fd < 0 || fd > 2)
+        return -1;
+    if (mode != 0x4000 /*_O_TEXT*/ && mode != 0x8000 /*_O_BINARY*/)
+        return -1;
+    (void)mode;
+    return 0x8000;   /* we are always binary */
+}
+
 static WN_API int32_t ms_fclose(wn_ms_file *f)
 {
     f = ms_file_of(f);
@@ -926,6 +1025,76 @@ static WN_API char *ms_getenv(const char *name)
     return NULL;
 }
 
+/* --- ctype (real: forward to host with unsigned-char domain) ---------------- */
+
+static WN_API int32_t ms_toupper(int32_t c) { return toupper((unsigned char)(c & 0xFF)); }
+static WN_API int32_t ms_tolower(int32_t c) { return tolower((unsigned char)(c & 0xFF)); }
+static WN_API int32_t ms_isalpha(int32_t c) { return isalpha((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_isalnum(int32_t c) { return isalnum((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_iscntrl(int32_t c) { return iscntrl((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_isdigit(int32_t c) { return isdigit((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_isgraph(int32_t c) { return isgraph((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_islower(int32_t c) { return islower((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_isprint(int32_t c) { return isprint((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_ispunct(int32_t c) { return ispunct((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_isspace(int32_t c) { return isspace((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_isupper(int32_t c) { return isupper((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms_isxdigit(int32_t c) { return isxdigit((unsigned char)(c & 0xFF)) != 0; }
+static WN_API int32_t ms___isascii(int32_t c) { return (c & ~0x7F) == 0; }
+static WN_API int32_t ms_toascii(int32_t c) { return c & 0x7F; }
+
+/* --- _setjmp / _longjmp (MS x64 jmp_buf layout: uint64_t[16]) ------------------
+ *
+ * MSVC's plain _setjmp saves the 6 nonvolatile GPRs + r12-r15 + rsp + rip:
+ *   [0]=RBX [1]=RSI [2]=RDI [3]=RBP [4..7]=R12-R15 [8]=RSP [9]=RIP
+ * These are called BY GUEST CODE directly, so they follow the MS ABI
+ * (rcx = jmp_buf). Implemented in raw asm like the stub trampoline.
+ */
+extern WN_API int32_t ms__setjmp_impl(void *env);
+extern WN_API void ms__longjmp_impl(void *env, uint64_t val);
+
+__asm__(
+    ".text\n"
+    ".globl ms__setjmp_impl\n"
+    ".type ms__setjmp_impl, @function\n"
+    "ms__setjmp_impl:\n"
+    "    movq %rbx,   0x00(%rcx)\n"
+    "    movq %rsi,   0x08(%rcx)\n"
+    "    movq %rdi,   0x10(%rcx)\n"
+    "    movq %rbp,   0x18(%rcx)\n"
+    "    movq %r12,   0x20(%rcx)\n"
+    "    movq %r13,   0x28(%rcx)\n"
+    "    movq %r14,   0x30(%rcx)\n"
+    "    movq %r15,   0x38(%rcx)\n"
+    "    leaq 8(%rsp), %rax\n"
+    "    movq %rax,   0x40(%rcx)\n"   /* caller rsp  */
+    "    movq (%rsp), %rax\n"
+    "    movq %rax,   0x48(%rcx)\n"   /* return addr */
+    "    xorl %eax, %eax\n"
+    "    ret\n"
+    ".size ms__setjmp_impl, .-ms__setjmp_impl\n"
+    ".globl ms__longjmp_impl\n"
+    ".type ms__longjmp_impl, @function\n"
+    "ms__longjmp_impl:\n"            /* rcx = env, rdx = val */
+    "    movq 0x00(%rcx), %rbx\n"
+    "    movq 0x08(%rcx), %rsi\n"
+    "    movq 0x10(%rcx), %rdi\n"
+    "    movq 0x18(%rcx), %rbp\n"
+    "    movq 0x20(%rcx), %r12\n"
+    "    movq 0x28(%rcx), %r13\n"
+    "    movq 0x30(%rcx), %r14\n"
+    "    movq 0x38(%rcx), %r15\n"
+    "    movq 0x40(%rcx), %rsp\n"
+    "    movq 0x48(%rcx), %rax\n"
+    "    xorl %ecx, %ecx\n"          /* clear retval's env for good measure */
+    "    testq %rdx, %rdx\n"
+    "    jne 2f\n"
+    "    movl $1, %edx\n"
+    "2:  movq %rdx, %rax\n"
+    "    jmp *%rax\n"
+    ".size ms__longjmp_impl, .-ms__longjmp_impl\n"
+);
+
 /* --- export table -------------------------------------------------------------------------------- */
 
 const wn_export_entry wn_msvcrt_exports[] = {
@@ -952,16 +1121,35 @@ const wn_export_entry wn_msvcrt_exports[] = {
     { "_initterm_e", ms__initterm_e },
     { "_lock", ms__lock },
     { "_snprintf", ms_snprintf },
+    { "_setjmp", ms__setjmp_impl },
+    { "_longjmp", ms__longjmp_impl },
+    { "longjmp", ms__longjmp_impl },
     { "_strdup", ms_strdup },
     { "_stricmp", ms_stricmp },
     { "_strnicmp", ms_strnicmp },
     { "_unlock", ms__unlock },
     { "_vsnprintf", ms_vsnprintf },
     { "abort", ms_abort },
+    { "toupper", ms_toupper },
+    { "tolower", ms_tolower },
+    { "isalpha", ms_isalpha },
+    { "isalnum", ms_isalnum },
+    { "iscntrl", ms_iscntrl },
+    { "isdigit", ms_isdigit },
+    { "isgraph", ms_isgraph },
+    { "islower", ms_islower },
+    { "isprint", ms_isprint },
+    { "ispunct", ms_ispunct },
+    { "isspace", ms_isspace },
+    { "isupper", ms_isupper },
+    { "isxdigit", ms_isxdigit },
+    { "__isascii", ms___isascii },
+    { "toascii", ms_toascii },
     { "abs", (void *)ms_abs },
     { "atexit", ms_atexit },
     { "atof", ms_atof },
     { "atoi", ms_atoi },
+    { "_time64", ms_time },
     { "atol", ms_atol },
     { "atoll", ms_atoll },
     { "calloc", ms_calloc },
@@ -972,6 +1160,13 @@ const wn_export_entry wn_msvcrt_exports[] = {
     { "feof", ms_feof },
     { "fflush", ms_fflush },
     { "fopen", ms_fopen },
+    { "_wfopen", ms__wfopen },
+    { "_fileno", ms__fileno },
+    { "_isatty", ms__isatty },
+    { "_access", ms__access },
+    { "_waccess", ms__waccess },
+    { "fgets", ms_fgets },
+    { "_setmode", ms__setmode },
     { "fprintf", ms_fprintf },
     { "fputc", ms_fputc },
     { "fputs", ms_fputs },

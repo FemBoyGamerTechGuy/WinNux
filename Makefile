@@ -17,7 +17,7 @@ OBJ     := obj
 TARGET  := $(BIN)/winnux
 
 SRCS    := $(sort $(wildcard src/*.c src/common/*.c src/pe/*.c src/loader/*.c \
-            src/win/*.c src/dlls/*.c src/backends/*.c src/gfx/*.c))
+            src/win/*.c src/dlls/*.c src/backends/*.c src/gfx/*.c src/tools/*.c))
 OBJS    := $(patsubst src/%.c,$(OBJ)/%.o,$(SRCS))
 
 # Cross toolchain used to build Windows test binaries (tests only, never linked

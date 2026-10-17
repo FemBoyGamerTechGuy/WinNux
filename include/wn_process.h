@@ -162,6 +162,13 @@ typedef struct wn_process {
 
 extern wn_process g_proc;
 
+/* Default prefix location: $WINNUX_HOME/default, else ~/.WinNux/default.
+ * Mirrors the documented environment layout (README/ARCHITECTURE). */
+void wn_prefix_default(char *out, size_t cap);
+
+/* Run FLS destructors for the current thread (called from thread exit). */
+void wn_fls_run_callbacks(void);
+
 /* Initialize process-wide state: prefix, env, PEB skeleton. Returns 0. */
 uint32_t wn_process_create(const char *prefix, const char *exe_display_name);
 

@@ -183,19 +183,69 @@ static WN_API wn_handle k32_GetModuleHandleA(const char *name)
 
 static WN_API wn_handle k32_GetModuleHandleW(const uint16_t *name)
 {
-    char a[256];
     if (!name) {
-        a[0] = '\0';
-    } else {
-        char *s = wn_utf16_to_utf8(name, 4096);
-        if (!s) {
-            wn_last_error_set(WN_ERR_INVALID_PARAMETER);
-            return NULL;
-        }
-        snprintf(a, sizeof a, "%s", s);
-        free(s);
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return NULL;
     }
-    return k32_GetModuleHandleA(name ? a : NULL);
+    size_t l = 0;
+    while (name[l])
+        l++;
+    char *s = wn_utf16_to_utf8(name, l);
+    if (!s) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return NULL;
+    }
+    wn_handle h = k32_GetModuleHandleA(s);
+    free(s);
+    return h;
+}
+
+/* GetModuleHandleEx: FROM_ADDRESS resolves a PC to its module handle. */
+static WN_API int32_t k32_GetModuleHandleExW(uint32_t flags,
+                                             const uint16_t *name,
+                                             wn_handle *out)
+{
+    if (!out)
+        return 0;
+    if (flags & 0x4 /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */) {
+        wn_module *m = wn_module_from_addr(name /* the address */, NULL);
+        if (!m) {
+            wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
+            *out = NULL;
+            return 0;
+        }
+        *out = (wn_handle)(uintptr_t)m->base;
+        return 1;
+    }
+    if (!name) {
+        *out = (wn_handle)(uintptr_t)g_proc.exe->base;
+        return 1;
+    }
+    *out = k32_GetModuleHandleW(name);
+    return *out != NULL;
+}
+
+static WN_API int32_t k32_GetModuleHandleExA(uint32_t flags, const char *name,
+                                             wn_handle *out)
+{
+    if (!out)
+        return 0;
+    if (flags & 0x4) {
+        wn_module *m = wn_module_from_addr((const void *)(uintptr_t)name, NULL);
+        if (!m) {
+            wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
+            *out = NULL;
+            return 0;
+        }
+        *out = (wn_handle)(uintptr_t)m->base;
+        return 1;
+    }
+    if (!name) {
+        *out = (wn_handle)(uintptr_t)g_proc.exe->base;
+        return 1;
+    }
+    *out = k32_GetModuleHandleA(name);
+    return *out != NULL;
 }
 
 static WN_API uint32_t k32_GetModuleFileNameA(wn_handle mod, char *out, uint32_t cap)
@@ -254,6 +304,239 @@ static wn_handle load_module_by_name(const char *name, int flags)
     return (wn_handle)(uintptr_t)m->base;
 }
 
+
+/* --- FLS (Fiber Local Storage) ------------------------------------------------
+ *
+ * Implemented on the Tls index space (per-thread values already work). FLS
+ * adds per-index destructors invoked on thread exit (MSDN contract); we run
+ * them from wn_thread_exit. 0 = free, 1 = used-no-callback, else callback.
+ */
+#define WN_FLS_MAX 1088
+static uint64_t g_fls_cb[WN_FLS_MAX];
+
+static WN_API uint32_t k32_TlsAlloc(void);
+static WN_API int32_t k32_TlsFree(uint32_t idx);
+static WN_API void *k32_TlsGetValue(uint32_t idx);
+static WN_API int32_t k32_TlsSetValue(uint32_t idx, void *v);
+
+static WN_API uint32_t k32_FlsAlloc(uint64_t callback)
+{
+    uint32_t idx = k32_TlsAlloc();
+    if (idx == 0xFFFFFFFFu)
+        return 0xFFFFFFFFu;
+    if (idx >= WN_FLS_MAX) {
+        wn_log(WN_LOG_ERR, "FlsAlloc: index %u beyond callback table", idx);
+        return 0xFFFFFFFFu;
+    }
+    g_fls_cb[idx] = callback;
+    return idx;
+}
+
+static WN_API int32_t k32_FlsFree(uint32_t idx)
+{
+    if (idx < WN_FLS_MAX)
+        g_fls_cb[idx] = 0;
+    return k32_TlsFree(idx);
+}
+
+static WN_API void *k32_FlsGetValue(uint32_t idx)
+{
+    return k32_TlsGetValue(idx);
+}
+
+static WN_API int32_t k32_FlsSetValue(uint32_t idx, void *v)
+{
+    return k32_TlsSetValue(idx, v);
+}
+
+/* Called from wn_thread_exit (thread.c) for every thread including main. */
+void wn_fls_run_callbacks(void)
+{
+    for (uint32_t i = 0; i < WN_FLS_MAX && i < 1088u; i++) {
+        if (!g_fls_cb[i])
+            continue;
+        void *v = k32_TlsGetValue(i);
+        if (!v)
+            continue;
+        typedef WN_API void (*fls_cb)(void *);
+        wn_log(WN_LOG_DEBUG, "FlsCallback[%u](%p)", i, v);
+        ((fls_cb)(uintptr_t)g_fls_cb[i])(v);
+    }
+}
+
+
+/* --- directory / env / locale batch (real) --------------------------------- */
+
+static int copy_winstr(char *out, uint32_t cap, const char *src)
+{
+    size_t l = strlen(src);
+    if (cap == 0)
+        return (uint32_t)(l + 1);
+    if (l + 1 > cap)
+        return l + 1 > 0xFFFFFFFFu ? 0 : (uint32_t)(l + 1);
+    memcpy(out, src, l + 1);
+    return (uint32_t)l;
+}
+
+static WN_API uint32_t k32_GetSystemDirectoryA(char *buf, uint32_t cap)
+{
+    return copy_winstr(buf, cap, "C:\\windows\\system32");
+}
+
+static WN_API uint32_t k32_GetSystemDirectoryW(uint16_t *buf, uint32_t cap)
+{
+    uint16_t *w = wn_utf8_to_utf16("C:\\windows\\system32", NULL);
+    if (!w)
+        return 0;
+    size_t l = 0;
+    while (w[l])
+        l++;
+    uint32_t rv = 0;
+    if (cap == 0) {
+        rv = (uint32_t)(l + 1);
+    } else if (l + 1 > cap) {
+        rv = (uint32_t)(l + 1);
+    } else {
+        memcpy(buf, w, (l + 1) * 2);
+        rv = (uint32_t)l;
+    }
+    free(w);
+    return rv;
+}
+
+static WN_API uint32_t k32_GetWindowsDirectoryA(char *buf, uint32_t cap)
+{
+    return copy_winstr(buf, cap, "C:\\windows");
+}
+
+static WN_API uint32_t k32_GetWindowsDirectoryW(uint16_t *buf, uint32_t cap)
+{
+    uint16_t *w = wn_utf8_to_utf16("C:\\windows", NULL);
+    if (!w)
+        return 0;
+    size_t l = 0;
+    while (w[l])
+        l++;
+    uint32_t rv = 0;
+    if (cap == 0 || l + 1 > cap)
+        rv = (uint32_t)(l + 1);
+    else {
+        memcpy(buf, w, (l + 1) * 2);
+        rv = (uint32_t)l;
+    }
+    free(w);
+    return rv;
+}
+
+static WN_API uint64_t k32_GetEnvironmentStringsW(void)
+{
+    /* UTF-16 block: NAME=value\0 ... \0\0 (our knobs hidden). */
+    wn_buf b;
+    wn_buf_init(&b);
+    for (char **e = environ; e && *e; e++) {
+        if (wn_strcaseprefix(*e, "WINNUX_"))
+            continue;
+        size_t n = strlen(*e);
+        uint16_t *w = wn_utf8_to_utf16_n(*e, n + 1);
+        if (w) {
+            wn_buf_append(&b, w, (n + 1) * 2);
+            free(w);
+        }
+    }
+    uint16_t z = 0;
+    wn_buf_append(&b, &z, 2);
+    wn_buf_append(&b, &z, 2);
+    return (uint64_t)(uintptr_t)b.data;
+}
+
+extern char **environ;
+
+static WN_API int32_t k32_FreeEnvironmentStringsW(uint16_t *block)
+{
+    free(block);
+    return 1;
+}
+
+static WN_API int32_t k32_IsValidCodePage(uint32_t cp)
+{
+    switch (cp) {
+    case 0: case 437: case 850: case 1252: case 65001: case 1200:
+        return 1;
+    default:
+        return cp >= 1250 && cp <= 1258 ? 1 : 0;
+    }
+}
+
+static WN_API void k32_InitializeSListHead(void *list)
+{
+    if (list)
+        memset(list, 0, 16);
+}
+
+static WN_API int32_t k32_IsDBCSLeadByteEx(uint32_t cp, uint8_t b)
+{
+    (void)cp;
+    (void)b;
+    return 0;   /* all our codepages are single-byte-ish (1252/437) */
+}
+
+static WN_API uint32_t k32_GetCurrentDirectoryW(uint32_t cap, uint16_t *buf)
+{
+    char cwd[1100];
+    wn_path_get_cwd_win(cwd, sizeof cwd);
+    uint16_t *w = wn_utf8_to_utf16(cwd, NULL);
+    if (!w)
+        return 0;
+    size_t l = 0;
+    while (w[l])
+        l++;
+    uint32_t rv = 0;
+    if (cap == 0 || l + 1 > cap)
+        rv = (uint32_t)(l + 1);
+    else {
+        memcpy(buf, w, (l + 1) * 2);
+        rv = (uint32_t)l;
+    }
+    free(w);
+    return rv;
+}
+
+static WN_API int32_t k32_SetCurrentDirectoryW(const uint16_t *dir)
+{
+    if (!dir)
+        return 0;
+    size_t l = 0;
+    while (dir[l])
+        l++;
+    char *a = wn_utf16_to_utf8(dir, l);
+    if (!a)
+        return 0;
+    int32_t r = wn_path_set_cwd_win(a) == 0 ? 1 : 0;
+    free(a);
+    return r;
+}
+
+static WN_API void k32_OutputDebugStringW(const uint16_t *s)
+{
+    if (!s) {
+        wn_log(WN_LOG_DEBUG, "OutputDebugString: (null)");
+        return;
+    }
+    size_t l = 0;
+    while (s[l])
+        l++;
+    char *a = wn_utf16_to_utf8(s, l);
+    wn_log(WN_LOG_DEBUG, "OutputDebugString: %s", a ? a : "");
+    free(a);
+}
+
+static WN_API int32_t k32_MulDiv(int32_t n, int32_t num, int32_t den)
+{
+    if (den == 0)
+        return -1;
+    return (int32_t)(((int64_t)n * num) / den);
+}
+
 static WN_API wn_handle k32_LoadLibraryA(const char *name)
 {
     return load_module_by_name(name, 0);
@@ -261,10 +544,32 @@ static WN_API wn_handle k32_LoadLibraryA(const char *name)
 
 static WN_API wn_handle k32_LoadLibraryW(const uint16_t *name)
 {
-    char *a = wn_utf16_to_utf8(name, 4096);
+    if (!name)
+        return NULL;
+    size_t l = 0;
+    while (name[l])
+        l++;
+    char *a = wn_utf16_to_utf8(name, l);
     if (!a)
         return NULL;
     wn_handle h = load_module_by_name(a, 0);
+    free(a);
+    return h;
+}
+
+static WN_API wn_handle k32_LoadLibraryExW(const uint16_t *name, wn_handle f,
+                                           uint32_t flags)
+{
+    if (!name)
+        return NULL;
+    size_t l = 0;
+    while (name[l])
+        l++;
+    char *a = wn_utf16_to_utf8(name, l);
+    if (!a)
+        return NULL;
+    (void)f;
+    wn_handle h = load_module_by_name(a, (int)flags);
     free(a);
     return h;
 }
@@ -1781,8 +2086,15 @@ static WN_API int32_t k32_GetVersionExA(void *vi)
 
 static WN_API int32_t k32_IsProcessorFeaturePresent(uint32_t f)
 {
-    (void)f;
-    return 1;   /* optimistic for common features; honest caveat in STATUS */
+    switch (f) {
+    case 0:  return 0; /* PF_FLOATING_POINT_PRECISION_ERRATA */
+    case 1:  return 0; /* PF_FLOATING_POINT_EMULATED         */
+    case 23: return 0; /* PF_FASTFAIL_AVAILABLE: we do not service int 0x29 */
+    default:
+        /* Everything else the baseline x86-64 has: MMX/SSE/SSE2/SSE3,
+         * cmpxchg, RDTSC, 3DNow-free, etc. */
+        return 1;
+    }
 }
 
 static WN_API int32_t k32_Beep(uint32_t freq, uint32_t dur)
@@ -1835,6 +2147,31 @@ static WN_API int32_t k32_DuplicateHandle(wn_handle src_proc, wn_handle src,
 }
 
 /* --- export table ------------------------------------------------------------------ */
+
+
+/* Console ctrl handlers: registration is real (stored); host -> guest event
+ * forwarding (SIGINT -> CTRL_C_EVENT) is a documented TODO. */
+static uint64_t g_ctrl_handlers[16];
+static int32_t g_ctrl_handler_count;
+
+static WN_API int32_t k32_SetConsoleCtrlHandler(uint64_t handler, int32_t add)
+{
+    if (!add) {
+        for (int i = 0; i < g_ctrl_handler_count; i++)
+            if (g_ctrl_handlers[i] == handler) {
+                g_ctrl_handlers[i] = 0;
+                return 1;
+            }
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (g_ctrl_handler_count >= 16) {
+        wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    g_ctrl_handlers[g_ctrl_handler_count++] = handler;
+    return 1;
+}
 
 const wn_export_entry wn_kernel32_exports[] = {
     { "Beep", k32_Beep },
@@ -1892,6 +2229,8 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "GetModuleFileNameW", k32_GetModuleFileNameW },
     { "GetModuleHandleA", k32_GetModuleHandleA },
     { "GetModuleHandleW", k32_GetModuleHandleW },
+    { "GetModuleHandleExW", k32_GetModuleHandleExW },
+    { "GetModuleHandleExA", k32_GetModuleHandleExA },
     { "GetOEMCP", k32_GetOEMCP },
     { "GetProcAddress", k32_GetProcAddress },
     { "GetProcessHeap", k32_GetProcessHeap },
@@ -1925,6 +2264,7 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "LeaveCriticalSection", k32_LeaveCriticalSection },
     { "LoadLibraryA", k32_LoadLibraryA },
     { "LoadLibraryExA", k32_LoadLibraryExA },
+    { "LoadLibraryExW", k32_LoadLibraryExW },
     { "LoadLibraryW", k32_LoadLibraryW },
     { "LocalAlloc", k32_LocalAlloc },
     { "LocalFree", k32_LocalFree },
@@ -1936,7 +2276,6 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "lstrlenW", k32_lstrlenW },
     { "MoveFileA", k32_MoveFileA },
     { "MultiByteToWideChar", k32_MultiByteToWideChar },
-    { "OutputDebugStringA", k32_OutputDebugStringA },
     { "QueryPerformanceCounter", k32_QueryPerformanceCounter },
     { "QueryPerformanceFrequency", k32_QueryPerformanceFrequency },
     { "RaiseException", k32_RaiseException },
@@ -1968,6 +2307,10 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "SuspendThread", k32_SuspendThread },
     { "SwitchToThread", k32_SwitchToThread },
     { "TerminateProcess", k32_TerminateProcess },
+    { "FlsAlloc", k32_FlsAlloc },
+    { "FlsFree", k32_FlsFree },
+    { "FlsGetValue", k32_FlsGetValue },
+    { "FlsSetValue", k32_FlsSetValue },
     { "TlsAlloc", k32_TlsAlloc },
     { "TlsFree", k32_TlsFree },
     { "TlsGetValue", k32_TlsGetValue },
@@ -1985,5 +2328,22 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "WriteConsoleA", k32_WriteConsoleA },
     { "WriteConsoleW", k32_WriteConsoleW },
     { "WriteFile", k32_WriteFile },
+    { "SetConsoleCtrlHandler", k32_SetConsoleCtrlHandler },
+    { "GetSystemDirectoryA", k32_GetSystemDirectoryA },
+    { "GetSystemDirectoryW", k32_GetSystemDirectoryW },
+    { "GetWindowsDirectoryA", k32_GetWindowsDirectoryA },
+    { "GetWindowsDirectoryW", k32_GetWindowsDirectoryW },
+    { "GetEnvironmentStringsW", k32_GetEnvironmentStringsW },
+    { "FreeEnvironmentStringsW", k32_FreeEnvironmentStringsW },
+    { "IsValidCodePage", k32_IsValidCodePage },
+    { "InitializeSListHead", k32_InitializeSListHead },
+    { "IsDBCSLeadByteEx", k32_IsDBCSLeadByteEx },
+    { "GetCurrentDirectoryA", k32_GetCurrentDirectoryA },
+    { "GetCurrentDirectoryW", k32_GetCurrentDirectoryW },
+    { "SetCurrentDirectoryA", k32_SetCurrentDirectoryA },
+    { "SetCurrentDirectoryW", k32_SetCurrentDirectoryW },
+    { "OutputDebugStringA", k32_OutputDebugStringA },
+    { "OutputDebugStringW", k32_OutputDebugStringW },
+    { "MulDiv", k32_MulDiv },
     { NULL, NULL },
 };

@@ -29,6 +29,7 @@
 #define WINNUX_VERSION "0.1.0"
 
 extern void wn_ms_set_args(int argc, char **argv);
+extern int  wn_cmd_imports(int argc, char **argv);
 
 static struct {
     const char *prefix;
@@ -245,6 +246,7 @@ int main(int argc, char **argv)
                 "WinNux %s — Windows compatibility layer in raw C\n"
                 "usage: winnux <command> [args]\n"
                 "  run app.exe [args...]   run a Windows PE32+ executable\n"
+                "  imports app.exe         list imports: implemented/stubbed/missing\n"
                 "  bench                   performance measurements\n"
                 "  --version               print version\n",
                 WINNUX_VERSION);
@@ -256,6 +258,8 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[1], "run"))
         return cmd_run(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "imports"))
+        return wn_cmd_imports(argc - 2, argv + 2);
     if (!strcmp(argv[1], "bench"))
         return cmd_bench();
     fprintf(stderr, "winnux: unknown command '%s'\n", argv[1]);

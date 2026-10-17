@@ -209,6 +209,26 @@ crash_report(wn_exc_record *rec, wn_context64 *ctx)
            (unsigned long long)ctx->r8, (unsigned long long)ctx->r9,
            (unsigned long long)ctx->r10, (unsigned long long)ctx->r11);
     wn_log(WN_LOG_ERR, "  RIP=%016llx", (unsigned long long)ctx->rip);
+    /* Frame-pointer backtrace (MSVC /Oy- builds): stop on anything that does
+     * not look like a sane chain. Best-effort - we are already crashing. */
+    {
+        uint64_t rbp = ctx->rbp;
+        for (int i = 0; i < 24 && rbp; i++) {
+            if (rbp & 7 || rbp < 0x1000 || rbp - ctx->rbp > 0x400000ULL ||
+                (i && rbp <= ctx->rbp + (uint64_t)i * 16))
+                break;
+            uint64_t ret = *(const uint64_t *)(const void *)(rbp + 8);
+            if (!ret)
+                break;
+            char w[96];
+            wn_module_describe_addr((const void *)(uintptr_t)ret, w, sizeof w);
+            wn_log(WN_LOG_ERR, "  #%d from %s", i, w);
+            uint64_t next = *(const uint64_t *)(const void *)rbp;
+            if (next <= rbp)
+                break;
+            rbp = next;
+        }
+    }
     exit((int)rec->exception_code);
 }
 

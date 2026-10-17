@@ -316,7 +316,15 @@ wn_module *wn_module_load_exe(const char *host_path)
 /* DLL search: builtin registry first, then filesystem. */
 wn_module *wn_module_load_dll(const char *name, const char *dir)
 {
-    const char *norm = wn_dll_normalize_name(name);
+    /* Callers may pass full paths ("C:\windows\system32\kernel32.dll" -
+     * PuTTY does exactly that). Our builtins ARE the system32, so match on
+     * the basename; an explicit non-builtin path maps to the prefix and
+     * loads as a file. */
+    const char *base = name;
+    for (const char *p = name; p && *p; p++)
+        if (*p == '\\' || *p == '/')
+            base = p + 1;
+    const char *norm = wn_dll_normalize_name(base);
 
     wn_module *found = wn_module_find(norm);
     if (found) {
@@ -341,6 +349,21 @@ wn_module *wn_module_load_dll(const char *name, const char *dir)
             wn_log(WN_LOG_DEBUG, "loader: builtin '%s' activated", m->name);
             return m;
         }
+    }
+
+    /* Explicit path? Try mapping it before the directory search. */
+    if (base != name) {
+        char host[2100];
+        if (wn_path_resolve_ci(name, host, sizeof host) == 0 ||
+            wn_path_win_to_host(name, host, sizeof host) == 0) {
+            struct stat st;
+            if (stat(host, &st) == 0 && S_ISREG(st.st_mode))
+                return load_pe(host, base, 0);
+        }
+        wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
+        wn_log(WN_LOG_ERR, "loader: DLL '%s' not found (path did not resolve)",
+               name);
+        return NULL;
     }
 
     /* Filesystem search. */
@@ -416,10 +439,15 @@ void *wn_module_get_proc_ordinal(wn_module *mod, uint32_t ordinal)
     if (!mod)
         return NULL;
     if (mod->kind == WN_MOD_BUILTIN) {
+        /* Builtins are name-indexed; ordinal exports use "#N" entries
+         * (see oleaut32 for the classic by-ordinal surface). */
+        char key[16];
+        snprintf(key, sizeof key, "#%u", ordinal);
         for (const wn_export_entry *e = mod->builtin->exports; e && e->name; e++)
-            ;   /* builtins are name-indexed only */
+            if (!strcmp(e->name, key))
+                return e->fn;
         wn_log(WN_LOG_WARN, "exports: ordinal %u import from builtin '%s' "
-               "(name exports only)", ordinal, mod->name);
+               "not in name table", ordinal, mod->name);
         return NULL;
     }
     return wn_pe_resolve_export(&mod->pe, NULL, (uint16_t)ordinal, 1, 0);
