@@ -72,7 +72,8 @@ run_one() {
         return
     fi
     libs=''
-    grep -lE '#include <windows.h>' "$src" >/dev/null 2>&1 && libs='-lgdi32 -luser32'
+    grep -q '#include <windows.h>' "$src" && libs='-lgdi32 -luser32'
+    grep -q '#include <winsock2.h>' "$src" && libs="$libs -lws2_32" 
     if ! "$MXGCC" -O2 -o "$exe" "$src" $libs 2>>"$RESULTS/build.log"; then
         echo "FAIL $name (build error, see results/build.log)"
         fail=$((fail+1)); failed_names="$failed_names $name(build)"

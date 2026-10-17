@@ -22,6 +22,17 @@ not observed.
 | Module APIs | t09 |
 | VirtualAlloc/Protect/Query/Free + heap | t10 |
 | **GUI vertical slice: X11 via dlopen, window, message loop, WM_PAINT, GDI FillRect/TextOut (server-rendered fonts via glyph cache), timers, destroy** | **t11 under Xvfb** |
+| Winsock (TCP roundtrip, select, nonblocking) | t12 |
+
+### Sockets (new this session)
+
+* ws2_32 builtin over host BSD sockets: socket/bind/listen/accept/connect/
+  send/recv/shutdown/closesocket, ioctlsocket FIONBIO, select with the
+  **Windows fd_set layout** (count + SOCKET array, translated to host
+  fd_set and back), __WSAFDIsSet, inet_addr/ntoa, gethostbyname,
+  WSAStartup. SO_REUSEADDR on stream sockets matches Windows rebind
+  behavior. **Proof: t12 — in-guest TCP server+client roundtrip with
+  select() and nonblocking accept: 12/12 suite pass.**
 
 ### GUI architecture (as of this session)
 
