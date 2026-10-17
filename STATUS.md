@@ -4,6 +4,63 @@ Updated every session. Format: what works (with the test that proves it),
 what is broken, what is untested, what is next. Never claim success that was
 not observed.
 
+## Date: 2026-10-18 (session 4)
+
+### PuTTY STAYS ALIVE (the headline)
+
+`winnux run putty.exe` under Xvfb now **runs until killed** (exit 124 after
+a 30-40s timeout = a live GUI app in its message loop), with the
+"PuTTY Configuration" dialog and "hidden timing window" mapped in the X
+window tree, a QUIET log (only the three known optional-DLL notes:
+wship6/hhctrl/shcore), and **40 minutes-equivalent soak: zero
+AddressSanitizer/UBSan reports**. This session found and fixed the chain
+that used to kill putty ~50ms after startup:
+
+1. **gdi32 GetTextMetricsA wrote 32 bytes past TEXTMETRICA** (memset 0x58 +
+   a write at offset 0x54 into a 56-byte struct). Putty's stack canary sat
+   exactly after the 56-byte caller buffer → MSVC /GS failure →
+   `__report_gsfailure` → `TerminateProcess(GetCurrentProcess(),
+   0xC0000409 STATUS_STACK_BUFFER_OVERRUN)`. Fixed with the exact x64
+   layout (tmItalic@0x30, tmPitchAndFamily@0x33, tmCharSet@0x34; total
+   0x38). Found by disassembling putty's report path + stack archaeology
+   (the failing function's RA and corrupted canary were recovered from the
+   report_gsfailure frame).
+2. **user32 LoadCursor/LoadIcon(A/W) dereferenced MAKEINTRESOURCE
+   values** (IDC_ARROW = 32512 = 0x7f00 passed as a "string"). Fixed:
+   `IS_INTRESOURCE` check (< 0x10000) in res_name_to_id + the W variants.
+3. **IsDialogMessage had a one-arg signature** — it takes (hDlg, lpMsg);
+   RCX is the dialog handle, RDX the MSG. The old code faulted reading the
+   handle as the MSG pointer.
+4. **loader DLL probe loop read cands[2] OUT OF BOUNDS**: when a
+   LoadLibrary path had no ".dll" suffix (hhctrl.ocx), the `.dll`-append
+   branch filled the last NULL slot and the loop walked one past the array
+   into stack garbage (the "unreadable win-path pointer 0x6" spam).
+   Fixed: cands[3] with a mandatory NULL terminator + Windows semantics
+   (.dll is appended ONLY to extension-less names — "hhctrl.ocx" is probed
+   as-is).
+5. **MoveWindow + SetWindowPos are real now** (was a stub putty's dialog
+   layout hits): child coordinates + parent recompose; top-level resize
+   through a new backend op `win_move_resize` (X11: XMoveResizeWindow via
+   dlsym + pixel-buffer realloc). WM_SIZE/WM_MOVE posted.
+6. kernel32: **Rtl* unwinding exports** (RtlCaptureContext raw asm,
+   RtlLookupFunctionEntry .pdata binary search, RtlVirtualUnwind full
+   unwind-code interpreter incl. XMM saves/CHAINED opcodes, RtlPcToFileHeader,
+   RtlUnwind v1 walk), **RaiseException** (real, routes through the VEH /
+   crash-report path), **UnhandledExceptionFilter** (routes to the app's
+   SetUnhandledExceptionFilter function). Putty's abort/SEH path calls
+   exactly these.
+
+Putty's config dialog: window + OK/Cancel buttons + controls are created
+and the modal loop runs; the dialog is NOT yet visually complete (controls
+draw as flat boxes; no per-control painting fidelity; keyboard nav exists
+via IsDialogMessage but no end-to-end session creation yet — see TODO P0).
+
+### Regression status this session
+
+15/15 tests (t01-t15); lua.exe (`print(1+2*3, ("win"):upper())` → `7 WIN`)
+and sqlite3.exe (`SELECT id, upper(name)` → `1|ALPHA 2|BETA 3|GAMMA`)
+re-verified; putty 40s ASan/UBSan soak clean.
+
 ## Date: 2026-10-17 (session 3)
 
 ### Real applications (the headline)

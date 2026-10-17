@@ -814,9 +814,19 @@ static WN_API wn_handle g32_CreateFontW(int32_t height, int32_t width,
                            quality, pitch, aface);
 }
 
-/* TEXTMETRICA x64: tmHeight@0(4), tmAscent@4, tmDescent@8, tmInternalLeading@0xC,
- * tmExternalLeading@0x10, tmAveCharWidth@0x14, tmMaxCharWidth@0x18,
- * tmWeight@0x1C, tmItalic@0x20 ... tmPitchAndFamily@0x54. 56+ bytes. */
+/* TEXTMETRICA x64 layout (53 bytes, padded to 56 = 0x38):
+ * tmHeight@0x00 tmAscent@0x04 tmDescent@0x08 tmInternalLeading@0x0C
+ * tmExternalLeading@0x10 tmAveCharWidth@0x14 tmMaxCharWidth@0x18
+ * tmWeight@0x1C tmOverhang@0x20 tmDigitizedAspectX@0x24
+ * tmDigitizedAspectY@0x28 tmFirstChar@0x2C tmLastChar@0x2D
+ * tmDefaultChar@0x2E tmBreakChar@0x2F tmItalic@0x30 tmUnderlined@0x31
+ * tmStruckOut@0x32 tmPitchAndFamily@0x33 tmCharSet@0x34
+ *
+ * THE SIZE IS LOAD-BEARING: putty calls GetTextMetricsA with a 56-byte
+ * stack buffer whose /GS canary sits immediately after it; an earlier
+ * version memset 0x58 bytes and wrote tmPitchAndFamily at 0x54 — the
+ * 32-byte overflow zeroed the canary and killed putty with
+ * STATUS_STACK_BUFFER_OVERRUN (0xC0000409). Never write past 0x38. */
 static WN_API int32_t g32_GetTextMetricsA(wn_handle hdc, void *tm)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
@@ -825,7 +835,7 @@ static WN_API int32_t g32_GetTextMetricsA(wn_handle hdc, void *tm)
     gdi_obj *f = dc->dc.cur_font ? dc->dc.cur_font : default_font(dc);
     int cell_h, adv;
     font_metrics(dc, &cell_h, &adv);
-    memset(tm, 0, 0x58);
+    memset(tm, 0, 0x38);                  /* exactly sizeof(TEXTMETRICA) */
     int32_t *v = tm;
     v[0] = cell_h;                        /* tmHeight */
     v[1] = cell_h - 3;                    /* tmAscent */
@@ -835,8 +845,9 @@ static WN_API int32_t g32_GetTextMetricsA(wn_handle hdc, void *tm)
     v[5] = adv;                           /* tmAveCharWidth */
     v[6] = adv;                           /* tmMaxCharWidth */
     v[7] = f->font.weight;                /* tmWeight */
-    ((uint8_t *)tm)[0x20] = (uint8_t)f->font.italic;
-    ((uint8_t *)tm)[0x54] = 0x01;         /* FIXED_PITCH-ish */
+    ((uint8_t *)tm)[0x30] = (uint8_t)f->font.italic;  /* tmItalic */
+    ((uint8_t *)tm)[0x33] = 0x01;         /* tmPitchAndFamily: FIXED_PITCH */
+    ((uint8_t *)tm)[0x34] = 0x00;         /* tmCharSet: ANSI */
     return 1;
 }
 

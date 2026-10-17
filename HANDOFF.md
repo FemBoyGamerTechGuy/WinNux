@@ -3,52 +3,58 @@
 Read this before continuing. Pair with STATUS.md (what works + proof) and
 TODO.md (prioritized backlog).
 
-## Last session (session 3) — what happened
+## Last session (session 4) — what happened
 
-Goal: stop fixing missing DLLs one at a time; make real apps load.
+Goal (from the task brief): keep the loop going on putty until its config
+dialog is real; the session started with in-flight SEH-unwinding work
+(Rtl* exports) uncommitted.
 
-Done, in order:
-1. `winnux imports <exe> [-v]` static import analyzer (PE32+ AND PE32, incl.
-   delay-load imports and builtin ordinal `#N` exports). Exit 1 = missing DLL
-   or 32-bit image.
-2. 25+ new builtin DLLs (imm32, comctl32, comdlg32, shell32, shlwapi, ole32,
-   oleaut32 with ordinals, rpcrt4/uuid, version, psapi, dbghelp, setupapi,
-   winspool.drv, wininet, winhttp, mswsock, iphlpapi, dnsapi, crypt32,
-   bcrypt(+cryptbase), secur32/sspicli, userenv, uxtheme, dwmapi, winmm,
-   msvcp140 family) + api-set routing (crt→ucrtbase, rest→kernelbase).
-3. Real bugs found BY REAL APPS and fixed:
-   - **loader: LoadLibrary with full paths** ("C:\windows\system32\kernel32.dll")
-     now resolves: basename matches builtins, paths map into the prefix.
-     This is what unblocked putty's winsock load.
-   - wn_utf16_to_utf8(length) misused in 3 places (LoadLibraryW,
-     GetModuleHandleW) — out-of-bounds reads, fixed.
-   - FLS implemented on the Tls index space (mingw CRT init needs it).
-   - msvcrt: ctype batch, real x64 `_setjmp`/`_longjmp` (raw asm, MS
-     jmp_buf layout), fgets, _wfopen, _fileno, _isatty, _access, _setmode,
-     _time64.
-   - IsProcessorFeaturePresent: PF_FASTFAIL_AVAILABLE=23 returns 0 now
-     (returning 1 made MSVC abort() execute int 0x29 instantly).
-   - user32 MessageBoxA/W prints text to the log + returns IDOK (diagnostic
-     aid: this is how "Unable to load any WinSock library" was found).
-   - Crash report now walks the RBP frame chain ("#N from module+rva").
-   - wsock32.dll alias onto ws2_32 exports.
-4. Real-app results (recorded in STATUS.md): putty.exe creates a window;
-   lua.exe and sqlite3.exe run REAL workloads; 13/13 tests; ASan+UBSan clean;
-   fuzz clean.
+Putty used to die ~50ms after startup with no crash report — only three
+optional-DLL notes then silence, exit 9. The hunt (disassembly of
+putty.exe + stack archaeology from our TerminateProcess handler) found a
+chain of four real WinNux bugs, all fixed this session:
+
+1. **gdi32 GetTextMetricsA overflow (THE killer)**: memset(tm, 0, 0x58) +
+   a write at tm+0x54 into a 56-byte TEXTMETRICA → 32-byte stack smash →
+   putty's /GS canary corrupted → __report_gsfailure →
+   TerminateProcess(0xC0000409). Exact x64 layout now (0x38 bytes).
+2. **LoadCursor/LoadIcon(A/W) dereferenced MAKEINTRESOURCE** values
+   (IDC_ARROW = 0x7f00 as a char*) → SIGSEGV in res_name_to_id.
+3. **IsDialogMessage was one-arg**; real signature (hDlg, lpMsg) — RCX is
+   the dialog HWND, RDX the MSG*.
+4. **loader cands[2] OOB read** in the explicit-path probe loop (only when
+   the name lacked ".dll", e.g. hhctrl.ocx) → garbage 3rd probe → the
+   "unreadable win-path pointer" WARN spam. cands[3] + NULL terminator +
+   Windows extension semantics (.dll only appended to extension-less names).
+
+Also landed: MoveWindow + SetWindowPos (child coords + parent recompose;
+top-level via new backend op win_move_resize — X11 XMoveResizeWindow
+dlsym'd), and the previously in-flight kernel32 Rtl* unwinding exports
+(RtlCaptureContext raw-asm, RtlLookupFunctionEntry, RtlVirtualUnwind with
+full unwind-code interpretation, RtlPcToFileHeader, RtlUnwind v1) +
+RaiseException + UnhandledExceptionFilter routing to the app's filter.
+
+**RESULT: putty now STAYS ALIVE in its message loop** (killed only by our
+timeout), "PuTTY Configuration" dialog + timing window mapped under Xvfb,
+quiet log, 40s ASan/UBSan soak clean. 15/15 tests; lua/sqlite re-verified.
+
+Debug-tooling that helped (kept): scripts/dev/xtree.c — host tool compiled
+with -lX11 OUTSIDE the product build; dumps the X window tree and saves
+PPM screenshots. `cc -O2 -o /tmp/xtree scripts/dev/xtree.c -lX11`.
 
 ## Next 3 steps (exactly this order)
 
-1. **user32 dialog engine**: DLGTEMPLATE(EX) parser + CreateDialogParamA/W +
-   DialogBoxParam + IsDialogMessageA + EndDialog + GetDlgItem +
-   WM_INITDIALOG. PuTTY's config dialog is the test case (putty.exe +
-   `xprobe :95` to verify the window tree; add t14_gui_dialog mingw test).
-2. **Basic control classes**: register built-in classes "Button", "Edit",
-   "Static", "ListBox", "ComboBox" (own wndprocs over the existing GDI
-   software backend). t15 control test.
-3. **SEH table unwinding** (P1 in TODO.md): RtlLookupFunctionEntry +
-   RtlVirtualUnwind + RtlUnwind(Ex) over .pdata/.xdata — putty's abort path
-   calls them and guest __try needs them. Test: mingw exe with __try/__except
-   catching a deliberate access violation.
+1. **Dialog interaction proof**: route X clicks to child controls →
+   WM_COMMAND (BN_CLICKED, control id) to the dialog proc; verify putty's
+   OK/Cancel/Apply buttons fire (log lines from putty's dlgproc handlers).
+   Extend the existing mouse-hit path in the message pump.
+2. **Control visual fidelity**: real Button (border + text + check),
+   Edit (sunken border + caret), Static, ListBox painting in the compose
+   path + GetSysColor palette; screenshot with xtree should show text in
+   the dialog, not flat boxes.
+3. **SEH dispatch loop** (P1): use RtlVirtualUnwind in wn_seh_raise/crash
+   paths to walk guest frames and call scope-table handlers; t16 test with
+   mingw __try/__except catching a deliberate AV.
 
 ## Dead ends / gotchas (do not repeat)
 
@@ -65,14 +71,28 @@ Done, in order:
   report's frame walk.
 - Stale .o files under obj-dbg (sources since deleted) break the fuzz link:
   `rm -rf obj-dbg && make debug` before fuzzing after structural changes.
+- Builtin output-struct writers MUST match the exact Win64 layout size —
+  putty's /GS canary sat right after a 56-byte TEXTMETRICA and our 88-byte
+  write killed the process with 0xC0000409 (no crash report — MSVC
+  fast-fails). When adding any struct-writing API, write the offsets in a
+  comment and count the bytes.
+- MSVC __report_gsfailure sequence to recognize: SetUnhandledExceptionFilter
+  (NULL) then TerminateProcess(-1, 0xC0000409). If you see it, a callee
+  smashed a guest stack buffer — hunt OUR struct writers first.
+- backtrace() cannot unwind guest (ms_abi) frames; symbolize the first
+  non-winnux frame with wn_module_from_addr and objdump the exe around
+  that RVA (host objdump works on PE with -M intel; image base 0x140000000).
+- `winnux run` output through `grep | head` pipes eats the REAL exit code —
+  redirect to a file and check $? separately or you will misread exits.
 
 ## Environment notes
 
 - Box: Debian 13, GCC 14.2 (user runs GCC 15 — keep both compatible; the
   strchr/strrchr/strstr const-propagation class of diagnostics is the known
   difference so far).
-- Xvfb auto-started on :95 by the test runner; `scripts/xprobe.c` (host
-  tool, not shipped) lists the X window tree — use it to prove guest windows.
+- Xvfb auto-started on :95 by the test runner; `scripts/dev/xtree.c` (host
+  tool, cc -lX11, not shipped) lists the X window tree and captures PPM
+  screenshots — use it to prove guest windows.
 - Real apps live OUTSIDE the repo in /home/z/my-project/apps: putty.exe
   (x64 GUI), 7zr.exe (32-bit! WoW64 driver case), lua-5.4.7 (built with the
   in-tree mingw toolchain), sqlite-amalgamation-3500400 (built likewise).

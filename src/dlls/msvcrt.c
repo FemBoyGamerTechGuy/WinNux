@@ -5,6 +5,8 @@
  * extracted, then formatted with host snprintf — allowed: libc).
  */
 #include "wn_dll.h"
+#include <execinfo.h>
+#include <dlfcn.h>
 #include "wn_types.h"
 #include "wn_process.h"
 #include "wn_log.h"

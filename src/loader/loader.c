@@ -401,19 +401,24 @@ wn_module *wn_module_load_dll(const char *name, const char *dir)
     }
 
     /* Explicit path? Try mapping it before the directory search. Windows
-     * appends .dll to extension-less paths too ("C:\dir\mylib" ->
-     * C:\dir\mylib.dll). */
+     * appends .dll ONLY to extension-less paths ("C:\dir\mylib" ->
+     * C:\dir\mylib.dll); "hhctrl.ocx" or "wship6.dll" are probed as-is.
+     * cands[2] is the mandatory NULL terminator: the probe loop used to
+     * read cands[2] out of bounds when the .dll-append branch filled the
+     * last slot (found via putty's hhctrl.ocx load: it probed a garbage
+     * stack value 0x6 as a path). */
     if (had_path) {
         char host[2100];
         char with_ext_path[1100];
-        const char *cands[2] = { name, NULL };
+        const char *cands[3] = { name, NULL, NULL };
         size_t nl = strlen(name);
-        if (nl < sizeof with_ext_path - 5 &&
+        if (!dot &&
+            nl < sizeof with_ext_path - 5 &&
             !(nl > 4 && !strncasecmp(name + nl - 4, ".dll", 4))) {
             snprintf(with_ext_path, sizeof with_ext_path, "%s.dll", name);
             cands[1] = with_ext_path;
         }
-        for (int c = 0; cands[c]; c++) {
+        for (int c = 0; c < 2 && cands[c]; c++) {
             if (wn_path_resolve_ci(cands[c], host, sizeof host) == 0 ||
                 wn_path_win_to_host(cands[c], host, sizeof host) == 0) {
                 struct stat st;

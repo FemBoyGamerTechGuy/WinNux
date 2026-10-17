@@ -3,34 +3,40 @@
 Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
-## P0 — unblocks real apps right now
+## P0 — make PuTTY's config dialog USABLE (next user-visible milestone)
 
-1. **Dialog engine** (user32): CreateDialogParamA/W, DialogBoxParamA/W,
-   DLGTEMPLATE/DLGTEMPLATEEX parsing, dialog message proc, IsDialogMessage,
-   EndDialog. Evidence: putty.exe config dialog is a dialog + child controls;
-   `[stub] CreateDialogParamA` in every putty run.
-2. **Child control window classes** (user32): "Button", "Edit", "Static",
-   "ListBox", "ComboBox", "ScrollBar" + comctl32 "SysTabControl32",
-   tooltips. Evidence: putty config dialog is built from these.
-3. **user32 surface putty needs**: LoadCursorA, LoadIconA, SetWindowLongPtrA/
-   GetWindowLongPtrA, SetWindowPos, MoveWindow, GetDlgItem, SetDlgItemText,
-   EnableWindow, IsDlgButtonChecked, CheckRadioButton, menus
-   (CreateMenu/AppendMenu/TrackPopupMenu), GetSysColor/Brush, GetSystemMetrics,
-   SystemParametersInfoA, keyboard state (GetKeyboardState, ToAsciiEx).
-4. **gdi32 font/text batch**: CreateFont(Indirect)A, GetTextMetricsA,
-   GetTextExtentPoint32A, ExtTextOutA, SetTextAlign, GetCharWidth32.
-   Evidence: putty terminal rendering is text-based; stubs in every run.
+1. **Dialog visual fidelity**: per-control painting (Button with border +
+   check state, Edit with sunken border + text, Static text layout,
+   ListBox with item list + selection, ComboBox), dialog background
+   GetSysColor(COLOR_BTNFACE), font-accurate text layout. Evidence:
+   putty config dialog is mapped but controls draw as flat boxes; the
+   xtree screenshot shows only gray/white/black.
+2. **End-to-end dialog interaction**: click → WM_COMMAND to the dlgproc
+   (BN_CLICKED with control id), keyboard focus ring, list selection
+   messages, then verify putty's Category tree + Session list + host
+   name edit box respond. Evidence: putty's modal loop runs but no
+   WM_COMMAND routing proof yet.
+3. **PuTTY SSH session start**: once the dialog works, Open button →
+   winsock connect path (ws2_32 is proven; needs the terminal window +
+   per-character rendering). This is the acceptance target from the task
+   brief ("PuTTY config dialog complete, can initiate SSH connection").
+4. **user32 surface still stubbed that putty hits**: menus
+   (CreateMenu/AppendMenu/TrackPopupMenu — putty's system menu),
+   GetSysColor/Brush batch, GetSystemMetrics completeness, monitor APIs
+   (GetMonitorInfoA/MonitorFromWindow), SystemParametersInfoA,
+   keyboard state (GetKeyboardState, ToAsciiEx/ToUnicodeEx), FlashWindowEx.
+   Evidence: STUB lines in the putty trace (info level).
 
-## P1 — next milestone (SEH table unwinding)
+## P1 — next milestone (SEH dispatch: scope tables)
 
-5. **x64 SEH unwinding** (.pdata/.xdata): RtlLookupFunctionEntry,
-   RtlVirtualUnwind, RtlUnwind/RtlUnwindEx, RtlCaptureContext (in ntdll or
-   kernel32 re-export). Guest `__try/__except` + CRT abort/terminate paths
-   depend on it (putty's abort() walked exactly these stubs).
-   SEH opcodes: pushnonvol, allocsmall/large, setfpreg, unwindsave...
-6. **Resource loading** (kernel32): FindResourceA/LoadResource/LockResource/
-   SizeofResource over PE .rsrc (putty embeds its dialogs as resources;
-   version.dll can then read VS_VERSIONINFO too).
+5. **x64 SEH scope-table execution** (on top of the now-real
+   RtlVirtualUnwind/RtlLookupFunctionEntry): walk frames at
+   RaiseException/crash time, call __C_specific_handler filters and
+   handlers, guest `__try/__except` actually catching faults. The
+   Rtl* exports exist; the DISPATCH loop is what's missing.
+   Test: mingw exe with __try/__except catching a deliberate AV.
+6. **Resource loading** — DONE session 3 (moved to STATUS.md: FindResource/
+   Load/Lock/SizeofResource walk putty's .rsrc; dialog templates resolve).
 
 ## P2 — major features
 

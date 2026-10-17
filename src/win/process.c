@@ -3,6 +3,8 @@
  */
 #include "wn_process.h"
 #include "wn_module.h"
+#include <execinfo.h>
+#include <dlfcn.h>
 #include "wn_log.h"
 #include "wn_util.h"
 #include "wn_path.h"

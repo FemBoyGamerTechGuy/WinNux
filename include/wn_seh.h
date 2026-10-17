@@ -23,5 +23,7 @@ void  wn_seh_veh_remove(void *registration);
 
 /* Unhandled exception filter (SetUnhandledExceptionFilter). */
 void *wn_seh_set_unhandled_filter(void *filter);
+/* Route UnhandledExceptionFilter(ep) to the app's installed filter. */
+int64_t wn_seh_call_unhandled_filter(void *exception_pointers);
 
 #endif /* WN_SEH_H */

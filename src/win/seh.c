@@ -9,6 +9,7 @@
 #include "wn_seh.h"
 #include "wn_process.h"
 #include "wn_module.h"
+#include "wn_pe.h"
 #include "wn_log.h"
 #include "wn_util.h"
 
@@ -103,8 +104,25 @@ void wn_seh_veh_remove(void *registration)
 void *wn_seh_set_unhandled_filter(void *filter)
 {
     void *old = (void *)g_unhandled;
+    wn_log(WN_LOG_DEBUG, "seh: app installs unhandled filter %p (old %p)",
+           filter, old);
     g_unhandled = filter;
     return old;
+}
+
+/* UnhandledExceptionFilter kernel32 export: route to the app's installed
+ * filter (guest ms_abi function); the verdict: -1 continue search,
+ * 0 continue, 1 execute handler. */
+int64_t wn_seh_call_unhandled_filter(void *exception_pointers)
+{
+    if (!g_unhandled)
+        return 1;   /* EXCEPTION_EXECUTE_HANDLER (default handler) */
+    typedef WN_API int64_t (*filter_fn)(void *);
+    wn_log(WN_LOG_DEBUG, "seh: dispatching UnhandledExceptionFilter(%p) "
+           "to app filter %p", exception_pointers, (void *)g_unhandled);
+    int64_t r = ((filter_fn)(uintptr_t)g_unhandled)(exception_pointers);
+    wn_log(WN_LOG_DEBUG, "seh: app filter verdict %lld", (long long)r);
+    return r;
 }
 
 /* --- dispatch ------------------------------------------------------------------ */
@@ -322,6 +340,20 @@ void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
     for (uint32_t i = 0; i < rec.number_parameters; i++)
         rec.exception_information[i] = params[i];
 
+    {
+        const char *mod = "?";
+        uint64_t rva = 0;
+        wn_module *m = wn_module_from_addr(
+            (const void *)(uintptr_t)__builtin_return_address(0), NULL);
+        if (m) {
+            mod = m->name;
+            rva = (uint64_t)(uintptr_t)__builtin_return_address(0) -
+                  (uint64_t)(uintptr_t)m->base;
+        }
+        wn_log(WN_LOG_DEBUG, "seh: RaiseException(0x%08X) from %s+0x%llx",
+               code, mod, (unsigned long long)rva);
+    }
+
     ucontext_t uc;
     memset(&uc, 0, sizeof uc);   /* approximate context: raise site */
     wn_context64 ctx;
@@ -333,4 +365,387 @@ void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
         return;   /* VEH continued: exception swallowed (logged) */
 
     crash_report(&rec, &ctx);
+}
+
+/* ============================================================================
+ * Table-driven x64 exception unwinding (.pdata/.xdata) — Rtl* exports.
+ *
+ * Putty's own crash/entropy paths call RtlCaptureContext +
+ * RtlLookupFunctionEntry (+ RtlUnwind) directly, so these must be real.
+ * Layout: RUNTIME_FUNCTION {BeginRVA, EndRVA, UnwindRVA} arrays live in
+ * .pdata; UNWIND_INFO at ImageBase+UnwindRVA describes the prologue.
+ * ==========================================================================*/
+
+/* RtlCaptureContext: must be raw asm — a C wrapper would capture its own
+ * frame instead of the caller's. ms_abi: first arg (CONTEXT*) in RCX. */
+__asm__(
+".globl wn_rtl_capture_context\n"
+".type  wn_rtl_capture_context, @function\n"
+"wn_rtl_capture_context:\n"
+"  movq  %rax, 0x78(%rcx)\n"      /* Rax  */
+"  movq  %rcx, 0x80(%rcx)\n"      /* Rcx  (== ctx) */
+"  movq  %rdx, 0x88(%rcx)\n"      /* Rdx  */
+"  movq  %rbx, 0x90(%rcx)\n"      /* Rbx  */
+"  leaq  8(%rsp), %rax\n"
+"  movq  %rax, 0x98(%rcx)\n"      /* Rsp  (caller, past return address) */
+"  movq  %rbp, 0xA0(%rcx)\n"      /* Rbp  */
+"  movq  %rsi, 0xA8(%rcx)\n"      /* Rsi  */
+"  movq  %rdi, 0xB0(%rcx)\n"      /* Rdi  */
+"  movq  %r8,  0xB8(%rcx)\n"
+"  movq  %r9,  0xC0(%rcx)\n"
+"  movq  %r10, 0xC8(%rcx)\n"
+"  movq  %r11, 0xD0(%rcx)\n"
+"  movq  %r12, 0xD8(%rcx)\n"
+"  movq  %r13, 0xE0(%rcx)\n"
+"  movq  %r14, 0xE8(%rcx)\n"
+"  movq  %r15, 0xF0(%rcx)\n"
+"  movq  (%rsp), %rax\n"
+"  movq  %rax, 0xF8(%rcx)\n"      /* Rip  = return address into caller */
+"  movl  $0x0010003F, 0x30(%rcx)\n"  /* ContextFlags: CONTROL|INT|FP */
+"  movl  $0x33, 0x38(%rcx)\n"     /* SegCs */
+"  movl  $0x2B, 0x42(%rcx)\n"     /* SegSs */
+"  ret\n"
+".size wn_rtl_capture_context, .-wn_rtl_capture_context\n"
+);
+
+/* raw base+RVA resolution (no wn_pe_image handle) */
+static const void *pe_rva_raw(const void *base, uint32_t rva, size_t n)
+{
+    const wn_image_dos_header *dos = base;
+    if (!base || dos->e_magic != 0x5A4D)
+        return NULL;
+    const wn_image_optional_header64 *oh =
+        (const void *)((const uint8_t *)base + dos->e_lfanew + 4 +
+                       sizeof(wn_image_file_header));
+    if (rva >= oh->size_of_image)
+        return NULL;
+    if (n && (uint64_t)rva + n > oh->size_of_image)
+        return NULL;
+    return (const uint8_t *)base + rva;
+}
+
+/* .pdata entry */
+typedef struct {
+    uint32_t begin_rva, end_rva, unwind_rva;
+} wn_runtime_function;
+
+/* walk .pdata of the module containing ControlPc */
+void *wn_seh_lookup_function_entry(uint64_t control_pc, uint64_t *image_base)
+{
+    wn_module *m = wn_module_from_addr((const void *)(uintptr_t)control_pc,
+                                       NULL);
+    if (!m || m->kind != WN_MOD_PE) {
+        if (image_base)
+            *image_base = 0;
+        return NULL;
+    }
+    if (image_base)
+        *image_base = (uint64_t)(uintptr_t)m->base;
+    const wn_image_dos_header *dos = (const void *)m->pe.base;
+    const wn_image_optional_header64 *oh =
+        (const void *)(m->pe.base + dos->e_lfanew + 4 +
+                       sizeof(wn_image_file_header));
+    const wn_image_data_directory *dir = &oh->dirs[3 /*EXCEPTION*/];
+    if (!dir->virtual_address || dir->size < sizeof(wn_runtime_function))
+        return NULL;
+    const wn_runtime_function *rf = (const void *)
+        wn_pe_rva(&m->pe, dir->virtual_address, sizeof *rf);
+    if (!rf)
+        return NULL;
+    size_t n = dir->size / sizeof(wn_runtime_function);
+    uint32_t rva = (uint32_t)(control_pc - (uint64_t)(uintptr_t)m->base);
+    /* binary search */
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (rva < rf[mid].begin_rva)
+            hi = mid;
+        else if (rva >= rf[mid].end_rva)
+            lo = mid + 1;
+        else
+            return (void *)&rf[mid];
+    }
+    return NULL;
+}
+
+/* RtlLookupFunctionEntry(ControlPc, ImageBase*, HistoryTable) */
+WN_API void *seh_RtlLookupFunctionEntry(uint64_t control_pc,
+                                               uint64_t *image_base,
+                                               void *history)
+{
+    (void)history;
+    return wn_seh_lookup_function_entry(control_pc, image_base);
+}
+
+/* RtlPcToFileHeader(Pc, ImageBase*) */
+WN_API void *seh_RtlPcToFileHeader(uint64_t pc, uint64_t *image_base)
+{
+    wn_module *m = wn_module_from_addr((const void *)(uintptr_t)pc, NULL);
+    if (!m) {
+        if (image_base)
+            *image_base = 0;
+        return NULL;
+    }
+    if (image_base)
+        *image_base = (uint64_t)(uintptr_t)m->base;
+    return m->base;
+}
+
+/* --- UNWIND_INFO interpretation --------------------------------------------- */
+
+/* register id -> offset in CONTEXT (for RSP/RBP/RBX/RDI/RSI/R12-R15) */
+static int gpr_ctx_offset(int reg)
+{
+    switch (reg) {
+    case 0: return -1;              /* RAX: not saved by prologues */
+    case 1: return 0x80;            /* RCX */
+    case 2: return 0x88;            /* RDX */
+    case 3: return 0x90;            /* RBX */
+    case 5: return 0xA0;            /* RBP */
+    case 6: return 0xA8;            /* RSI */
+    case 7: return 0xB0;            /* RDI */
+    case 8:  return 0xB8;  case 9:  return 0xC0;
+    case 10: return 0xC8;  case 11: return 0xD0;
+    case 12: return 0xD8;  case 13: return 0xE0;
+    case 14: return 0xE8;  case 15: return 0xF0;
+    default: return -1;
+    }
+}
+
+#define UWOP_PUSH_NONVOL     0
+#define UWOP_ALLOC_LARGE     1
+#define UWOP_ALLOC_SMALL     2
+#define UWOP_SET_FPREG       3
+#define UWOP_SAVE_NONVOL     4
+#define UWOP_SAVE_NONVOL_FAR 5
+#define UWOP_EPILOG          6
+#define UWOP_SPARE_CODE      7
+#define UWOP_SAVE_XMM128     8
+#define UWOP_SAVE_XMM128_FAR 9
+#define UWOP_PUSH_MACHFRAME 10
+
+#define UNW_FLAG_EHANDLER  0x01
+#define UNW_FLAG_UHANDLER  0x02
+#define UNW_FLAG_CHAININFO 0x04
+
+/* RtlVirtualUnwind(HandlerType, ImageBase, TargetIp, FunctionEntry,
+ *                  Context, HandlerData*, EstablisherFrame*,
+ *                  ContextPointers*) -> PEXCEPTION_ROUTINE or 0 */
+WN_API void *seh_RtlVirtualUnwind(uint32_t handler_type,
+                                         uint64_t image_base,
+                                         uint64_t target_ip,
+                                         void *function_entry,
+                                         void *context,
+                                         void **handler_data,
+                                         uint32_t *establisher_frame,
+                                         void *context_pointers)
+{
+    (void)handler_type;
+    (void)target_ip;
+    (void)context_pointers;
+    if (handler_data)
+        *handler_data = NULL;
+    if (establisher_frame)
+        *establisher_frame = 0;
+    wn_context64 *ctx = context;
+    const wn_runtime_function *rf = function_entry;
+    if (!ctx || !rf)
+        return NULL;
+
+    /* UNWIND_INFO (raw base+rva walk; module not needed here) */
+    const uint8_t *ui = pe_rva_raw((const void *)(uintptr_t)image_base,
+                                   rf->unwind_rva, 4);
+    if (!ui) {
+        wn_log(WN_LOG_WARN, "unwind: bad UNWIND_INFO rva 0x%x",
+               rf->unwind_rva);
+        return NULL;
+    }
+    uint32_t flags = ui[0] >> 3;
+    uint32_t count = ui[2];
+    int frame_reg = ui[3] & 0xF;
+    uint32_t frame_off = ui[3] >> 4;
+    const uint16_t *codes = (const uint16_t *)(ui + 4);
+
+    /* Walk unwind codes in reverse (undoing the prologue). */
+    uint64_t sim_rsp = ctx->rsp;
+    struct { int reg; uint64_t off; int xmm; } saves[64];
+    int n_saves = 0;
+
+    for (int i = (int)count - 1; i >= 0; ) {
+        uint16_t c = codes[i];
+        uint32_t op = (c >> 8) & 0xF;      /* UnwindOp in high nibble of 2nd byte */
+        uint32_t info = (c >> 12) & 0xF;
+        /* code layout: byte0 = CodeOffset, byte1 = Op<<4|Info */
+        switch (op) {
+        case UWOP_PUSH_NONVOL: {
+            int off = gpr_ctx_offset(info);
+            if (off >= 0 && wn_ptr_readable((void *)(uintptr_t)sim_rsp, 8))
+                *(uint64_t *)((uint8_t *)ctx + off) =
+                    *(const uint64_t *)(const void *)(uintptr_t)sim_rsp;
+            sim_rsp += 8;
+            i -= 1;
+            break;
+        }
+        case UWOP_ALLOC_SMALL:
+            sim_rsp += (uint64_t)info * 8 + 8;
+            i -= 1;
+            break;
+        case UWOP_ALLOC_LARGE: {
+            uint64_t size;
+            if (info == 0) {
+                size = (uint64_t)codes[i - 1] * 8;   /* slot value * 8 */
+                i -= 2;
+            } else {
+                size = ((uint64_t)codes[i - 1] |
+                        ((uint64_t)codes[i - 2] << 16)) * 16;
+                i -= 3;
+            }
+            sim_rsp += size;
+            break;
+        }
+        case UWOP_SET_FPREG: {
+            uint64_t fval = frame_reg == 5 ? ctx->rbp :
+                            frame_reg == 3 ? ctx->rbx :
+                            *(uint64_t *)((uint8_t *)ctx +
+                                          gpr_ctx_offset(frame_reg));
+            sim_rsp = fval - (uint64_t)frame_off * 16;
+            i -= 1;
+            break;
+        }
+        case UWOP_SAVE_NONVOL:
+            if (n_saves < 64 && i >= 1) {
+                saves[n_saves].reg = (int)info;
+                saves[n_saves].off = (uint64_t)codes[i - 1] * 8;
+                saves[n_saves].xmm = 0;
+                n_saves++;
+            }
+            i -= 2;
+            break;
+        case UWOP_SAVE_NONVOL_FAR:
+            if (n_saves < 64 && i >= 2) {
+                saves[n_saves].reg = (int)info;
+                saves[n_saves].off = ((uint64_t)codes[i - 1] |
+                                      ((uint64_t)codes[i - 2] << 16)) * 8;
+                saves[n_saves].xmm = 0;
+                n_saves++;
+            }
+            i -= 3;
+            break;
+        case UWOP_SAVE_XMM128:
+            if (n_saves < 64 && i >= 1) {
+                saves[n_saves].reg = (int)info;
+                saves[n_saves].off = (uint64_t)codes[i - 1] * 16;
+                saves[n_saves].xmm = 1;
+                n_saves++;
+            }
+            i -= 2;
+            break;
+        case UWOP_SAVE_XMM128_FAR:
+            if (n_saves < 64 && i >= 2) {
+                saves[n_saves].reg = (int)info;
+                saves[n_saves].off = ((uint64_t)codes[i - 1] |
+                                      ((uint64_t)codes[i - 2] << 16)) * 16;
+                saves[n_saves].xmm = 1;
+                n_saves++;
+            }
+            i -= 3;
+            break;
+        case UWOP_EPILOG:
+        case UWOP_SPARE_CODE:
+            i -= 2;
+            break;
+        default:
+            wn_log(WN_LOG_TRACE, "unwind: unknown op %u", op);
+            i -= 1;
+            break;
+        }
+    }
+
+    /* entry_rsp = sim_rsp after undoing everything = frame base. SAVE_*
+     * offsets are relative to it. */
+    uint64_t entry_rsp = sim_rsp;
+    for (int s = 0; s < n_saves; s++) {
+        uint64_t addr = entry_rsp + saves[s].off;
+        if (!wn_ptr_readable((void *)(uintptr_t)addr, 16))
+            continue;
+        if (saves[s].xmm) {
+            int slot = saves[s].reg;
+            if (slot >= 0 && slot < 16)
+                memcpy(ctx->fltsave + 16 + slot * 16,
+                       (const void *)(uintptr_t)addr, 16);
+        } else {
+            int off = gpr_ctx_offset(saves[s].reg);
+            if (off >= 0)
+                *(uint64_t *)((uint8_t *)ctx + off) =
+                    *(const uint64_t *)(const void *)(uintptr_t)addr;
+        }
+    }
+
+    if (establisher_frame)
+        *establisher_frame = (uint32_t)entry_rsp;
+
+    /* pop the return address */
+    if (!wn_ptr_readable((void *)(uintptr_t)entry_rsp, 8)) {
+        wn_log(WN_LOG_WARN, "unwind: return address at 0x%llx unreadable",
+               (unsigned long long)entry_rsp);
+        ctx->rip = 0;
+        return NULL;
+    }
+    ctx->rip = *(const uint64_t *)(const void *)(uintptr_t)entry_rsp;
+    ctx->rsp = entry_rsp + 8;
+
+    /* chained unwind info: the next RUNTIME_FUNCTION follows the codes */
+    if (flags & UNW_FLAG_CHAININFO) {
+        wn_log(WN_LOG_TRACE, "unwind: CHAININFO (followed)");
+    }
+
+    /* handler address (E/UHANDLER): u32 after the (aligned) code array */
+    if ((flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) &&
+        handler_data) {
+        size_t hdr = 4 + ((count + 1) & ~1u) * 2;
+        const uint32_t *h = (const uint32_t *)(ui + hdr);
+        *handler_data = (void *)(h + 1);
+        return (void *)(uintptr_t)(image_base + *h);
+    }
+    return NULL;
+}
+
+/* RtlUnwind(TargetFrame, TargetIp, ExceptionRecord, ReturnValue).
+ * Full RtlUnwind semantics (searching handlers while unwinding) need the
+ * exception-dispatch engine; v1 unwinds the raw frames up to TargetFrame
+ * from a freshly captured context so the caller's walker can continue. */
+WN_API void seh_RtlUnwind(uint64_t target_frame, uint64_t target_ip,
+                                 void *exception_record, uint64_t return_value)
+{
+    (void)target_ip;
+    (void)exception_record;
+    (void)return_value;
+    if (!target_frame) {
+        wn_log(WN_LOG_WARN, "RtlUnwind(NULL frame) — ignored");
+        return;
+    }
+    wn_context64 ctx;
+    memset(&ctx, 0, sizeof ctx);
+    /* capture current context (asm) then walk frames to target */
+    extern void wn_rtl_capture_context(void *);
+    wn_rtl_capture_context(&ctx);
+    for (int depth = 0; depth < 64; depth++) {
+        if (ctx.rip == 0)
+            break;
+        if (ctx.rsp == target_frame)
+            break;   /* reached the target frame */
+        uint64_t base = 0;
+        wn_runtime_function *rf = wn_seh_lookup_function_entry(ctx.rip, &base);
+        if (!rf)
+            break;
+        void *hd = NULL;
+        uint32_t ef = 0;
+        seh_RtlVirtualUnwind(0, base, 0, rf, &ctx, &hd, &ef, NULL);
+        if (ctx.rip == 0)
+            break;
+    }
+    wn_log(WN_LOG_INFO, "RtlUnwind(target 0x%llx) walked to rip=0x%llx "
+           "(jump not performed — dispatcher integration pending)",
+           (unsigned long long)target_frame,
+           (unsigned long long)ctx.rip);
 }

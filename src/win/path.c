@@ -1,5 +1,6 @@
 /* path.c — drive mapping, case-insensitive resolution, cwd tracking. */
 #include "wn_path.h"
+#include "wn_module.h"
 #include "wn_log.h"
 #include "wn_util.h"
 #include "wn_process.h"
@@ -13,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <unistd.h>
 
 /* Documented global: Windows CWD in Windows form. */
@@ -146,16 +148,30 @@ int wn_path_win_to_host(const char *win, char *out, size_t cap)
      * that AVs inside the app and its SEH catches it). The layer must fail
      * cleanly instead of dying: probe under the sigsetjmp guard first. */
     if (win && !wn_ptr_readable(win, 4)) {
-        Dl_info di;
-        char where[96] = "?";
-        if (dladdr(__builtin_return_address(0), &di) && di.dli_fbase) {
-            snprintf(where, sizeof where, "winnux+0x%llx",
-                     (unsigned long long)((char *)__builtin_return_address(0) -
-                                          (char *)di.dli_fbase));
+        /* Guest bug survived: log caller chain + guest frame for triage
+         * (putty taught us these happen; the layer must fail cleanly). */
+        void *bt[10];
+        int n = backtrace(bt, 10);
+        char frames[192] = "";
+        size_t o = 0;
+        for (int i = 0; i < n && o + 24 < sizeof frames; i++) {
+            Dl_info di;
+            if (dladdr(bt[i], &di) && di.dli_fbase)
+                o += (size_t)snprintf(frames + o, sizeof frames - o,
+                                      " +%llx", (unsigned long long)
+                                      ((char *)bt[i] - (char *)di.dli_fbase));
+            else {
+                wn_module *gm = wn_module_from_addr(bt[i], NULL);
+                if (gm)
+                    o += (size_t)snprintf(frames + o, sizeof frames - o,
+                                          " %s+0x%llx", gm->name,
+                                          (unsigned long long)((char *)bt[i] -
+                                                               (char *)gm->base));
+            }
         }
         wn_log(WN_LOG_WARN, "path: unreadable win-path pointer %p -> "
-               "ERROR_INVALID_NAME (guest bug survived; caller %s)",
-               (void *)win, where);
+               "ERROR_INVALID_NAME (guest bug survived; bt:%s)",
+               (void *)win, frames);
         wn_last_error_set(WN_ERR_INVALID_NAME);
         return -1;
     }

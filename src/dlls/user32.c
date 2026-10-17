@@ -364,6 +364,98 @@ static WN_API int32_t u32_ShowWindow(uint64_t hwnd, int32_t cmd)
     return was_visible;
 }
 
+/* --- MoveWindow / SetWindowPos ----------------------------------------------------
+ * Children: coordinates update + parent recompose. Top-level: backend
+ * window resize (pixel buffer reallocated). WM_SIZE/WM_MOVE posted like
+ * Windows does. */
+static void compose_children_of(uint64_t parent);   /* fwd (defined later) */
+static void user32_move_resize(uint64_t hwnd, int x, int y, int w, int h,
+                               int do_move, int do_size)
+{
+    wn_window *win = win_from_hwnd(hwnd);
+    if (!win)
+        return;
+    if (do_size && w < 1)
+        w = 1;
+    if (do_size && h < 1)
+        h = 1;
+    int old_w = win->cw, old_h = win->ch;
+    if (win->parent) {                 /* child: coords + recompose parent */
+        if (do_move) { win->wx = x; win->wy = y; }
+        if (do_size) { win->cw = w; win->ch = h; }
+        compose_children_of(win->parent);
+        if (win->parent)
+            post_msg(win->parent, WN_WM_PAINT, 0, 0);
+    } else {                           /* top-level: backend move/resize */
+        if (do_size && (win->cw != w || win->ch != h)) {
+            const wn_backend *be = wn_backend_get();
+            if (be && be->win_move_resize)
+                be->win_move_resize(win->bwin, do_move ? x : 0,
+                                    do_move ? y : 0, w, h);
+            win->bwin->width = win->cw = w;
+            win->bwin->height = win->ch = h;
+            win->bwin->stride = w * 4;
+        } else if (do_move && win->bwin) {
+            const wn_backend *be = wn_backend_get();
+            if (be && be->win_move_resize)
+                be->win_move_resize(win->bwin, x, y, win->cw, win->ch);
+        }
+        compose_children_of(hwnd);
+    }
+    if (do_size && (win->cw != old_w || win->ch != old_h))
+        post_msg(hwnd, WN_WM_SIZE, 0,
+                 (int64_t)(((uint64_t)(uint16_t)win->cw) |
+                           ((uint64_t)(uint16_t)win->ch << 16)));
+    if (do_move)
+        post_msg(hwnd, WN_WM_MOVE, 0,
+                 (int64_t)(((uint64_t)(uint16_t)x) |
+                           ((uint64_t)(uint16_t)y << 16)));
+    win->dirty.l = 0;
+    win->dirty.t = 0;
+    win->dirty.r = do_size ? win->cw : win->cw;
+    win->dirty.b = win->ch;
+    post_msg(hwnd, WN_WM_PAINT, 0, 0);
+}
+
+static WN_API int32_t u32_MoveWindow(uint64_t hwnd, int32_t x, int32_t y,
+                                     int32_t w, int32_t h, int32_t repaint)
+{
+    (void)repaint;
+    if (!win_from_hwnd(hwnd)) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    user32_move_resize(hwnd, x, y, w, h, 1, 1);
+    return 1;
+}
+
+static WN_API int32_t u32_SetWindowPos(uint64_t hwnd, uint64_t after,
+                                       int32_t x, int32_t y, int32_t cx,
+                                       int32_t cy, uint32_t flags)
+{
+    wn_window *win = win_from_hwnd(hwnd);
+    if (!win) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    (void)after;   /* Z-order changes: unsupported (single-layer compose) */
+    if (!(flags & 0x0001 /* SWP_NOSIZE */)) {
+        if (cx < 1) cx = 1;
+        if (cy < 1) cy = 1;
+        user32_move_resize(hwnd, x, y, cx, cy,
+                           !(flags & 0x0002 /* SWP_NOMOVE */) ? 1 : 0, 1);
+    } else if (!(flags & 0x0002 /* SWP_NOMOVE */)) {
+        user32_move_resize(hwnd, x, y, win->cw, win->ch, 1, 0);
+    } else {
+        return 1;
+    }
+    if (flags & 0x0040 /* SWP_SHOWWINDOW */)
+        u32_ShowWindow(hwnd, 5);
+    else if (flags & 0x0080 /* SWP_HIDEWINDOW */)
+        u32_ShowWindow(hwnd, 0);
+    return 1;
+}
+
 /* --- focus, activation, desktop --------------------------------------------- */
 
 /* Canonical UTF-16 text storage for every window (controls round-trip it). */
@@ -2029,16 +2121,20 @@ static uint64_t create_dialog_from_template(uint64_t hinst,
 
 /* DialogBox: modal-ish loop until EndDialog. */
 /* --- IsDialogMessage: dialog keyboard navigation ----------------------------------
+ * TWO-ARG contract: IsDialogMessage(hDlg, lpMsg) — RCX is the dialog HWND,
+ * RDX the MSG*. An earlier one-arg version dereferenced RCX (the handle)
+ * as the MSG and faulted (found via putty's message loop).
  * Tab/Shift-Tab cycle WS_TABSTOP children; Enter -> IDOK; Esc -> IDCANCEL;
  * arrows move radio selection within a WS_GROUP run. MSG x64:
  * hwnd@0(8), message@8(4), wParam@0x10(8), lParam@0x18(8). */
-static int32_t u32_IsDialogMessage_impl(const uint8_t *msg)
+static int32_t u32_IsDialogMessage_impl(uint64_t hdlg, const uint8_t *msg)
 {
     if (!msg)
         return 0;
     uint64_t hwnd = *(const uint64_t *)(const void *)msg;
     uint32_t message = *(const uint32_t *)(const void *)(msg + 8);
     uint64_t wp = *(const uint64_t *)(const void *)(msg + 0x10);
+    (void)hdlg;
     wn_window *dlg = win_from_hwnd(hwnd);
     if (!dlg || !dlg->is_dialog)
         return 0;
@@ -2124,9 +2220,9 @@ static int32_t u32_IsDialogMessage_impl(const uint8_t *msg)
     return 0;
 }
 
-static WN_API int32_t u32_IsDialogMessageA(void *msg)
+static WN_API int32_t u32_IsDialogMessageA(uint64_t hdlg, const void *msg)
 {
-    return u32_IsDialogMessage_impl((const uint8_t *)msg);
+    return u32_IsDialogMessage_impl(hdlg, (const uint8_t *)msg);
 }
 
 static WN_API int64_t u32_DialogBoxParamA(uint64_t hinst, const void *tmpl,
@@ -2154,7 +2250,7 @@ static WN_API int64_t u32_DialogBoxParamA(uint64_t hinst, const void *tmpl,
         int32_t r = u32_GetMessageA(&m, 0, 0, 0);
         if (r <= 0)
             break;
-        if (!u32_IsDialogMessageA(&m))
+        if (!u32_IsDialogMessageA(hwnd, &m))
             u32_DispatchMessageA(&m);
     }
     user32_set_focus_internal(0);
@@ -2241,6 +2337,11 @@ static wn_handle res_handle(uint32_t id, int is_icon)
 static uint32_t res_name_to_id(const char *name, const char *const *names,
                                int base)
 {
+    /* MAKEINTRESOURCE: values below 0x10000 ARE the id (IDC_ARROW is
+     * 32512 = 0x7f00 — dereferencing it as a string faults; found via
+     * putty's WNDCLASS.hCursor = LoadCursor(NULL, IDC_ARROW)). */
+    if ((uintptr_t)name < 0x10000)
+        return (uint32_t)(uintptr_t)name;
     /* "#123" or "IDC_ARROW"-style: compare sz form. */
     if (!name || !*name)
         return 0;
@@ -2274,13 +2375,15 @@ static WN_API wn_handle u32_LoadCursorA(uint64_t hinst, const char *name)
 {
     (void)hinst;   /* process-defined cursors: not yet (documented gap) */
     uint32_t id = res_name_to_id(name, g_idc_names, 32512 /*IDC_ARROW base*/);
-    if (!id)
+    if (!id && (uintptr_t)name >= 0x10000)
         wn_log(WN_LOG_WARN, "user32: LoadCursorA('%s') unknown", name);
     return res_handle(id, 0);
 }
 
 static WN_API wn_handle u32_LoadCursorW(uint64_t hinst, const uint16_t *name)
 {
+    if ((uintptr_t)name < 0x10000)   /* MAKEINTRESOURCEW */
+        return u32_LoadCursorA(hinst, (const char *)(uintptr_t)name);
     char *a = name ? wn_utf16_to_utf8(name, 256) : NULL;
     wn_handle h = u32_LoadCursorA(hinst, a);
     free(a);
@@ -2301,6 +2404,8 @@ static WN_API wn_handle u32_LoadIconA(uint64_t hinst, const char *name)
 
 static WN_API wn_handle u32_LoadIconW(uint64_t hinst, const uint16_t *name)
 {
+    if ((uintptr_t)name < 0x10000)   /* MAKEINTRESOURCEW */
+        return u32_LoadIconA(hinst, (const char *)(uintptr_t)name);
     char *a = name ? wn_utf16_to_utf8(name, 256) : NULL;
     wn_handle h = u32_LoadIconA(hinst, a);
     free(a);
@@ -2396,7 +2501,9 @@ const wn_export_entry wn_user32_exports[] = {
     { "SendMessageA", u32_SendMessageA },
     { "SetTimer", u32_SetTimer },
     { "SetWindowTextA", u32_SetWindowTextA },
+    { "SetWindowPos", u32_SetWindowPos },
     { "ShowWindow", u32_ShowWindow },
+    { "MoveWindow", u32_MoveWindow },
     { "TranslateMessage", u32_TranslateMessage },
     { "UpdateWindow", u32_UpdateWindow },
     { "DialogBoxParamA", u32_DialogBoxParamA },

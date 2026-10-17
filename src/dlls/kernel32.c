@@ -14,7 +14,10 @@
 #include "wn_log.h"
 #include "wn_util.h"
 #include "wn_registry.h"
+#include "wn_module.h"
 
+#include <execinfo.h>
+#include <dlfcn.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -753,9 +756,9 @@ static WN_API uint32_t k32_SleepEx(uint32_t ms, uint32_t alertable)
 static WN_API int32_t k32_TerminateProcess(wn_handle h, uint32_t code)
 {
     if (h == WN_CURRENT_PROCESS)
-        exit((int)(int32_t)code);
+        wn_process_exit((int)(int32_t)code);
     wn_log(WN_LOG_WARN, "kernel32: TerminateProcess(other) treated as exit");
-    exit((int)(int32_t)code);
+    wn_process_exit((int)(int32_t)code);
 }
 
 static WN_API int32_t k32_SwitchToThread(void)
@@ -2054,6 +2057,26 @@ static WN_API int32_t k32_LCMapStringA(uint32_t locale, uint32_t flags,
     return r;
 }
 
+/* Rtl* unwinding exports (implemented in seh.c) */
+extern void wn_rtl_capture_context(void *);   /* raw asm symbol */
+extern void *seh_RtlLookupFunctionEntry(uint64_t, uint64_t *, void *);
+extern void *seh_RtlPcToFileHeader(uint64_t, uint64_t *);
+extern void *seh_RtlVirtualUnwind(uint32_t, uint64_t, uint64_t, void *,
+                                  void *, void **, uint32_t *, void *);
+extern void  seh_RtlUnwind(uint64_t, uint64_t, void *, uint64_t);
+
+static void k32_RtlCaptureContext(void *ctx) { wn_rtl_capture_context(ctx); }
+static void *k32_RtlLookupFunctionEntry(uint64_t pc, uint64_t *base, void *h)
+{ return seh_RtlLookupFunctionEntry(pc, base, h); }
+static void *k32_RtlPcToFileHeader(uint64_t pc, uint64_t *base)
+{ return seh_RtlPcToFileHeader(pc, base); }
+static void *k32_RtlVirtualUnwind(uint32_t t, uint64_t ib, uint64_t tip,
+                                  void *fe, void *ctx, void **hd,
+                                  uint32_t *ef, void *cp)
+{ return seh_RtlVirtualUnwind(t, ib, tip, fe, ctx, hd, ef, cp); }
+static void k32_RtlUnwind(uint64_t tf, uint64_t tip, void *er, uint64_t rv)
+{ seh_RtlUnwind(tf, tip, er, rv); }
+
 static WN_API char *k32_lstrcpyA(char *dst, const char *src)
 {
     if (!dst || !src)
@@ -2240,6 +2263,11 @@ static WN_API void k32_GetStartupInfoW(void *si)
 static WN_API void *k32_SetUnhandledExceptionFilter(void *filter)
 {
     return wn_seh_set_unhandled_filter(filter);
+}
+
+static WN_API int64_t k32_UnhandledExceptionFilter(void *exception_pointers)
+{
+    return wn_seh_call_unhandled_filter(exception_pointers);
 }
 
 static WN_API void k32_OutputDebugStringA(const char *s)
@@ -2687,6 +2715,11 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "IsDebuggerPresent", k32_IsDebuggerPresent },
     { "IsProcessorFeaturePresent", k32_IsProcessorFeaturePresent },
     { "LeaveCriticalSection", k32_LeaveCriticalSection },
+    { "RtlCaptureContext", k32_RtlCaptureContext },
+    { "RtlLookupFunctionEntry", k32_RtlLookupFunctionEntry },
+    { "RtlPcToFileHeader", k32_RtlPcToFileHeader },
+    { "RtlUnwind", k32_RtlUnwind },
+    { "RtlVirtualUnwind", k32_RtlVirtualUnwind },
     { "LoadLibraryA", k32_LoadLibraryA },
     { "LoadLibraryExA", k32_LoadLibraryExA },
     { "LoadLibraryExW", k32_LoadLibraryExW },
@@ -2733,6 +2766,8 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "SetThreadPriority", k32_SetThreadPriority },
     { "SetThreadPriority", k32_SetThreadPriority },
     { "SetUnhandledExceptionFilter", k32_SetUnhandledExceptionFilter },
+    { "UnhandledExceptionFilter", k32_UnhandledExceptionFilter },
+    { "RaiseException", k32_RaiseException },
     { "Sleep", k32_Sleep },
     { "SleepEx", k32_SleepEx },
     { "SuspendThread", k32_SuspendThread },

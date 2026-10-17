@@ -67,6 +67,8 @@ typedef struct wn_backend {
     void (*win_destroy)(wn_bwin *w);
     void (*win_show)(wn_bwin *w);
     void (*win_set_title)(wn_bwin *w, const char *title);
+    /* Move/resize a top-level backend window (NULL = fixed-size). */
+    void (*win_move_resize)(wn_bwin *w, int x, int y, int cw, int ch);
     /* Poll for events up to timeout_ms (0 = don't block, -1 = forever).
      * Returns count of events dispatched through cb. */
     int  (*pump)(int timeout_ms);

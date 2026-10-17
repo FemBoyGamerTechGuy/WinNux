@@ -280,6 +280,27 @@ static void x11_win_set_title(wn_bwin *b, const char *title)
     pXStoreName(g_dpy, ((x11_win_priv *)b->priv)->xwin, title);
 }
 
+static int (*pXMoveResizeWindow)(wnx_Display, wnx_Window, int, int,
+                                 unsigned, unsigned);
+
+static void x11_win_move_resize(wn_bwin *b, int x, int y, int cw, int ch)
+{
+    x11_win_priv *p = b->priv;
+    if (cw < 1) cw = 1;
+    if (ch < 1) ch = 1;
+    if (pXMoveResizeWindow)
+        pXMoveResizeWindow(g_dpy, p->xwin, x, y, (unsigned)cw, (unsigned)ch);
+    if (cw != b->width || ch != b->height) {
+        b->width = cw;
+        b->height = ch;
+        b->stride = cw * 4;
+        free(b->pixels);
+        b->pixels = wn_xmalloc((size_t)cw * ch * 4 + 64);
+        memset(b->pixels, 0xFF, (size_t)cw * ch * 4);
+    }
+    pXFlush(g_dpy);
+}
+
 static void dispatch(wn_bwin *b, int type, int x, int y, int val, int val2)
 {
     wn_backend_event ev = { .type = type, .win = b, .x = x, .y = y,
@@ -483,6 +504,7 @@ static int x11_init(void)
     pXGetImage = dlsym(x, "XGetImage");
     pXFreePixmap = dlsym(x, "XFreePixmap");
     pXSetBackground = dlsym(x, "XSetBackground");
+    pXMoveResizeWindow = dlsym(x, "XMoveResizeWindow");
     if (pXLoadQueryFont) {
         g_font = pXLoadQueryFont(g_dpy, "fixed");
         if (!g_font)
@@ -500,6 +522,7 @@ const wn_backend wn_x11_backend = {
     .win_destroy = x11_win_destroy,
     .win_show = x11_win_show,
     .win_set_title = x11_win_set_title,
+    .win_move_resize = x11_win_move_resize,
     .pump = x11_pump,
     .present = x11_present,
     .draw_text = x11_draw_text,
