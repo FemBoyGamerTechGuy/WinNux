@@ -1659,8 +1659,25 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
     /* #32770 dialog: every message goes to the guest dlgproc (WM_COMMAND
      * from child controls, WM_CLOSE, ...). Without this the dialog was a
      * black hole: clicks produced WM_COMMANDs that vanished in ctl_proc's
-     * default case. */
+     * default case. WM_PAINT is special: DefDlgProc's job is erasing the
+     * background and composing children — the guest dlgproc never paints
+     * the face color itself (found via putty: dialog went black after the
+     * routing fix). */
     if (w->is_dialog && w->dlgproc) {
+        if (msg == WN_WM_PAINT) {
+            wn_handle hdc = g32_GetDC(hwnd);
+            if (hdc) {
+                int32_t rect[4] = { 0, 0, w->cw, w->ch };
+                wn_handle bg = g32_CreateSolidBrush(0x00C8D0D4 /*face*/);
+                g32_FillRect(hdc, rect, bg);
+                wn_handle_close(bg);
+            }
+            compose_children_of(hwnd);
+            const wn_backend *be = wn_backend_get();
+            if (be && be->present && w->bwin)
+                be->present(w->bwin);
+            w->dirty.l = -1;
+        }
         typedef WN_API int64_t (*dlgproc_fn)(uint64_t, uint32_t, uint64_t,
                                              int64_t);
         int64_t r = ((dlgproc_fn)(uintptr_t)w->dlgproc)(hwnd, msg, wp, lp);

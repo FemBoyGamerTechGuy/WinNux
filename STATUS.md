@@ -93,6 +93,24 @@ child → WM_LBUTTONDOWN → ctl_proc → WM_COMMAND → dialog proc → guest
 dlgproc → putty's handler code executes. Zero ASan/UBSan reports with
 clicks; 15/15 suite.
 
+### Part 3 (same session): dialog paints again + keyboard events arrive
+
+- Dialog WM_PAINT is handled by the layer (face-color fill + child compose
+  + present) BEFORE forwarding to the dlgproc — routing every message to
+  the guest dlgproc had left nobody painting the background (putty's
+  dlgproc ignores WM_PAINT like most do; DefDlgProc owns erasing).
+  Screenshot now shows gray dialog + dark text pixels in the dialog
+  region (xtree root capture; the PPM reader in xtree was also fixed to
+  real 32bpp reads).
+- Keyboard events reach the guest too (synthetic 'a' key via
+  `xtree key <win> 0x61`: KeyPress/KeyRelease logged, routed to the focus
+  window). Putty moved its own config dialog with our real MoveWindow —
+  partially off-screen (600x1008 at 340,-104) because the monitor/DPI
+  APIs are stubs; that placement (GetMonitorInfo/MonitorFromWindow/
+  GetSystemMetricsForDpi) is the next visual-fidelity item.
+- xtree (dev tool) gained: window geometry in the tree dump, PPM capture
+  with correct 32bpp reads, synthetic click + key injection.
+
 ## Date: 2026-10-17 (session 3)
 
 ### Real applications (the headline)
