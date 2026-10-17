@@ -6,7 +6,7 @@ not observed.
 
 ## Date: 2026-10-17 (session 1, part 3)
 
-### Working — proven by `make test` (11/11 pass, GUI included)
+### Working — proven by `make test` (13/13 pass)
 
 | Area | Proof |
 |------|-------|
@@ -23,6 +23,7 @@ not observed.
 | VirtualAlloc/Protect/Query/Free + heap | t10 |
 | **GUI vertical slice: X11 via dlopen, window, message loop, WM_PAINT, GDI FillRect/TextOut (server-rendered fonts via glyph cache), timers, destroy** | **t11 under Xvfb** |
 | Winsock (TCP roundtrip, select, nonblocking) | t12 |
+| Guest crash handling: SIGSEGV → EXCEPTION_ACCESS_VIOLATION report (module+rva, registers) + exception-code exit | t13 |
 
 ### Sockets (new this session)
 
@@ -50,7 +51,10 @@ not observed.
 
 ### Broken / partial (unchanged from part 2 unless noted)
 
-- SEH table-based unwinding (x64 .pdata/.xwave) still not implemented.
+- SEH table-based unwinding (x64 .pdata/.xdata) still not implemented;
+  guest `__try`/`__except` will not find scope handlers. Crash capture,
+  VEH and the Windows-style report ARE proven (t13). POSIX truncates
+  guest exit codes to 8 bits (0xC0000005 shows as 5) — same as Wine.
 - MessageBox, dialogs, child windows, scrollbars: not implemented (stubs).
 - Graphics: only software rendering; Vulkan loader present but no
   D3D/GL translation yet (`make bench` reports what exists).
