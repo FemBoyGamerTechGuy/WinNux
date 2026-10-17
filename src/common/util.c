@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 void *wn_xmalloc(size_t n)
 {
@@ -45,6 +46,70 @@ char *wn_xstrdup(const char *s)
         abort();
     }
     return d;
+}
+
+/* wn_safe_strnlen / wn_safe_probe: fault-safe memory probes.
+ *
+ * process_vm_readv turned out to be the WRONG primitive: it uses
+ * FOLL_FORCE and happily reads PROT_NONE reserved pages, so the guard
+ * passed while the later direct read SIGSEGVd (found via putty: it passes
+ * reserved-memory pointers to LoadLibrary on some paths - on Windows that
+ * is an in-app AV which putty's own SEH catches).
+ *
+ * Instead: walk under a sigsetjmp guard; the SIGSEGV handler in seh.c
+ * checks wn_safe_fault_active() and longjmps back out.
+ */
+#include <setjmp.h>
+
+static __thread sigjmp_buf g_safe_jmp;
+static __thread volatile int g_safe_active;
+
+int wn_safe_fault_active(void)
+{
+    return g_safe_active;
+}
+
+void wn_safe_fault_jump(void)
+{
+    if (g_safe_active) {
+        g_safe_active = 0;
+        siglongjmp(g_safe_jmp, 1);
+    }
+}
+
+size_t wn_safe_strnlen(const char *p, size_t cap)
+{
+    if (!p || cap == 0)
+        return 0;
+    g_safe_active = 1;
+    if (sigsetjmp(g_safe_jmp, 1)) {
+        /* faulted: unreadable (PROT_NONE or unmapped) */
+        return cap;
+    }
+    size_t n = 0;
+    while (n < cap) {
+        if (p[n] == '\0')
+            break;
+        n++;
+    }
+    g_safe_active = 0;
+    return n < cap ? n : cap;
+}
+
+int wn_ptr_readable(const void *p, size_t len)
+{
+    if (!p || len == 0)
+        return 0;
+    g_safe_active = 1;
+    if (sigsetjmp(g_safe_jmp, 1)) {
+        return 0;
+    }
+    volatile unsigned char sink = 0;
+    for (size_t i = 0; i < len; i++)
+        sink ^= ((const unsigned char *)p)[i];
+    g_safe_active = 0;
+    (void)sink;
+    return 1;
 }
 
 static char fold_ascii(char c)

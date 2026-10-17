@@ -15,6 +15,13 @@ void  *wn_xrealloc(void *p, size_t n);
 char  *wn_xstrdup(const char *s);
 
 /* Case-insensitive ASCII compare (Windows path/name matching semantics). */
+/* Fault-safe memory probes (sigsetjmp-guarded; seh.c jumps back on fault).
+ * wn_safe_strnlen returns cap when unreadable or no NUL within cap. */
+int    wn_ptr_readable(const void *p, size_t len);
+size_t wn_safe_strnlen(const char *p, size_t cap);
+/* For seh.c: active probe state + jump-back on fault. */
+int    wn_safe_fault_active(void);
+void   wn_safe_fault_jump(void);
 int    wn_strcaseeq(const char *a, const char *b);
 /* Case-insensitive prefix compare: does s start with prefix? */
 int    wn_strcaseprefix(const char *s, const char *prefix);

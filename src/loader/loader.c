@@ -9,6 +9,7 @@
 #include "wn_stub.h"
 #include "wn_log.h"
 #include "wn_util.h"
+#include <dlfcn.h>
 #include "wn_registry.h"
 
 #include <errno.h>
@@ -338,6 +339,21 @@ static void note_failed_load(const char *name)
 
 wn_module *wn_module_load_dll(const char *name, const char *dir)
 {
+    /* Fault-safe name validation (also covers the import resolver, which
+     * does not pass through kernel32's LoadLibrary guard). */
+    if (!name || wn_safe_strnlen(name, 260) >= 260) {
+        Dl_info di;
+        char where[80] = "?";
+        if (dladdr(__builtin_return_address(0), &di) && di.dli_fbase) {
+            snprintf(where, sizeof where, "winnux+0x%llx",
+                     (unsigned long long)((char *)__builtin_return_address(0) -
+                                          (char *)di.dli_fbase));
+        }
+        wn_log(WN_LOG_WARN, "loader: bad DLL name %p (caller %s) -> "
+               "ERROR_MOD_NOT_FOUND", (void *)name, where);
+        wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
+        return NULL;
+    }
     /* Basename + does it carry an extension? */
     const char *base = name;
     for (const char *p = name; p && *p; p++)

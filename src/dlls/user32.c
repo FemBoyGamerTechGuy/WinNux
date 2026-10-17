@@ -114,6 +114,7 @@ static int g_bwin_count;
 
 /* Forward decls (defined later in this file). */
 static void compose_child(wn_window *child);
+static void present_root(wn_window *w);
 #define DLG_X(n) ((int)((n) * 4 / 2 + ((n) & 1)))
 #define DLG_Y(n) ((int)((n) * 8 / 2))
 
@@ -1272,6 +1273,24 @@ static void compose_child(wn_window *child)
         if (child->wx + cw > pw->dirty.r) pw->dirty.r = child->wx + cw;
         if (child->wy + ch > pw->dirty.b) pw->dirty.b = child->wy + ch;
     }
+    /* Changes must reach the screen: compose chains end at the top-level
+     * window, whose bwin is the backend surface. Present it. */
+    present_root(child);
+}
+
+static void present_root(wn_window *w)
+{
+    while (w && w->parent) {
+        wn_window *p = win_from_hwnd(w->parent);
+        if (!p)
+            break;
+        w = p;
+    }
+    if (!w || !w->bwin || !w->visible)
+        return;
+    const wn_backend *be = wn_backend_get();
+    if (be && be->present)
+        be->present(w->bwin);
 }
 
 static void compose_children_of(uint64_t parent)

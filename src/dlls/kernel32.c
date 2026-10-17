@@ -293,6 +293,16 @@ static WN_API uint32_t k32_GetModuleFileNameW(wn_handle mod, uint16_t *out, uint
 static wn_handle load_module_by_name(const char *name, int flags)
 {
     (void)flags;
+    /* Apps can pass garbage (freed HMODULEs, uninitialized data); the
+     * layer must never die on that - Windows would fault in the app, we
+     * fail the call cleanly instead. */
+    if (!name || wn_safe_strnlen(name, 260) >= 260) {
+        wn_log(WN_LOG_WARN, "kernel32: LoadLibrary(bad name ptr %p) from "
+               "guest %p -> ERROR_MOD_NOT_FOUND", (void *)name,
+               __builtin_return_address(0));
+        wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
+        return NULL;
+    }
     /* The loader itself handles extension-less names (appends .dll),
      * full system32 paths, and case-insensitivity. No blind retry here:
      * a failed load must set ERROR_MOD_NOT_FOUND exactly once, quietly. */

@@ -186,6 +186,9 @@ static const char *exc_name(uint32_t c)
 static __attribute__((noreturn)) void
 crash_report(wn_exc_record *rec, wn_context64 *ctx)
 {
+    wn_log(WN_LOG_ERR, "seh: guest exception %s (0x%08X) at putty-ish rip "
+           "0x%llx -> app filter", exc_name(rec->exception_code),
+           rec->exception_code, (unsigned long long)ctx->rip);
     if (g_unhandled) {
         wn_exc_pointers ep = { rec, ctx };
         if (g_unhandled(&ep) == WN_EXC_EXECUTE_HANDLER)
@@ -235,6 +238,14 @@ crash_report(wn_exc_record *rec, wn_context64 *ctx)
 static void signal_handler(int sig, siginfo_t *si, void *uc_)
 {
     ucontext_t *uc = uc_;
+    /* Fault inside a guarded safe-probe (wn_safe_strnlen etc.): jump back
+     * to the probe so callers get a clean "unreadable" answer instead of
+     * dying. This must run before any other handling. */
+    if (wn_safe_fault_active()) {
+        wn_log(WN_LOG_DEBUG, "seh: fault inside safe probe (addr=%p) — "
+               "jumping back to caller", si->si_addr);
+        wn_safe_fault_jump();
+    }
     wn_module *m = wn_module_from_addr((const void *)uc->uc_mcontext.gregs[REG_RIP], NULL);
     if (!m) {
         /* Fault inside host code: not ours to hide. Re-raise default. */

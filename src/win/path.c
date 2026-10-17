@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 #include <unistd.h>
 
 /* Documented global: Windows CWD in Windows form. */
@@ -141,6 +142,23 @@ static char *clean_win_path(const char *win)
 
 int wn_path_win_to_host(const char *win, char *out, size_t cap)
 {
+    /* Apps pass garbage pointers on failure paths (putty does; on Windows
+     * that AVs inside the app and its SEH catches it). The layer must fail
+     * cleanly instead of dying: probe under the sigsetjmp guard first. */
+    if (win && !wn_ptr_readable(win, 4)) {
+        Dl_info di;
+        char where[96] = "?";
+        if (dladdr(__builtin_return_address(0), &di) && di.dli_fbase) {
+            snprintf(where, sizeof where, "winnux+0x%llx",
+                     (unsigned long long)((char *)__builtin_return_address(0) -
+                                          (char *)di.dli_fbase));
+        }
+        wn_log(WN_LOG_WARN, "path: unreadable win-path pointer %p -> "
+               "ERROR_INVALID_NAME (guest bug survived; caller %s)",
+               (void *)win, where);
+        wn_last_error_set(WN_ERR_INVALID_NAME);
+        return -1;
+    }
     char *p = clean_win_path(win);
     if (!p) {
         wn_last_error_set(WN_ERR_INVALID_NAME);
