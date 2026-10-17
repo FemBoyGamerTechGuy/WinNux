@@ -56,9 +56,18 @@ wn_teb *wn_teb_attach(void)
 
 wn_teb *wn_teb_current(void)
 {
+#if defined(__x86_64__)
     wn_teb *t;
     __asm__ volatile ("movq %%gs:0x30, %0" : "=r"(t));
     return t;
+#else
+    /* i386 Windows reads the TEB self-pointer at fs:0x18; hosting that
+     * requires a set_thread_area-based TLS scheme (WoW64 groundwork,
+     * STATUS.md "32-bit"). Until then this path must not be reached. */
+    wn_teb *t = NULL;
+    __asm__ volatile ("movl %%fs:0x18, %0" : "=r"(t));
+    return t;
+#endif
 }
 
 wn_thread *wn_thread_current(void)

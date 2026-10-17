@@ -84,3 +84,28 @@ uninstall:
 
 clean:
 	rm -rf $(BIN) $(OBJ) $(DBGOBJ)
+
+# --- 32-bit groundwork (compile-only probe) -------------------------------------
+# Compiles every translation unit with -m32 (i386) WITHOUT linking: keeps the
+# source 32-bit clean (pointer sizes, struct overlays, static asserts). Full
+# WoW64 needs per-export stdcall/cdecl dispatch metadata + i386 TEB/PEB
+# layouts — see STATUS.md "32-bit".
+HAVE_M32 := $(shell echo 'int winnux_probe;' | $(CC) -m32 -x c - -o /dev/null >/dev/null 2>&1 && echo yes || echo no)
+
+check32:
+	@mkdir -p obj32
+ifeq ($(HAVE_M32),no)
+	@echo "check32: SKIP - no working -m32 toolchain on this box"
+	@echo "  Debian/Ubuntu: apt install gcc-multilib (as root)"
+	@echo "  Arch:          pacman -S gcc-multilib lib32-gcc-libs"
+else
+	@echo "== i386 compile check (no link; dispatch metadata is future work) =="
+	@rc=0; for src in $(SRCS); do \
+		obj="obj32/$$(echo $$src | sed 's|^src/||; s|\.c$$|.o|; s|/|_|g')"; \
+		if ! $(CC) $(CFLAGS) -m32 -c -o $$obj $$src 2>/tmp/check32.err; then \
+			echo "FAIL: $$src"; head -12 /tmp/check32.err; rc=1; \
+		fi; \
+	done; \
+	if [ $$rc = 0 ]; then echo "check32: all sources compile under -m32"; \
+	else echo "check32: FAILURES above"; fi; exit $$rc
+endif

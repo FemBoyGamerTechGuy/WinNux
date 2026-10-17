@@ -3,29 +3,22 @@
 Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
-## P0 — make PuTTY's config dialog USABLE (next user-visible milestone)
+## P0 — make PuTTY OPEN an SSH session (next user-visible milestone)
 
-1. **Dialog visual fidelity**: per-control painting (Button with border +
-   check state, Edit with sunken border + text, Static text layout,
-   ListBox with item list + selection, ComboBox), dialog background
-   GetSysColor(COLOR_BTNFACE), font-accurate text layout. Evidence:
-   putty config dialog is mapped but controls draw as flat boxes; the
-   xtree screenshot shows only gray/white/black.
-2. **End-to-end dialog interaction**: click → WM_COMMAND to the dlgproc
-   (BN_CLICKED with control id), keyboard focus ring, list selection
-   messages, then verify putty's Category tree + Session list + host
-   name edit box respond. Evidence: putty's modal loop runs but no
-   WM_COMMAND routing proof yet.
-3. **PuTTY SSH session start**: once the dialog works, Open button →
-   winsock connect path (ws2_32 is proven; needs the terminal window +
-   per-character rendering). This is the acceptance target from the task
-   brief ("PuTTY config dialog complete, can initiate SSH connection").
-4. **user32 surface still stubbed that putty hits**: menus
-   (CreateMenu/AppendMenu/TrackPopupMenu — putty's system menu),
-   GetSysColor/Brush batch, GetSystemMetrics completeness, monitor APIs
-   (GetMonitorInfoA/MonitorFromWindow), SystemParametersInfoA,
-   keyboard state (GetKeyboardState, ToAsciiEx/ToUnicodeEx), FlashWindowEx.
-   Evidence: STUB lines in the putty trace (info level).
+1. **Open-button launch path**: WM_COMMAND(BN_CLICKED, id=1009) is PROVEN
+   to reach putty's PuTTYConfigBox dlgproc (ctl_notify trace) but nothing
+   launches. Disassemble the dlgproc WM_COMMAND handler (image base
+   0x140000000; the Open handler is the next thing to map), find the call
+   that fails silently (suspects: config save to registry, CreateThread
+   for the session, terminal window creation on the launch thread, socket
+   events), and drive it to a live terminal window. Hostname typing
+   already round-trips (EN_CHANGE + GetDlgItemText verified).
+2. **Terminal window**: putty's terminal class (W-flavored APIs — the W
+   message APIs now exist) + per-line text output; the FreeType mono path
+   (Courier New → DejaVu Sans Mono) is ready for the cell metrics.
+3. **SysLink control class** (About box web link) — render as blue
+   underlined static, NM_CLICK notify (even a no-op beat failing class
+   registration, which is what happens now: unknown-class WARN).
 
 ## P1 — next milestone (SEH dispatch: scope tables)
 
@@ -40,15 +33,19 @@ put it here. Never silently drop items; move them to STATUS.md when done.
 
 ## P2 — major features
 
-7. **32-bit (WoW64-style) PE support** — user-reported: a 32-bit installer
-   fails with "i386 images not supported yet". Requires: PE32 header path,
-   32-bit thunks (WOW64 segment emulation on x86_64 via __builtin_ia32... is
-   NOT possible directly — plan: load 32-bit images and run them with a
-   32-bit thunk layer using X32 or an interpreter; realistically: a separate
-   32-bit helper process (like real WoW64), or restricting to CPUs with
-   X32-ABI support). This is a MAJOR project; tracked after SEH per the
-   task brief. `winnux imports` already parses 32-bit import tables
-   (7zr.exe is the first driver case).
+7. **32-bit (WoW64-style) PE support** — user priority. GROUNDWORK DONE
+   (session 5): `make check32` compiles the tree -m32 on multilib boxes,
+   WN_API is arch-mapped (cdecl on i386 for now), all x64-only asm is
+   guarded (stub trampoline, RtlCaptureContext, _setjmp/_longjmp, gs-TEB
+   read has an fs:0x18 i386 path). Real 32-bit exes CANNOT run yet; what
+   remains, in order: (a) per-export stdcall/cdecl dispatch metadata —
+   Win32 i386 APIs clean the stack, varargs are cdecl (Wine's model:
+   __stdcall on fixed-arity exports); (b) i386 TEB/PEB layouts +
+   set_thread_area TLS (fs:0x18 self-pointer) replacing the x64 gs:0x30
+   scheme; (c) i386 CONTEXT/EXCEPTION_RECORD layouts for SEH; (d) the
+   separate 32-bit runtime build (Wine model: 32-bit process, 32-bit
+   libX11 dlopen'd, console-first so GUI deps stay optional). Acceptance:
+   7zr.exe (32-bit, apps/) runs, then a 32-bit GUI app.
 8. **Vulkan surface + swapchain** (Xlib WSI, dlopen'd), then D3D9-on-Vulkan
    start: device/present/swapchain objects, DXBC sm1-sm3 bytecode → SPIR-V
    translator (headless development possible via `winnux bench`).

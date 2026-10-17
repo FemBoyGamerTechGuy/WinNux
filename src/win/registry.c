@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
 
 typedef struct wn_reg_value {
     char     *name;
@@ -220,11 +222,21 @@ static void save_tree(FILE *f, wn_reg_key *k)
 
 void wn_registry_save(void)
 {
-    char path[1100];
+    /* Atomic save: write a temp file, then rename over system.reg so a
+     * crash mid-write can never truncate the persisted tree. Also report
+     * errno on failure — the old message hid the REASON (the user's box
+     * hit "cannot save" with no clue why). */
+    char path[1100], tmp[1120];
     snprintf(path, sizeof path, "%s/system.reg", g_proc.prefix);
-    FILE *f = fopen(path, "we");
+    snprintf(tmp, sizeof tmp, "%s/system.reg.tmp", g_proc.prefix);
+    FILE *f = fopen(tmp, "we");
     if (!f) {
-        wn_log(WN_LOG_WARN, "registry: cannot save %s", path);
+        int e = errno;
+        wn_log(WN_LOG_WARN, "registry: cannot open %s for write: %s "
+               "(prefix writable?)", tmp, strerror(e));
+        /* recovery attempt: a root-owned or read-only file at the final
+         * path does not block the temp write; if the DIRECTORY itself is
+         * unwritable there is nothing more we can do honestly. */
         return;
     }
     fprintf(f, "# WinNux registry v1\n");
@@ -232,6 +244,16 @@ void wn_registry_save(void)
         if (g_roots[i])
             save_tree(f, g_roots[i]);
     fclose(f);
+    if (rename(tmp, path) != 0) {
+        int e = errno;
+        wn_log(WN_LOG_WARN, "registry: cannot replace %s: %s", path,
+               strerror(e));
+        /* last resort: unlink a stale/protected destination and retry */
+        unlink(path);
+        if (rename(tmp, path) != 0)
+            wn_log(WN_LOG_WARN, "registry: save failed after unlink retry: %s",
+                   strerror(errno));
+    }
 }
 
 static void insert_line(const char *line)

@@ -60,6 +60,7 @@ typedef struct gdi_obj {
         int height;                 /* requested cell height (px, >0) */
         int weight;                 /* >=700 = bold */
         int italic;
+        int ft_slot;                /* FreeType slot (>=0) or -1 = bitmap */
         char face[64];              /* informational */
     } font;
 } gdi_obj;
@@ -126,9 +127,17 @@ static void fill_rect_rgb(gdi_obj *dc, int l, int t, int r, int b, uint32_t rgb)
 /* effective metrics for the DC's current font */
 static void font_metrics(gdi_obj *dc, int *cell_h, int *adv)
 {
+    gdi_obj *f = dc->dc.cur_font;
+    if (f && f->font.ft_slot >= 0 && wn_ft_available()) {
+        int asc, desc, hgt, avg;
+        wn_ft_metrics(f->font.ft_slot, &asc, &desc, &hgt, &avg);
+        *cell_h = hgt;
+        *adv = avg;
+        return;
+    }
     int h = WN_FONT_CELL_H;
-    if (dc->dc.cur_font && dc->dc.cur_font->font.height > 0)
-        h = dc->dc.cur_font->font.height;
+    if (f && f->font.height > 0)
+        h = f->font.height;
     if (h < 5)
         h = 5;
     *cell_h = h;
@@ -178,7 +187,14 @@ static const unsigned char *glyph_rows(uint32_t cp, gdi_obj *dc)
     return wn_font_missing();
 }
 
-/* UTF-16 text draw; returns the x advance consumed. */
+/* fwd: default font object (defined below) */
+static gdi_obj *default_font(gdi_obj *dc);
+
+/* UTF-16 text draw; returns the x advance consumed.
+ *
+ * FreeType path (when the DC font resolved to a slot): alpha-blended
+ * subpixel-advancing glyphs with per-codepoint positioning; surrogate
+ * pairs combine into one codepoint. Falls back to the bitmap atlas. */
 static int draw_text16(gdi_obj *dc, int x, int y,
                        const uint16_t *s, size_t n)
 {
@@ -186,6 +202,64 @@ static int draw_text16(gdi_obj *dc, int x, int y,
     uint32_t bk = colorref_to_u32(dc->dc.bk_color);
     int cell_h, adv;
     font_metrics(dc, &cell_h, &adv);
+    gdi_obj *fobj = dc->dc.cur_font ? dc->dc.cur_font : default_font(dc);
+    int slot = fobj && fobj->kind == GDI_FONT ? fobj->font.ft_slot : -1;
+    if (slot >= 0 && wn_ft_available()) {
+        int asc, desc, hgt, avg;
+        wn_ft_metrics(slot, &asc, &desc, &hgt, &avg);
+        int baseline = y + asc;
+        int fake_bold = wn_ft_slot_bold(slot);
+        if (dc->dc.bk_mode == 2 /*OPAQUE*/)
+            fill_rect_rgb(dc, x, y, x + (int)n * avg, y + hgt, bk);
+        int cx = x;
+        for (size_t i = 0; i < n; i++) {
+            if (!s[i])
+                break;
+            uint32_t cp = s[i];
+            if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < n &&
+                s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (s[i + 1] - 0xDC00);
+                i++;
+            }
+            const wn_ft_glyph_t *g = wn_ft_glyph(slot, cp);
+            if (g) {
+                int gx = cx + g->left;
+                int gy = baseline - g->top;
+                for (int py = 0; py < g->h; py++) {
+                    int dy = dc->dc.dib_bottom_up
+                                ? dc->dc.h - 1 - (gy + py) : gy + py;
+                    if (dy < 0 || dy >= dc->dc.h)
+                        continue;
+                    uint8_t *line = dc->dc.pixels +
+                                    (size_t)dy * dc->dc.stride;
+                    for (int px = 0; px < g->w; px++) {
+                        int dx = gx + px;
+                        if (dx < 0 || dx >= dc->dc.w)
+                            continue;
+                        uint8_t a = g->alpha[(size_t)py * g->w + px];
+                        if (fake_bold && px + 1 < g->w) {
+                            int a2 = g->alpha[(size_t)py * g->w + px + 1];
+                            if (a2 > a)
+                                a = a2;
+                        }
+                        if (!a)
+                            continue;
+                        uint8_t *dst = line + (size_t)dx * 4;
+                        dst[0] = (uint8_t)((dst[0] * (255 - a) +
+                                 (rgb & 0xFF) * a) / 255);
+                        dst[1] = (uint8_t)((dst[1] * (255 - a) +
+                                 ((rgb >> 8) & 0xFF) * a) / 255);
+                        dst[2] = (uint8_t)((dst[2] * (255 - a) +
+                                 ((rgb >> 16) & 0xFF) * a) / 255);
+                    }
+                }
+                cx += g->adv_x;
+            } else {
+                cx += avg;
+            }
+        }
+        return cx - x;
+    }
     int bold = dc->dc.cur_font && dc->dc.cur_font->font.weight >= 700;
     int cx = x;
     for (size_t i = 0; i < n; i++) {
@@ -216,6 +290,7 @@ static gdi_obj *default_font(gdi_obj *dc)
         def->kind = GDI_FONT;
         def->font.height = WN_FONT_CELL_H;
         def->font.weight = 400;
+        def->font.ft_slot = wn_ft_select("MS Sans Serif", 16, 0, 0);
         snprintf(def->font.face, sizeof def->font.face, "System");
     }
     return def;
@@ -545,7 +620,7 @@ static WN_API int32_t g32_TextOutW(wn_handle hdc, int x, int y,
     return 1;
 }
 
-static WN_API uint32_t g32_SetPixel(wn_handle hdc, int32_t x, int32_t y, uint32_t color)
+WN_API uint32_t g32_SetPixel(wn_handle hdc, int32_t x, int32_t y, uint32_t color)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
     if (!dc || x < 0 || y < 0 || x >= dc->dc.w || y >= dc->dc.h)
@@ -754,6 +829,10 @@ static gdi_obj *font_from_logfont(const void *lf, int wide)
         snprintf(f->font.face, sizeof f->font.face, "%.*s",
                  (int)sizeof f->font.face - 1, face);
     }
+    /* FreeType slot AFTER the face name is known: real family +
+     * antialiased rendering when available; -1 keeps the bitmap atlas. */
+    f->font.ft_slot = wn_ft_select(f->font.face, f->font.height,
+                                   f->font.weight >= 700, f->font.italic);
     return f;
 }
 
@@ -837,6 +916,22 @@ static WN_API int32_t g32_GetTextMetricsA(wn_handle hdc, void *tm)
     font_metrics(dc, &cell_h, &adv);
     memset(tm, 0, 0x38);                  /* exactly sizeof(TEXTMETRICA) */
     int32_t *v = tm;
+    if (f->font.ft_slot >= 0 && wn_ft_available()) {
+        int asc, desc, hgt, avg;
+        wn_ft_metrics(f->font.ft_slot, &asc, &desc, &hgt, &avg);
+        v[0] = hgt;                       /* tmHeight */
+        v[1] = asc;                       /* tmAscent (real) */
+        v[2] = desc;                      /* tmDescent (real) */
+        v[3] = hgt - asc - desc > 0 ? hgt - asc - desc : 0;
+        v[4] = 0;                         /* tmExternalLeading */
+        v[5] = avg;                       /* tmAveCharWidth */
+        v[6] = avg;                       /* tmMaxCharWidth */
+        v[7] = f->font.weight;            /* tmWeight */
+        ((uint8_t *)tm)[0x30] = (uint8_t)f->font.italic;
+        ((uint8_t *)tm)[0x33] = 0x24;     /* VARIABLE_PITCH | FF_SWISS-ish */
+        ((uint8_t *)tm)[0x34] = 0x00;
+        return 1;
+    }
     v[0] = cell_h;                        /* tmHeight */
     v[1] = cell_h - 3;                    /* tmAscent */
     v[2] = 3;                             /* tmDescent */
@@ -864,9 +959,23 @@ static WN_API int32_t g32_GetTextExtentPoint32A(wn_handle hdc,
     if (!dc || !s || !size)
         return 0;
     size_t n = count < 0 ? strlen(s) : (size_t)count;
+    gdi_obj *f = dc->dc.cur_font ? dc->dc.cur_font : default_font(dc);
+    int32_t *sz = size;
+    if (f->font.ft_slot >= 0 && wn_ft_available()) {
+        int wpx = 0;
+        for (size_t i = 0; i < n; i++) {
+            const wn_ft_glyph_t *g = wn_ft_glyph(f->font.ft_slot,
+                                                 (uint8_t)s[i]);
+            wpx += g ? g->adv_x : 0;
+        }
+        int asc, desc, hgt, avg;
+        wn_ft_metrics(f->font.ft_slot, &asc, &desc, &hgt, &avg);
+        sz[0] = wpx;
+        sz[1] = hgt;              /* same cell height GetTextMetrics reports */
+        return 1;
+    }
     int cell_h, adv;
     font_metrics(dc, &cell_h, &adv);
-    int32_t *sz = size;
     sz[0] = (int32_t)(n * (size_t)adv);
     sz[1] = cell_h;
     return 1;
@@ -886,9 +995,30 @@ static WN_API int32_t g32_GetTextExtentPoint32W(wn_handle hdc,
     } else {
         n = (size_t)count;
     }
+    gdi_obj *f = dc->dc.cur_font ? dc->dc.cur_font : default_font(dc);
+    int32_t *sz = size;
+    if (f->font.ft_slot >= 0 && wn_ft_available()) {
+        int wpx = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (!s[i])
+                break;
+            uint32_t cp = s[i];
+            if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < n &&
+                s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (s[i + 1] - 0xDC00);
+                i++;
+            }
+            const wn_ft_glyph_t *g = wn_ft_glyph(f->font.ft_slot, cp);
+            wpx += g ? g->adv_x : 0;
+        }
+        int asc, desc, hgt, avg;
+        wn_ft_metrics(f->font.ft_slot, &asc, &desc, &hgt, &avg);
+        sz[0] = wpx;
+        sz[1] = hgt;
+        return 1;
+    }
     int cell_h, adv;
     font_metrics(dc, &cell_h, &adv);
-    int32_t *sz = size;
     sz[0] = (int32_t)(n * (size_t)adv);
     sz[1] = cell_h;
     return 1;
@@ -1050,6 +1180,56 @@ WN_API void g32_DrawCtlFrame(wn_handle hdc, int x, int y, int radio, int state)
     }
 }
 
+/* DrawEdge: 3D control borders. uFlags: BF_RECT=0x4 etc. (subset). Classic
+ * palette: raised = light top-left / dark bottom-right; sunken = swapped. */
+WN_API int32_t g32_DrawEdge(wn_handle hdc, void *rect, uint32_t edge,
+                            uint32_t flags)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !rect)
+        return 0;
+    int32_t *r = rect;
+    int l = r[0], t = r[1], rt = r[2], b = r[3];
+    int sunken = (edge & 0xA) != 0;   /* BDR_SUNKENOUTER|BDR_SUNKENINNER */
+    uint32_t lite = 0x00FFFFFF, dark = 0x00808080, mid = 0x00A0A0A0;
+    (void)flags;
+    int32_t q[4];
+    wn_handle bl = g32_CreateSolidBrush(lite);
+    wn_handle bd = g32_CreateSolidBrush(dark);
+    wn_handle bm = g32_CreateSolidBrush(mid);
+    if (sunken) {
+        q[0] = l; q[1] = t; q[2] = rt; q[3] = t + 1;
+        g32_FillRect(hdc, q, bd);
+        q[0] = l; q[1] = t; q[2] = l + 1; q[3] = b;
+        g32_FillRect(hdc, q, bd);
+        q[0] = l + 1; q[1] = t + 1; q[2] = rt; q[3] = t + 2;
+        g32_FillRect(hdc, q, bm);
+        q[0] = l + 1; q[1] = t + 1; q[2] = l + 2; q[3] = b;
+        g32_FillRect(hdc, q, bm);
+        q[0] = l; q[1] = b - 1; q[2] = rt; q[3] = b;
+        g32_FillRect(hdc, q, bl);
+        q[0] = rt - 1; q[1] = t; q[2] = rt; q[3] = b;
+        g32_FillRect(hdc, q, bl);
+    } else {
+        q[0] = l; q[1] = t; q[2] = rt; q[3] = t + 1;
+        g32_FillRect(hdc, q, bl);
+        q[0] = l; q[1] = t; q[2] = l + 1; q[3] = b;
+        g32_FillRect(hdc, q, bl);
+        q[0] = l + 1; q[1] = t + 1; q[2] = rt; q[3] = t + 2;
+        g32_FillRect(hdc, q, bm);
+        q[0] = l + 1; q[1] = t + 1; q[2] = l + 2; q[3] = b;
+        g32_FillRect(hdc, q, bm);
+        q[0] = l; q[1] = b - 1; q[2] = rt; q[3] = b;
+        g32_FillRect(hdc, q, bd);
+        q[0] = rt - 1; q[1] = t; q[2] = rt; q[3] = b;
+        g32_FillRect(hdc, q, bd);
+    }
+    wn_handle_close(bl);
+    wn_handle_close(bd);
+    wn_handle_close(bm);
+    return 1;
+}
+
 const wn_export_entry wn_gdi32_exports[] = {
     { "BitBlt", g32_BitBlt },
     { "CreateCompatibleDC", g32_CreateCompatibleDC },
@@ -1060,6 +1240,7 @@ const wn_export_entry wn_gdi32_exports[] = {
     { "CreateFontW", g32_CreateFontW },
     { "DrawTextA", g32_DrawTextA },
     { "DrawTextW", g32_DrawTextW },
+    { "DrawEdge", g32_DrawEdge },
     { "GetTextExtentPoint32A", g32_GetTextExtentPoint32A },
     { "GetTextExtentPoint32W", g32_GetTextExtentPoint32W },
     { "GetTextMetricsA", g32_GetTextMetricsA },

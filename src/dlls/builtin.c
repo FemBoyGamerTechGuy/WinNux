@@ -72,6 +72,7 @@ const wn_builtin_dll wn_builtin_table[] = {
     { "mswsock.dll",    wn_mswsock_exports,    NULL },
     { "iphlpapi.dll",   wn_iphlpapi_exports,   NULL },
     { "dnsapi.dll",     wn_dnsapi_exports,     NULL },
+    { "wship6.dll",     wn_wship6_exports,    NULL },   /* IPv6 helpers (putty) */
     /* crypto / security */
     { "crypt32.dll",    wn_crypt32_exports,    NULL },
     { "bcrypt.dll",     wn_bcrypt_exports,     NULL },
@@ -85,6 +86,9 @@ const wn_builtin_dll wn_builtin_table[] = {
     { "msvcp140_2.dll", wn_msvcp140_exports,   NULL },
     { "concrt140.dll",  wn_msvcp140_exports,   NULL },
     { "vcomp140.dll",   wn_msvcp140_exports,   NULL },
+    /* DPI awareness (putty delay-loads at startup) + HTML help stub */
+    { "shcore.dll",     wn_shcore_exports,    NULL },
+    { "hhctrl.ocx",     wn_hhctrl_exports,    NULL },
     { NULL, NULL, NULL },
 };
 

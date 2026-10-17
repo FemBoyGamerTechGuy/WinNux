@@ -75,12 +75,15 @@ int main(void)
           "metrics sane (cell + advance)");
     SIZE sz;
     check(GetTextExtentPoint32A(hdc, "hello", 5, &sz), "GetTextExtentPoint32A");
-    check(sz.cx == 5 * tm.tmAveCharWidth && sz.cy == tm.tmHeight,
-          "extent = n * advance");
+    /* proportional fonts (FreeType path) advance per glyph: accept a range
+     * instead of the exact bitmap-font equality n * aveCharWidth */
+    check(sz.cx > 5 * tm.tmAveCharWidth / 2 &&
+          sz.cx < 5 * tm.tmAveCharWidth * 2 &&
+          sz.cy == tm.tmHeight, "extent plausible (proportional ok)");
     RECT rc = { 0, 0, 200, 40 };
     int h = DrawTextA(hdc, "PuTTY", -1, &rc, DT_CALCRECT | DT_LEFT | DT_SINGLELINE);
-    check(h == tm.tmHeight && rc.right == 5 * tm.tmAveCharWidth,
-          "DrawTextA DT_CALCRECT");
+    check(h == tm.tmHeight && rc.right > 5 * tm.tmAveCharWidth / 2 &&
+          rc.right < 5 * tm.tmAveCharWidth * 2, "DrawTextA DT_CALCRECT");
     SelectObject(hdc, old);
     ReleaseDC(NULL, hdc);
     check(DeleteObject(f), "DeleteObject(font)");

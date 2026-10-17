@@ -30,11 +30,21 @@ typedef wn_dword wn_colorref;
 
 /* Windows API calling convention: on x86_64 there is exactly one convention
  * and it is the Microsoft x64 ABI. GCC/Clang expose it via ms_abi so builtin
- * functions can be called directly by guest code with zero thunks. */
+ * functions can be called directly by guest code with zero thunks.
+ *
+ * i386 (WoW64 groundwork, IN PROGRESS — see STATUS.md): Win32 APIs are
+ * stdcall (callee cleans) and msvcrt varargs are cdecl, so the i386 dispatch
+ * layer needs per-export convention metadata before any 32-bit guest can
+ * run. Until that lands, WN_API maps to PLAIN cdecl on i386: `make
+ * check32` compiles the whole tree with -m32 to keep the source 32-bit
+ * clean (pointer-size assumptions, struct layouts) without claiming a
+ * working convention. */
 #if defined(__x86_64__)
 #define WN_API __attribute__((ms_abi))
+#elif defined(__i386__)
+#define WN_API                   /* cdecl; stdcall metadata TBD (STATUS.md) */
 #else
-#error "WinNux currently targets x86_64 only (aarch64 planned; its Windows ABI also maps well onto direct calls)"
+#error "WinNux targets x86 (32/64) only; aarch64 is planned"
 #endif
 
 /* Export-table signature for builtin DLLs: ms_abi functions whose address is

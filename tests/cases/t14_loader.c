@@ -40,8 +40,8 @@ int main(void)
 
     /* 4. Optional DLL missing -> clean failure + ERROR_MOD_NOT_FOUND(126). */
     SetLastError(0);
-    HMODULE nope = LoadLibraryA("wship6.dll");
-    check(nope == NULL, "LoadLibraryA(\"wship6.dll\") fails");
+    HMODULE nope = LoadLibraryA("winnux-missing-test.dll");
+    check(nope == NULL, "LoadLibraryA(\"winnux-missing-test.dll\") fails");
     check(GetLastError() == ERROR_MOD_NOT_FOUND,
           "GetLastError() == ERROR_MOD_NOT_FOUND");
 

@@ -43,6 +43,9 @@ extern const wn_export_entry wn_uxtheme_exports[];
 extern const wn_export_entry wn_dwmapi_exports[];
 extern const wn_export_entry wn_winmm_exports[];
 extern const wn_export_entry wn_msvcp140_exports[];
+extern const wn_export_entry wn_wship6_exports[];
+extern const wn_export_entry wn_shcore_exports[];
+extern const wn_export_entry wn_hhctrl_exports[];
 
 /* The full builtin table (name -> exports). */
 extern const wn_builtin_dll wn_builtin_table[];

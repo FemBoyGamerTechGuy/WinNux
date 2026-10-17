@@ -1080,6 +1080,7 @@ static WN_API int32_t ms_toascii(int32_t c) { return c & 0x7F; }
 extern WN_API int32_t ms__setjmp_impl(void *env);
 extern WN_API void ms__longjmp_impl(void *env, uint64_t val);
 
+#if defined(__x86_64__)
 __asm__(
     ".text\n"
     ".globl ms__setjmp_impl\n"
@@ -1121,6 +1122,12 @@ __asm__(
     "    jmp *%rax\n"
     ".size ms__longjmp_impl, .-ms__longjmp_impl\n"
 );
+#else
+/* i386: classic cdecl setjmp saves ebx,esi,edi,ebp,esp,eip — TODO */
+__asm__(".globl ms__setjmp_impl\n.type ms__setjmp_impl,@function\nms__setjmp_impl:\n xor %eax,%eax\n ret\n"
+".globl ms__longjmp_impl\n.type ms__longjmp_impl,@function\nms__longjmp_impl:\n xor %eax,%eax\n ret\n");
+#endif
+
 
 /* --- export table -------------------------------------------------------------------------------- */
 

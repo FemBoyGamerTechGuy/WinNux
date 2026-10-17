@@ -45,9 +45,11 @@ enum wn_backend_ev {
     WN_BEV_RESIZE,
     WN_BEV_CLOSE,
     WN_BEV_KEY,
+    WN_BEV_KEYUP,
     WN_BEV_MOUSE_MOVE,
     WN_BEV_MOUSE_BUTTON,
     WN_BEV_TEXT,
+    WN_BEV_CONFIGURE,       /* position/size from the WM (x, y, w, h) */
 };
 
 typedef struct wn_bwin {
@@ -76,6 +78,15 @@ typedef struct wn_backend {
     void (*present)(wn_bwin *w);
     /* Draw UTF-8 text (optional; NULL = use software font path). */
     void (*draw_text)(wn_bwin *w, int x, int y, const char *utf8, uint32_t bgra);
+    /* Audible beep (MessageBeep; NULL = silent success). */
+    void (*beep)(void);
+    /* Screen dimensions in pixels (NULL = 800x600 guess). */
+    void (*screen_size)(int *w, int *h);
+    /* Pollable fd that wakes when backend events are pending
+     * (-1/NULL = none; user32 falls back to periodic polling). */
+    int  (*poll_fd)(void);
+    /* Query a top-level window's position on screen (optional). */
+    void (*win_pos)(wn_bwin *w, int *x, int *y);
 } wn_backend;
 
 /* Select and initialize the backend. Returns 0 on success. */

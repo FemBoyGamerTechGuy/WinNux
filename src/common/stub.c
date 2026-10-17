@@ -40,7 +40,10 @@ static uint32_t g_info_count;
 WN_API void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
                                uint64_t a3, uint64_t a4, uint64_t guest_ret);
 
-/* MS-ABI assembly bridge (see file comment). */
+/* MS-ABI assembly bridge (see file comment).
+ * i386: no ms_abi split exists; the bridge becomes a cdecl/stdcall-aware
+ * thunk — future work with the WoW64 dispatch metadata. */
+#if defined(__x86_64__)
 __asm__(
     ".text\n"
     ".globl wn_stub_entry_trampoline\n"
@@ -60,6 +63,11 @@ __asm__(
     "    ret\n"
     ".size wn_stub_entry_trampoline, .-wn_stub_entry_trampoline\n"
 );
+#else
+/* i386 trampoline: TODO with per-export convention metadata */
+__asm__(".globl wn_stub_entry_trampoline\n.type wn_stub_entry_trampoline,@function\nwn_stub_entry_trampoline:\n ret\n");
+#endif
+
 
 WN_API void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
                                uint64_t a3, uint64_t a4, uint64_t guest_ret)

@@ -377,7 +377,10 @@ void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
  * ==========================================================================*/
 
 /* RtlCaptureContext: must be raw asm — a C wrapper would capture its own
- * frame instead of the caller's. ms_abi: first arg (CONTEXT*) in RCX. */
+ * frame instead of the caller's. ms_abi: first arg (CONTEXT*) in RCX.
+ * i386: the CONTEXT layout differs entirely (EBP/ESP at different offsets,
+ * arguments on the stack) — needed before any WoW64 unwind work. */
+#if defined(__x86_64__)
 __asm__(
 ".globl wn_rtl_capture_context\n"
 ".type  wn_rtl_capture_context, @function\n"
@@ -407,6 +410,11 @@ __asm__(
 "  ret\n"
 ".size wn_rtl_capture_context, .-wn_rtl_capture_context\n"
 );
+#else
+/* i386 wn_rtl_capture_context: implement with i386 CONTEXT layout (TODO) */
+__asm__(".globl wn_rtl_capture_context\n.type wn_rtl_capture_context,@function\nwn_rtl_capture_context:\n ret\n");
+#endif
+
 
 /* raw base+RVA resolution (no wn_pe_image handle) */
 static const void *pe_rva_raw(const void *base, uint32_t rva, size_t n)

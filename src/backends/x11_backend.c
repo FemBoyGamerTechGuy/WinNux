@@ -67,6 +67,19 @@ typedef struct {
     int32_t override_redirect;
 } xconfigure;
 
+/* XWindowAttributes (x64): x@0 y@4 width@8 height@12 — all we read.
+ * THE STRUCT IS ~136 BYTES: XGetWindowAttributes writes the FULL struct, so
+ * the destination must be over-sized (a 24-byte overlay smashed the stack
+ * and crashed with wild pointers — same class as the TEXTMETRICA /GS bug). */
+typedef struct {
+    int32_t x, y, width, height;
+    int32_t border_width, depth;
+    uint8_t rest[160];
+} xwattr;
+_Static_assert(offsetof(xwattr, width) == 8, "XWindowAttributes ABI");
+_Static_assert(offsetof(xwattr, height) == 12, "XWindowAttributes ABI");
+_Static_assert(sizeof(xwattr) >= 136, "XWindowAttributes full size");
+
 typedef struct {
     xany any;
     wnx_Window message_type;
@@ -236,6 +249,7 @@ int wn_backend_glyph_render(unsigned char c, int *w, int *h, uint32_t **rgb)
 
 typedef struct {
     wnx_Window xwin;
+    int x, y;                 /* last ConfigureNotify position */
 } x11_win_priv;
 
 /* X window id -> wn_bwin map, owned by THIS backend. The old scheme
@@ -308,6 +322,8 @@ static void x11_win_destroy(wn_bwin *b)
 static void x11_win_show(wn_bwin *b)
 {
     x11_win_priv *p = b->priv;
+    if (!p || !p->xwin)     /* child-surface bwin: nothing to map */
+        return;
     pXMapWindow(g_dpy, p->xwin);
     pXFlush(g_dpy);
     b->mapped = 1;
@@ -365,8 +381,18 @@ static void handle_event(void *raw)
     case 22 /* ConfigureNotify */: {
         xconfigure *c = raw;
         wn_bwin *b = win_for(c->any.window);
-        if (b && (c->width != (uint32_t)b->width || c->height != (uint32_t)b->height))
+        if (!b)
+            break;
+        x11_win_priv *p = b->priv;
+        if (p) {
+            p->x = c->x;
+            p->y = c->y;
+        }
+        if (c->width != (uint32_t)b->width ||
+            c->height != (uint32_t)b->height)
             dispatch(b, WN_BEV_RESIZE, (int)c->width, (int)c->height, 0, 0);
+        else
+            dispatch(b, WN_BEV_CONFIGURE, c->x, c->y, 0, 0);
         break;
     }
     case 2 /* KeyPress */:
@@ -378,7 +404,7 @@ static void handle_event(void *raw)
         char buf[16] = { 0 };
         wnx_Atom keysym = 0;
         int n = pXLookupString(raw, buf, sizeof buf - 1, &keysym, NULL);
-        dispatch(b, k->any.type == 2 ? WN_BEV_KEY : WN_BEV_KEY, k->x, k->y,
+        dispatch(b, k->any.type == 2 ? WN_BEV_KEY : WN_BEV_KEYUP, k->x, k->y,
                  (int)(keysym & 0xFFFFFFFF), (int)(unsigned char)k->keycode);
         if (n > 0 && k->any.type == 2) {
             buf[n] = '\0';
@@ -477,6 +503,40 @@ static void x11_draw_text(wn_bwin *b, int x, int y, const char *utf8, uint32_t b
     pXDrawImageString(g_dpy, p->xwin, g_gc, x, y, utf8, (int)strlen(utf8));
 }
 
+static int (*pXBell)(wnx_Display, int);
+
+static void x11_beep(void)
+{
+    if (pXBell) {
+        pXBell(g_dpy, 100);
+        pXFlush(g_dpy);
+    }
+}
+
+static int g_screen_w = 1280, g_screen_h = 800;
+
+static void x11_screen_size(int *w, int *h)
+{
+    if (w)
+        *w = g_screen_w;
+    if (h)
+        *h = g_screen_h;
+}
+
+static int x11_poll_fd(void)
+{
+    return g_dpy ? pXConnectionNumber(g_dpy) : -1;
+}
+
+static void x11_win_pos(wn_bwin *b, int *x, int *y)
+{
+    x11_win_priv *p = b ? b->priv : NULL;
+    if (x)
+        *x = p ? p->x : 0;
+    if (y)
+        *y = p ? p->y : 0;
+}
+
 static int x11_init(void)
 {
     void *x = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
@@ -532,6 +592,16 @@ static int x11_init(void)
     g_depth = 24;   /* standard TrueColor; XPutImage converts if needed */
     g_gc = pXCreateGC(g_dpy, g_root, 0, NULL);
     g_wm_delete = pXInternAtom(g_dpy, "WM_DELETE_WINDOW", 0);
+    /* Screen dimensions for GetSystemMetrics / monitor APIs. */
+    {
+        xwattr wa;
+        memset(&wa, 0, sizeof wa);
+        if (pXGetWindowAttributes(g_dpy, g_root, &wa) && wa.width > 0) {
+            g_screen_w = wa.width;
+            g_screen_h = wa.height;
+        }
+    }
+    wn_log(WN_LOG_DEBUG, "x11: screen %dx%d", g_screen_w, g_screen_h);
     pXLoadQueryFont = dlsym(x, "XLoadQueryFont");
     pXTextWidth = dlsym(x, "XTextWidth");
     pXCreatePixmap = dlsym(x, "XCreatePixmap");
@@ -539,6 +609,7 @@ static int x11_init(void)
     pXFreePixmap = dlsym(x, "XFreePixmap");
     pXSetBackground = dlsym(x, "XSetBackground");
     pXMoveResizeWindow = dlsym(x, "XMoveResizeWindow");
+    pXBell = dlsym(x, "XBell");
     if (pXLoadQueryFont) {
         g_font = pXLoadQueryFont(g_dpy, "fixed");
         if (!g_font)
@@ -560,4 +631,8 @@ const wn_backend wn_x11_backend = {
     .pump = x11_pump,
     .present = x11_present,
     .draw_text = x11_draw_text,
+    .beep = x11_beep,
+    .screen_size = x11_screen_size,
+    .poll_fd = x11_poll_fd,
+    .win_pos = x11_win_pos,
 };

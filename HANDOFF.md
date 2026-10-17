@@ -3,65 +3,79 @@
 Read this before continuing. Pair with STATUS.md (what works + proof) and
 TODO.md (prioritized backlog).
 
-## Last session (session 4) — what happened
+## Last session (session 5) — what happened
 
-Goal (from the task brief): keep the loop going on putty until its config
-dialog is real; the session started with in-flight SEH-unwinding work
-(Rtl* exports) uncommitted.
+User-reported bugs, all reproduced + fixed: the message-queue overflow spam
+(WM_SIZE/WM_PAINT posted per control move + uncoalesced WM_MOUSEMOVE; now
+sync-delivered / dirty-flag-synthesized / coalesced, ring grows to 8192),
+the About-box segfault (dialogs were CHILDREN of their owner; now top-level
+owned popups — full modal cycle proven: open, interact, WM_DELETE close,
+owner re-enabled), the three missing optional DLLs (wship6 = getaddrinfo
+family with AF_INET6 translated Linux 10 → Windows 23; shcore DPI; hhctrl
+stubs), EnableWindow/MessageBeep real (disabled windows now refuse input),
+and the registry save hardened (atomic tmp+rename, errno reported, unlink
+retry).
 
-Putty used to die ~50ms after startup with no crash report — only three
-optional-DLL notes then silence, exit 9. The hunt (disassembly of
-putty.exe + stack archaeology from our TerminateProcess handler) found a
-chain of four real WinNux bugs, all fixed this session:
+Monitor/DPI APIs landed (GetSystemMetrics, MonitorFrom*, GetMonitorInfo,
+SystemParametersInfo, real top-level GetWindowRect with cw/ch + screen-sized
+desktop) — putty centers its config box exactly ((660,36) on 1080p).
+Text is FreeType-rendered now (dlopen libfreetype, probed+verified struct
+overlays, /proc/self/maps-guarded face scan, family matching, AA blit;
+bitmap atlas remains the fallback). check32 (i386 compile probe) + arch
+guards landed as WoW64 groundwork.
 
-1. **gdi32 GetTextMetricsA overflow (THE killer)**: memset(tm, 0, 0x58) +
-   a write at tm+0x54 into a 56-byte TEXTMETRICA → 32-byte stack smash →
-   putty's /GS canary corrupted → __report_gsfailure →
-   TerminateProcess(0xC0000409). Exact x64 layout now (0x38 bytes).
-2. **LoadCursor/LoadIcon(A/W) dereferenced MAKEINTRESOURCE** values
-   (IDC_ARROW = 0x7f00 as a char*) → SIGSEGV in res_name_to_id.
-3. **IsDialogMessage was one-arg**; real signature (hDlg, lpMsg) — RCX is
-   the dialog HWND, RDX the MSG*.
-4. **loader cands[2] OOB read** in the explicit-path probe loop (only when
-   the name lacked ".dll", e.g. hhctrl.ocx) → garbage 3rd probe → the
-   "unreadable win-path pointer" WARN spam. cands[3] + NULL terminator +
-   Windows extension semantics (.dll only appended to extension-less names).
-
-Also landed: MoveWindow + SetWindowPos (child coords + parent recompose;
-top-level via new backend op win_move_resize — X11 XMoveResizeWindow
-dlsym'd), and the previously in-flight kernel32 Rtl* unwinding exports
-(RtlCaptureContext raw-asm, RtlLookupFunctionEntry, RtlVirtualUnwind with
-full unwind-code interpretation, RtlPcToFileHeader, RtlUnwind v1) +
-RaiseException + UnhandledExceptionFilter routing to the app's filter.
-
-**RESULT: putty now STAYS ALIVE in its message loop** (killed only by our
-timeout), "PuTTY Configuration" dialog + timing window mapped under Xvfb,
-quiet log, 40s ASan/UBSan soak clean. 15/15 tests; lua/sqlite re-verified.
-
-Debug-tooling that helped (kept): scripts/dev/xtree.c — host tool compiled
-with -lX11 OUTSIDE the product build; dumps the X window tree and saves
-PPM screenshots. `cc -O2 -o /tmp/xtree scripts/dev/xtree.c -lX11`.
+Session archaeology worth remembering: a 24-byte XWindowAttributes overlay
+smashed the stack in x11_init (the real struct is ~136 bytes); top-level
+windows never had cw/ch set (GetWindowRect → 0-size → putty clamped to
+1x1); a stale /proc/self/maps snapshot made FreeType verification flaky
+(FT_New_Face extends the heap — refresh per scan); MonitorFromPoint takes
+POINT BY VALUE = packed into RCX.
 
 ## Next 3 steps (exactly this order)
 
-1. **Dialog interaction proof**: route X clicks to child controls →
-   WM_COMMAND (BN_CLICKED, control id) to the dialog proc; verify putty's
-   OK/Cancel/Apply buttons fire (log lines from putty's dlgproc handlers).
-   Extend the existing mouse-hit path in the message pump.
-2. **Control visual fidelity**: real Button (border + text + check),
-   Edit (sunken border + caret), Static, ListBox painting in the compose
-   path + GetSysColor palette; screenshot with xtree should show text in
-   the dialog, not flat boxes.
-3. **SEH dispatch loop** (P1): use RtlVirtualUnwind in wn_seh_raise/crash
-   paths to walk guest frames and call scope-table handlers; t16 test with
-   mingw __try/__except catching a deliberate AV.
+1. **PuTTY Open → SSH session launch**: the Open button's
+   WM_COMMAND(BN_CLICKED, id=1009) reaches putty's dlgproc (proven via
+   ctl_notify trace) but no launch follows. Disassemble the PuTTYConfigBox
+   wndproc's WM_COMMAND path around the call site, find which call fails
+   silently (suspects: config serialization to the registry, CreateThread
+   for the session thread, socket events on the launch thread), and drive
+   it to a terminal window. Hostname typing already works (EN_CHANGE +
+   GetDlgItemText verified).
+2. **32-bit WoW64, the real thing** (user priority): on the user's Arch
+   box (gcc-multilib), run `make check32` and fix the fallout; then build
+   the i386 runtime (Wine model: separate 32-bit process, 32-bit libX11
+   via dlopen), per-export stdcall/cdecl dispatch metadata, i386 TEB/PEB
+   via set_thread_area. 7zr.exe (32-bit, in apps/) is the acceptance case.
+3. **SEH scope-table dispatch loop**: RtlVirtualUnwind exists; wire the
+   dispatch (walk guest frames, call __except handlers) with a t16 mingw
+   __try/__except test catching a deliberate AV.
 
 ## Dead ends / gotchas (do not repeat)
 
 - The Edit/Write tools convert TABs to spaces — NEVER edit the Makefile with
-  them; use `sed` (a session was lost to "missing separator" once already).
+  them; use `sed` or `python` line-rewrite (a session was lost to "missing
+  separator" once already).
 - `wn_utf16_to_utf8(w, len16)`: second arg is the INPUT length in UTF-16
   units, not bytes, not a capacity. Two people got this wrong already.
+- MS-ABI struct-by-value trap: 1/2/4/8-byte structs arrive IN A REGISTER
+  (MonitorFromPoint's POINT → RCX; declare it as one uint64_t, not (x,y)).
+  Same class as the IsDialogMessage bug.
+- XGetWindowAttributes writes ~136 BYTES regardless of what your overlay
+  declares — size every X struct overlay for the REAL struct or oversize
+  it (XImage/wa overlay class of bugs; a 24-byte overlay smashed the
+  stack this session).
+- Putty's centre_dialog measures GetWindowRect(GetDesktopWindow()): the
+  desktop pseudo-window must track the REAL screen size or dialogs land
+  wrong / get clamped to 1x1.
+- FreeType: a face's max_advance_width is NOT an average (DejaVu Bold:
+  4129 units = 2× em). Use the 'x' glyph advance for tmAveCharWidth.
+- /proc/self/maps snapshots go STALE when libraries allocate (dlopen,
+  FT_New_Face) — refresh before pointer-validity scans.
+- Expected-file format in tests/: LINE 1 IS THE EXIT CODE, then output.
+  Editing a message without preserving the leading "0" line silently
+  breaks the runner comparison.
+- Makefile recipes: `exit 0` inside one recipe line's shell does NOT stop
+  the target — use make-level `ifeq` conditionals for skip logic.
 - SQLite CLI: `sqlite3.exe FILE` opens FILE as a DATABASE and reads SQL from
   stdin — a foreground run then blocks on the terminal forever. Use
   `sqlite3.exe :memory: "SQL..."` or `< script.sql`.
@@ -69,8 +83,6 @@ PPM screenshots. `cc -O2 -o /tmp/xtree scripts/dev/xtree.c -lX11`.
   terminates the comment.
 - PuTTY is MSVC-built with FPO OFF: RBP chains are walkable; keep the crash
   report's frame walk.
-- Stale .o files under obj-dbg (sources since deleted) break the fuzz link:
-  `rm -rf obj-dbg && make debug` before fuzzing after structural changes.
 - Builtin output-struct writers MUST match the exact Win64 layout size —
   putty's /GS canary sat right after a 56-byte TEXTMETRICA and our 88-byte
   write killed the process with 0xC0000409 (no crash report — MSVC
@@ -87,15 +99,15 @@ PPM screenshots. `cc -O2 -o /tmp/xtree scripts/dev/xtree.c -lX11`.
 
 ## Environment notes
 
-- Box: Debian 13, GCC 14.2 (user runs GCC 15 — keep both compatible; the
-  strchr/strrchr/strstr const-propagation class of diagnostics is the known
-  difference so far).
-- Xvfb auto-started on :95 by the test runner; `scripts/dev/xtree.c` (host
-  tool, cc -lX11, not shipped) lists the X window tree and captures PPM
-  screenshots — use it to prove guest windows.
+- Box: Debian 13, GCC 14.2 (user runs GCC 15 — keep both compatible), NO
+  32-bit libc headers (make check32 SKIPs; user's Arch box can install
+  gcc-multilib). Xvfb on :95 (screen 1920x1080x24 for putty's tall config
+  box). scripts/dev/xtree.c (host tool, cc -lX11, COMMITTED this time —
+  it was lost once): tree dump, PPM screenshots, synthetic click/key/
+  WM_DELETE-close. This time it is in git.
 - Real apps live OUTSIDE the repo in /home/z/my-project/apps: putty.exe
-  (x64 GUI), 7zr.exe (32-bit! WoW64 driver case), lua-5.4.7 (built with the
-  in-tree mingw toolchain), sqlite-amalgamation-3500400 (built likewise).
-  Never commit binaries; the token stays in /home/z/my-project/.github_token.
-- GitHub: push with the per-command credential helper (see git log messages
-  / worklog for the pattern); token must never enter the repo.
+  (x64 GUI), 7zr.exe (32-bit! WoW64 driver case), lua, sqlite. Never
+  commit binaries; the token stays in /home/z/my-project/.github_token
+  (untracked, and ALSO untracked from the workspace's own repo).
+- GitHub: push with the per-command credential helper (pattern in git log
+  messages / worklog); token must never enter any repo.

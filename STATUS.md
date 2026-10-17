@@ -4,6 +4,133 @@ Updated every session. Format: what works (with the test that proves it),
 what is broken, what is untested, what is next. Never claim success that was
 not observed.
 
+## Date: 2026-10-18 (session 5)
+
+### The user's bug list: fixed and verified
+
+All five issues from the user's run were reproduced locally under Xvfb
+(synthetic clicks via the rebuilt `scripts/dev/xtree.c`), root-caused, and
+fixed:
+
+1. **`user32: message queue overflow (dropped 0x5/0xf/0x200)` spam —
+   GONE.** Root cause: putty's layout code posted WM_SIZE+WM_PAINT per
+   MoveWindow (3 queue slots × ~50 controls) and every WM_MOUSEMOVE went
+   into a fixed 128-slot ring, so real input got DROPPED. Fixes, matching
+   Windows semantics: WM_SIZE/WM_MOVE are now DELIVERED SYNCHRONOUSLY from
+   inside MoveWindow/SetWindowPos (never queued); WM_PAINT is only ever
+   synthesized from the per-window dirty flag by the pump (direct posts
+   removed everywhere); WM_MOUSEMOVE coalesces in place (newest position,
+   queue order kept); the ring grows 128→8192 if a burst survives
+   coalescing; PeekMessage honors PM_NOREMOVE and pumps input (modal
+   loops used to starve the whole input path). Evidence: putty soak now
+   logs ZERO overflow lines.
+2. **The About-button segfault — FIXED.** Reproduced exactly (same
+   backtrace as the user). Chain: dialogs passed an owner as "parent"
+   were created as CHILD windows; u32_ShowWindow then called the backend's
+   win_show on a child's bwin (priv=NULL) → SIG11 in x11_win_show.
+   Dialogs are now top-level OWNED popups (WS_CHILD decides child-vs-
+   owned, per Windows), with owner-relative template positioning
+   (DS_ABSALIGN honored). The About box opens as its own X11 window
+   (540x544), survives interaction, and closes cleanly via the
+   WM_DELETE_WINDOW ClientMessage (xtree `close`) — the full modal
+   lifecycle (open → interact → close → owner re-enabled) works.
+3. **`wship6.dll / hhctrl.ocx / shcore.dll not found` — GONE.** All three
+   are builtins now (auto-placeholders in drive_c/windows/system32):
+   wship6 = getaddrinfo/freeaddrinfo/getnameinfo over the host resolver
+   with the addrinfo list deep-copied and **AF_INET6 translated
+   (Linux 10 → Windows 23)**; shcore = SetProcessDpiAwareness/
+   GetDpiForMonitor/GetScaleFactorForMonitor; hhctrl = loud honest
+   HtmlHelp stubs.
+4. **`EnableWindow` / `MessageBeep` STUBs — real.** EnableWindow sets
+   WS_DISABLED, moves focus away, returns the previous state, and the
+   input path now IGNORES clicks on disabled windows (the hit-test skips
+   them; that is why putty's owner must be disabled during modal About).
+   MessageBeep rings XBell through a new backend `beep` op.
+5. **`registry: cannot save .../system.reg` — hardened.** The save is now
+   atomic (tmp + rename, crash-truncation impossible) and reports errno
+   with the REASON on failure; a stale/protected destination gets an
+   unlink+rename retry. Not reproducible here (saves work locally) —
+   if it still fails on the user's box, the log will now say exactly why
+   (most likely EACCES from a prefix created by an earlier root run).
+
+### PuTTY's config box now places itself correctly
+
+Monitor/DPI APIs are real: GetSystemMetrics (full metric table),
+MonitorFromWindow/Rect/Point (POINT BY VALUE — the 8-byte struct arrives
+packed in RCX under the MS x64 ABI; a naive (x,y,flags) signature reads
+y from RDX), GetMonitorInfoA/W, EnumDisplayMonitors, SystemParametersInfo
+(SPI_GETWORKAREA), GetDpiForWindow/System, SetProcessDPIAware,
+ScreenToClient/ClientToScreen, GetParent, GetWindowPlacement/
+SetWindowPlacement. Two blockers found on the way: top-level windows
+never had cw/ch set (GetWindowRect returned 0-size → putty center
+shrank the box to 1x1), and the desktop pseudo-window was hardcoded
+1280x800. Both fixed — putty's `centre_dialog(GetDesktopWindow())` now
+centers the config box EXACTLY: 600x1008 at (660,36) on 1920x1080.
+
+### Text is now FreeType-rendered (the "readable but not great" fix)
+
+New `src/gfx/font_ft.c`: libfreetype.so.6 is dlopen'd at runtime (zero
+compile-time deps, per project rules) and glyph structs are accessed via
+hand overlays whose offsets were PROBED against the real headers
+(FT_FaceRec.glyph@0x98, size@0xA0; GlyphSlot advance@0x80, format@0x90,
+bitmap@0x98, bitmap_left@0xC0). Nothing is trusted blindly: init renders
+'A', then locates the glyph-slot/size pointers by structural signature,
+with every candidate pointer validated against a /proc/self/maps
+snapshot (refreshed per scan — a stale snapshot made verification flaky).
+On any mismatch we fall back to the embedded bitmap atlas and log it.
+Rendering: alpha-blended glyphs, per-glyph advances, surrogate pairs,
+family matching (Courier New/Consolas→mono, Times→serif, everything else
+sans; DejaVu/Liberation/Free/Noto probed on Arch and Debian layouts),
+bold/oblique variants with double-strike synthesis when only regular
+exists. GetTextMetrics/GetTextExtentPoint use REAL metrics (ascent/
+descent from the face; tmAveCharWidth = the 'x' advance — a face's
+max_advance is a lie, DejaVu Bold reports 4129 units = 2× the em).
+Also fixed on the way: XGetWindowAttributes wrote a ~136-byte struct
+into a 24-byte overlay (stack smash in x11_init — the wild-pointer
+crashes of the "1x1 config box" hunt).
+
+### Interaction API batch (user32)
+
+InvalidateRect/ValidateRect (dirty-flag semantics), GetSysColor/
+GetSysColorBrush (classic palette), GetCursorPos/GetKeyboardState/
+SetKeyboardState/GetKeyboardLayout/GetQueueStatus/GetMessageTime/
+GetDoubleClickTime/GetCaretBlinkTime/IsIconic/IsZoomed/FlashWindow/
+SetForegroundWindow, caret family (CreateCaret/SetCaretPos/ShowCaret/
+HideCaret/DestroyCaret), FindWindowA, LoadImageA(icons), DestroyIcon,
+DrawEdge (gdi32: real 3D borders), MsgBoxIndirectW, W-variants for
+message/dispatch/text APIs, SendDlgItemMessageA/W, Get/SetDlgItemText,
+MsgWaitForMultipleObjects (queue-aware wait with 0-timeout handle
+probes through the sync engine). Push buttons now draw 3D frames +
+dotted focus rects; disabled controls paint gray text (COLOR_GRAYTEXT).
+
+### 32-bit (WoW64) groundwork — source-level
+
+`make check32` compiles the whole tree with -m32 (i386) when a multilib
+toolchain exists (this container lacks 32-bit libc headers; the target
+prints install hints and skips — it will run on the user's Arch box
+with gcc-multilib). WN_API maps to cdecl on i386 for now; the x64-only
+asm blocks (stub trampoline, RtlCaptureContext, _setjmp/_longjmp,
+gs-TEB access) are guarded with i386 variants or compile-stubs, so the
+tree stays buildable on both. What 32-bit STILL needs before a single
+32-bit exe runs (documented in TODO P2): per-export stdcall/cdecl
+dispatch metadata (Win32 i386 APIs clean the stack; varargs are cdecl),
+i386 TEB/PEB layouts + a set_thread_area TLS scheme (gs:0x30 → fs:0x18),
+i386 CONTEXT/EXCEPTION layouts for SEH, and a separate 32-bit build of
+the runtime (Wine's model: 32-bit process, 32-bit X11 via dlopen).
+
+### Regression status
+
+15/15 tests (t14/t15 updated: wship6 is now a real DLL so the
+missing-DLL test uses a permanently-missing name; text-extent checks
+accept proportional metrics). lua.exe and sqlite3.exe re-verified.
+Putty: 40s ASan soak clean; interactions verified via xtree (clicks,
+key typing, About modal cycle, WM_DELETE close). Known gaps: putty's
+Open button fires WM_COMMAND(BN_CLICKED) into its dlgproc but no
+session launch follows (next session's target: trace the wndproc path
+from WM_COMMAND to launch — likely needs the config→registry save and
+the launch-thread flow); SysLink control class unknown (About box link
+falls back); X11 clipboard/menus remain stubs.
+
 ## Date: 2026-10-18 (session 4)
 
 ### PuTTY STAYS ALIVE (the headline)

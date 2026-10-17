@@ -65,7 +65,8 @@ typedef struct wn_window {
     struct { int l, t, r, b; } dirty;    /* damage rect; l<0 = clean */
     /* child window support */
     uint64_t parent;          /* 0 = top level */
-    int wx, wy;               /* position in parent (pixels) */
+    uint64_t owner;           /* top-level OWNER (dialogs): not a parent */
+    int wx, wy;               /* position in parent / on screen */
     int cw, ch;               /* size (pixels) */
     uint64_t id;              /* control id (HMENU slot) */
     int is_child;
@@ -93,9 +94,6 @@ typedef struct wn_window {
 /* Documented globals: GUI state (single-GUI-thread model for v1). */
 static wn_wndclass g_classes[32];
 static wn_timer g_timers[32];
-static wn_msg g_queue[WN_MSG_QUEUE_DEPTH];
-static int g_q_head, g_q_count;
-static int g_msg_fd = -1;
 static int g_backend_up;
 static int g_quit_posted;
 static uint32_t g_quit_code;
@@ -116,19 +114,73 @@ static int g_bwin_count;
 /* Forward decls (defined later in this file). */
 static void compose_child(wn_window *child);
 static void present_root(wn_window *w);
+static void win_screen_origin(wn_window *w, int *x, int *y);
+static WN_API uint64_t u32_SendMessageA(uint64_t hwnd, uint32_t msg,
+                                        uint64_t wp, int64_t lp);
+static WN_API int32_t u32_MessageBoxW(uint64_t hwnd, const uint16_t *text,
+                                     const uint16_t *caption, uint32_t type);
 #define DLG_X(n) ((int)((n) * 4 / 2 + ((n) & 1)))
 #define DLG_Y(n) ((int)((n) * 8 / 2))
 
+/* Synchronous delivery — Windows sends WM_SIZE/WM_MOVE from INSIDE
+ * SetWindowPos/MoveWindow (they are never queued). Apps measure with
+ * GetWindowRect right after MoveWindow and relayout synchronously; queueing
+ * them also let putty's layout bursts overflow the queue. */
+static void deliver_now(uint64_t hwnd, uint32_t msg, uint64_t wp, int64_t lp)
+{
+    u32_SendMessageA(hwnd, msg, wp, lp);
+}
+
 /* --- queue -------------------------------------------------------------------- */
+
+/* Growable ring buffer. Windows coalesces WM_MOUSEMOVE (only the newest
+ * pending position exists per queue) and generates WM_PAINT from the update
+ * region instead of queueing it — putty's layout code used to flood 128-slot
+ * queue with WM_SIZE/WM_PAINT pairs and the overflow DROPPED real input
+ * (user-visible: "message queue overflow (dropped 0x5/0xf/0x200)" spam and
+ * dead clicks). We keep the ring small and grow it only if a burst survives
+ * coalescing (cross-thread posts). */
+#define WN_MSG_QUEUE_DEPTH 128
+#define WN_MSG_QUEUE_MAX   8192
+
+static wn_msg *g_queue;               /* malloc'd ring, g_q_depth slots */
+static int g_q_depth = WN_MSG_QUEUE_DEPTH;
+static int g_q_head, g_q_count;
+static int g_msg_fd = -1;
 
 static void queue_push(const wn_msg *m)
 {
-    if (g_q_count >= WN_MSG_QUEUE_DEPTH) {
-        wn_log(WN_LOG_WARN, "user32: message queue overflow (dropped 0x%x)",
-               m->message);
-        return;
+    if (!g_queue)
+        g_queue = wn_xmalloc((size_t)WN_MSG_QUEUE_DEPTH * sizeof(wn_msg));
+    /* WM_MOUSEMOVE coalescing: replace a pending move for the same window
+     * in place (keeps queue order, updates to the newest position). */
+    if (m->message == 0x0200 /* WM_MOUSEMOVE */) {
+        for (int i = 0; i < g_q_count; i++) {
+            int slot = (g_q_head + i) % g_q_depth;
+            if (g_queue[slot].message == 0x0200 &&
+                g_queue[slot].hwnd == m->hwnd) {
+                g_queue[slot] = *m;
+                return;
+            }
+        }
     }
-    g_queue[(g_q_head + g_q_count) % WN_MSG_QUEUE_DEPTH] = *m;
+    if (g_q_count >= g_q_depth) {
+        if (g_q_depth < WN_MSG_QUEUE_MAX) {
+            int nd = g_q_depth * 2;
+            wn_msg *nq = wn_xmalloc((size_t)nd * sizeof(wn_msg));
+            for (int i = 0; i < g_q_count; i++)
+                nq[i] = g_queue[(g_q_head + i) % g_q_depth];
+            free(g_queue);
+            g_queue = nq;
+            g_q_head = 0;
+            g_q_depth = nd;
+        } else {
+            wn_log(WN_LOG_WARN, "user32: message queue overflow at %d "
+                   "(dropped 0x%x)", g_q_depth, m->message);
+            return;
+        }
+    }
+    g_queue[(g_q_head + g_q_count) % g_q_depth] = *m;
     g_q_count++;
     if (g_msg_fd >= 0) {
         uint64_t one = 1;
@@ -141,8 +193,17 @@ static int queue_pop(wn_msg *out)
     if (g_q_count == 0)
         return 0;
     *out = g_queue[g_q_head];
-    g_q_head = (g_q_head + 1) % WN_MSG_QUEUE_DEPTH;
+    g_q_head = (g_q_head + 1) % g_q_depth;
     g_q_count--;
+    return 1;
+}
+
+/* Peek without removing (PeekMessage PM_NOREMOVE). */
+static int queue_peek(wn_msg *out)
+{
+    if (g_q_count == 0)
+        return 0;
+    *out = g_queue[g_q_head];
     return 1;
 }
 
@@ -188,6 +249,11 @@ wn_bwin *wn_user32_bwin_for(void *backend_priv)
             return g_bwins[i].bwin;
     return NULL;
 }
+
+/* cursor + keyboard-state tracking (GetCursorPos/GetKeyboardState). */
+static int g_mouse_x = -1, g_mouse_y = -1;
+static uint8_t g_key_state[256];
+static uint32_t g_last_msg_time;
 
 /* --- input translation --------------------------------------------------------- */
 
@@ -244,8 +310,20 @@ void wn_backend_event_cb(const wn_backend_event *ev)
             if (ev->x + ev->val > w->dirty.r) w->dirty.r = ev->x + ev->val;
             if (ev->y + ev->val2 > w->dirty.b) w->dirty.b = ev->y + ev->val2;
         }
-        post_msg(h, WN_WM_PAINT, 0, 0);
+        /* WM_PAINT is generated from the dirty flag by the message pump —
+         * NEVER posted directly (queue-flood bug, see queue_push comment). */
         break;
+    case WN_BEV_CONFIGURE: {
+        /* moved without resizing (WM drag): update + queued WM_MOVE */
+        if (w->parent == 0) {
+            w->wx = ev->x;
+            w->wy = ev->y;
+            post_msg(h, WN_WM_MOVE, 0,
+                     (int64_t)(((uint64_t)(uint16_t)ev->x) |
+                               ((uint64_t)(uint16_t)ev->y << 16)));
+        }
+        break;
+    }
     case WN_BEV_RESIZE:
         if (b->pixels) {
             b->width = ev->x;
@@ -255,22 +333,39 @@ void wn_backend_event_cb(const wn_backend_event *ev)
             b->pixels = wn_xmalloc((size_t)ev->x * ev->y * 4 + 64);
             memset(b->pixels, 0xFF, (size_t)ev->x * ev->y * 4);
         }
-        post_msg(h, WN_WM_SIZE, 0,
-                 (int64_t)(((uint64_t)(uint16_t)ev->x) |
-                           ((uint64_t)(uint16_t)ev->y << 16)));
+        if (w->parent == 0) {
+            w->cw = ev->x;
+            w->ch = ev->y;
+            /* the backend knows its position; sync it for GetWindowRect */
+            const wn_backend *be = wn_backend_get();
+            if (be && be->win_pos)
+                be->win_pos(b, &w->wx, &w->wy);
+        }
+        deliver_now(h, WN_WM_SIZE, 0,
+                    (int64_t)(((uint64_t)(uint16_t)ev->x) |
+                              ((uint64_t)(uint16_t)ev->y << 16)));
         break;
     case WN_BEV_CLOSE:
         post_msg(h, WN_WM_CLOSE, 0, 0);
         break;
-    case WN_BEV_KEY: {
+    case WN_BEV_KEY:
+    case WN_BEV_KEYUP: {
         uint32_t vk = wn_user32_vk_from_keysym((uint32_t)ev->val);
         if (vk) {
+            /* keyboard-state tracking for GetKeyboardState */
+            if (vk < 256) {
+                if (ev->type == WN_BEV_KEY)
+                    g_key_state[vk / 8] |= (uint8_t)(1u << (vk % 8));
+                else
+                    g_key_state[vk / 8] &= (uint8_t)~(1u << (vk % 8));
+            }
             /* keyboard goes to the FOCUS window, not the event window */
             uint64_t target = g_focus_hwnd ? g_focus_hwnd : h;
             wn_window *tw = win_from_hwnd(target);
             if (!tw)
                 target = h;
-            post_msg(target, WN_WM_KEYDOWN, vk, 0);
+            post_msg(target, ev->type == WN_BEV_KEY ? WN_WM_KEYDOWN
+                                                    : WN_WM_KEYUP, vk, 0);
         }
         break;
     }
@@ -279,6 +374,13 @@ void wn_backend_event_cb(const wn_backend_event *ev)
                  (uint64_t)(uint32_t)ev->val, 0);
         break;
     case WN_BEV_MOUSE_MOVE:
+        /* approximate cursor tracking for GetCursorPos (root coords) */
+        {
+            int ox, oy;
+            win_screen_origin(w, &ox, &oy);
+            g_mouse_x = ox + ev->x;
+            g_mouse_y = oy + ev->y;
+        }
         post_msg(g_capture_hwnd ? g_capture_hwnd : h, WN_WM_MOUSEMOVE, 0,
                  (int64_t)(((uint64_t)(uint16_t)ev->x) |
                            ((uint64_t)(uint16_t)ev->y << 16)));
@@ -292,6 +394,13 @@ void wn_backend_event_cb(const wn_backend_event *ev)
         if (ev->val2 == 1)      msg = ev->val ? WN_WM_LBUTTONDOWN : WN_WM_LBUTTONUP;
         else if (ev->val2 == 3) { msg = ev->val ? WN_WM_RBUTTONDOWN : WN_WM_RBUTTONUP; wp = 2; }
         if (msg) {
+            /* Disabled top-level windows eat no input: putty disables its
+             * config box while the About modal is up, and X11 still
+             * delivers clicks to that window. */
+            wn_window *ew = win_from_hwnd(h);
+            if (ew && (ew->style & 0x08000000u /*WS_DISABLED*/) &&
+                !g_capture_hwnd)
+                break;
             /* Captured window eats all button messages (Windows contract). */
             if (g_capture_hwnd) {
                 post_msg(g_capture_hwnd, msg, wp,
@@ -299,8 +408,11 @@ void wn_backend_event_cb(const wn_backend_event *ev)
                                    ((uint64_t)(uint16_t)ev->y << 16)));
                 break;
             }
-            /* hit-test: deliver to the deepest visible child under the
-             * cursor, with coordinates translated to its origin. */
+            /* hit-test: deliver to the deepest visible, ENABLED child under
+             * the cursor, with coordinates translated to its origin. Windows
+             * never delivers mouse input to WS_DISABLED windows — putty
+             * disables the config box while its About modal runs and the
+             * clicks MUST fall through. */
             uint64_t target = h;
             int mx = (int)(int16_t)ev->x, my = (int)(int16_t)ev->y;
             for (int depth = 0; depth < 8; depth++) {
@@ -309,7 +421,7 @@ void wn_backend_event_cb(const wn_backend_event *ev)
                 for (int i = 0; i < g_hwnd_count; i++) {
                     wn_window *c = g_hwnds[i].win;
                     if (!c || c->parent != target || !c->visible ||
-                        c->in_destroy)
+                        c->in_destroy || (c->style & 0x08000000u /*WS_DISABLED*/))
                         continue;
                     if (mx >= c->wx && my >= c->wy &&
                         mx < c->wx + c->cw && my < c->wy + c->ch) {
@@ -366,19 +478,25 @@ static WN_API int32_t u32_ShowWindow(uint64_t hwnd, int32_t cmd)
         return 0;
     const wn_backend *be = wn_backend_get();
     int was_visible = w->visible;
-    if (be && be->win_show)
+    /* Only top-level windows have a real backend surface; children are
+     * offscreen surfaces composed by their parent (be->win_show on a child
+     * bwin crashed on priv=NULL — the putty About-box segfault). */
+    if (!w->parent && be && be->win_show)
         be->win_show(w->bwin);
     if (cmd != 0 /* SW_HIDE */)
         w->visible = 1;
     else
         w->visible = 0;
+    if (w->parent && w->visible)
+        compose_child(w);
     return was_visible;
 }
 
 /* --- MoveWindow / SetWindowPos ----------------------------------------------------
  * Children: coordinates update + parent recompose. Top-level: backend
- * window resize (pixel buffer reallocated). WM_SIZE/WM_MOVE posted like
- * Windows does. */
+ * window resize (pixel buffer reallocated). WM_SIZE/WM_MOVE are DELIVERED
+ * synchronously (Windows semantics: they are sent inside SetWindowPos,
+ * never queued); WM_PAINT is scheduled via the dirty flag only. */
 static void compose_children_of(uint64_t parent);   /* fwd (defined later) */
 static void user32_move_resize(uint64_t hwnd, int x, int y, int w, int h,
                                int do_move, int do_size)
@@ -391,47 +509,58 @@ static void user32_move_resize(uint64_t hwnd, int x, int y, int w, int h,
     if (do_size && h < 1)
         h = 1;
     int old_w = win->cw, old_h = win->ch;
+    int old_x = win->wx, old_y = win->wy;
     if (win->parent) {                 /* child: coords + recompose parent */
         if (do_move) { win->wx = x; win->wy = y; }
         if (do_size) { win->cw = w; win->ch = h; }
+        if (win->bwin) {
+            win->bwin->width = win->cw;
+            win->bwin->height = win->ch;
+            win->bwin->stride = win->cw * 4;
+            free(win->bwin->pixels);
+            win->bwin->pixels = wn_xmalloc((size_t)win->cw * win->ch * 4 + 64);
+            memset(win->bwin->pixels, 0xFF, (size_t)win->cw * win->ch * 4);
+        }
         compose_children_of(win->parent);
-        if (win->parent)
-            post_msg(win->parent, WN_WM_PAINT, 0, 0);
     } else {                           /* top-level: backend move/resize */
+        if (do_move) { win->wx = x; win->wy = y; }
         if (do_size && (win->cw != w || win->ch != h)) {
             const wn_backend *be = wn_backend_get();
             if (be && be->win_move_resize)
-                be->win_move_resize(win->bwin, do_move ? x : 0,
-                                    do_move ? y : 0, w, h);
+                be->win_move_resize(win->bwin, x, y, w, h);
             win->bwin->width = win->cw = w;
             win->bwin->height = win->ch = h;
             win->bwin->stride = w * 4;
+            compose_children_of(hwnd);
         } else if (do_move && win->bwin) {
             const wn_backend *be = wn_backend_get();
             if (be && be->win_move_resize)
                 be->win_move_resize(win->bwin, x, y, win->cw, win->ch);
         }
-        compose_children_of(hwnd);
     }
     if (do_size && (win->cw != old_w || win->ch != old_h))
-        post_msg(hwnd, WN_WM_SIZE, 0,
-                 (int64_t)(((uint64_t)(uint16_t)win->cw) |
-                           ((uint64_t)(uint16_t)win->ch << 16)));
-    if (do_move)
-        post_msg(hwnd, WN_WM_MOVE, 0,
-                 (int64_t)(((uint64_t)(uint16_t)x) |
-                           ((uint64_t)(uint16_t)y << 16)));
+        deliver_now(hwnd, WN_WM_SIZE, 0,
+                    (int64_t)(((uint64_t)(uint16_t)win->cw) |
+                              ((uint64_t)(uint16_t)win->ch << 16)));
+    if (do_move && (win->wx != old_x || win->wy != old_y))
+        deliver_now(hwnd, WN_WM_MOVE, 0,
+                    (int64_t)(((uint64_t)(uint16_t)win->wx) |
+                              ((uint64_t)(uint16_t)win->wy << 16)));
+    /* full-surface damage: the pump will synthesize ONE WM_PAINT */
     win->dirty.l = 0;
     win->dirty.t = 0;
-    win->dirty.r = do_size ? win->cw : win->cw;
+    win->dirty.r = win->cw;
     win->dirty.b = win->ch;
-    post_msg(hwnd, WN_WM_PAINT, 0, 0);
+    if (win->parent && win->visible)
+        compose_child(win);
 }
 
 static WN_API int32_t u32_MoveWindow(uint64_t hwnd, int32_t x, int32_t y,
                                      int32_t w, int32_t h, int32_t repaint)
 {
     (void)repaint;
+    wn_log(WN_LOG_TRACE, "user32: MoveWindow hwnd=0x%llx %d,%d %dx%d",
+           (unsigned long long)hwnd, x, y, w, h);
     if (!win_from_hwnd(hwnd)) {
         wn_last_error_set(WN_ERR_INVALID_HANDLE);
         return 0;
@@ -449,6 +578,8 @@ static WN_API int32_t u32_SetWindowPos(uint64_t hwnd, uint64_t after,
         wn_last_error_set(WN_ERR_INVALID_HANDLE);
         return 0;
     }
+    wn_log(WN_LOG_TRACE, "user32: SetWindowPos hwnd=0x%llx %d,%d %dx%d "
+           "flags=0x%x", (unsigned long long)hwnd, x, y, cx, cy, flags);
     (void)after;   /* Z-order changes: unsupported (single-layer compose) */
     if (!(flags & 0x0001 /* SWP_NOSIZE */)) {
         if (cx < 1) cx = 1;
@@ -594,18 +725,28 @@ uint64_t user32_desktop(void)
 {
     if (g_desktop_hwnd)
         return g_desktop_hwnd;
+    ensure_gui();   /* need the backend up for the real screen size */
     wn_window *win = wn_xcalloc(1, sizeof *win);
     win->cls = NULL;
     win->is_desktop = 1;
     win->style = 0;
-    win->cw = 1280;
-    win->ch = 800;
-    win->bwin = wn_xcalloc(1, sizeof(wn_bwin));
-    win->bwin->width = 1280;
-    win->bwin->height = 800;
-    win->bwin->stride = 1280 * 4;
-    win->bwin->pixels = wn_xmalloc((size_t)1280 * 800 * 4 + 64);
-    memset(win->bwin->pixels, 0xFF, (size_t)1280 * 800 * 4);
+    /* REAL screen size: putty's centre_dialog measures the desktop via
+     * GetWindowRect(GetDesktopWindow()) and the old hardcoded 1280x800
+     * put dialogs in wrong places on other screens. */
+    {
+        const wn_backend *be = wn_backend_get();
+        int W = 640, H = 480;
+        if (be && be->screen_size)
+            be->screen_size(&W, &H);
+        win->cw = W;
+        win->ch = H;
+        win->bwin = wn_xcalloc(1, sizeof(wn_bwin));
+        win->bwin->width = W;
+        win->bwin->height = H;
+        win->bwin->stride = W * 4;
+        win->bwin->pixels = wn_xmalloc((size_t)W * H * 4 + 64);
+        memset(win->bwin->pixels, 0xFF, (size_t)W * H * 4);
+    }
     wn_handle h = register_hwnd(win);
     g_desktop_hwnd = (uint64_t)(uintptr_t)h;
     return g_desktop_hwnd;
@@ -902,7 +1043,12 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
             return 0;
         }
     }
-    if (parent) {
+    /* Child vs top-level: Windows decides by WS_CHILD, not by the presence
+     * of a parent argument. DIALOGS are passed their owner as "parent" by
+     * the dialog manager but are top-level WS_POPUP windows — treating them
+     * as children composed them into the owner's surface and crashed on
+     * ShowWindow (priv=NULL; the putty About-box segfault). */
+    if (parent && (style & 0x40000000u /*WS_CHILD*/)) {
         wn_window *pw = win_from_hwnd(parent);
         if (!pw) {
             wn_last_error_set(WN_ERR_INVALID_HANDLE);
@@ -958,8 +1104,13 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
     user32_set_wtext_utf8(win, win->title);
     win->style = style;
     win->ex_style = ex_style;
+    win->owner = parent;              /* owner != parent: stays top-level */
+    win->wx = x;
+    win->wy = y;
     if (w <= 0) w = 640;
     if (h <= 0) h = 480;
+    win->cw = w;                     /* canonical size (cw/ch, not just bwin) */
+    win->ch = h;
     win->bwin = be->win_create(w, h, win->title, win);
     if (!win->bwin) {
         free(win);
@@ -1131,53 +1282,62 @@ void wn_user32_paint_rect(uint64_t hwnd, int *l, int *t, int *r, int *b)
     *r = w->dirty.r; *b = w->dirty.b;
 }
 
+/* Fill the guest MSG x64 struct from an internal message:
+ * hwnd@0, message@8, wParam@0x10, lParam@0x18, time@0x20, pt@0x24. */
+static void fill_msg(void *msg_out, const wn_msg *m)
+{
+    uint8_t *o = msg_out;
+    memset(o, 0, 0x30);
+    *(uint64_t *)(void *)(o + 0) = m->hwnd;
+    *(uint32_t *)(void *)(o + 8) = m->message;
+    *(uint64_t *)(void *)(o + 0x10) = m->wparam;
+    *(int64_t *)(void *)(o + 0x18) = m->lparam;
+    *(uint32_t *)(void *)(o + 0x20) = m->time;
+    g_last_msg_time = m->time;    /* GetMessageTime */
+}
+
+/* One non-blocking pump pass: timers, synthesized paints, backend events.
+ * Returns 1 if anything might have entered the queue. */
+static int pump_once(void)
+{
+    const wn_backend *be = wn_backend_get();
+    int got = 0;
+    fire_timers();               /* may queue WM_TIMER */
+    generate_paints();           /* queues ONE WM_PAINT per dirty window */
+    if (be && be->pump)
+        got = be->pump(0);       /* input/expose/configure events */
+    if (g_q_count || g_quit_posted)
+        return 1;
+    fire_timers();
+    generate_paints();           /* events may have dirtied windows */
+    return got || g_q_count || g_quit_posted;
+}
+
 static WN_API int32_t u32_GetMessageA(void *msg_out, uint64_t hwnd,
                                       uint32_t min, uint32_t max)
 {
     (void)hwnd; (void)min; (void)max;
     if (ensure_gui() != 0)
         return -1;
-    const wn_backend *be = wn_backend_get();
     for (;;) {
         wn_msg m;
-        while (queue_pop(&m)) {
-            if (g_quit_posted)
-                break;
-            /* Fill MSG: hwnd@0, message@8, wParam@0x10, lParam@0x18,
-             * time@0x20, pt@0x24. */
-            uint8_t *o = msg_out;
-            memset(o, 0, 0x30);
-            *(uint64_t *)(void *)(o + 0) = m.hwnd;
-            *(uint32_t *)(void *)(o + 8) = m.message;
-            *(uint64_t *)(void *)(o + 0x10) = m.wparam;
-            *(int64_t *)(void *)(o + 0x18) = m.lparam;
-            *(uint32_t *)(void *)(o + 0x20) = m.time;
-            return 1;
-        }
+        /* WM_QUIT wins (checked before consuming a posted message — the
+         * old order dropped one real message on exit). */
         if (g_quit_posted) {
-            uint8_t *o = msg_out;
-            memset(o, 0, 0x30);
-            *(uint32_t *)(void *)(o + 8) = WN_WM_QUIT;
-            *(uint64_t *)(void *)(o + 0x10) = g_quit_code;
-            return 0;                   /* WM_QUIT */
+            wn_msg q = { .hwnd = 0, .message = WN_WM_QUIT,
+                         .wparam = g_quit_code };
+            fill_msg(msg_out, &q);
+            return 0;
         }
-        fire_timers();
-        generate_paints();
-        wn_msg m2;
-        if (queue_pop(&m2) && m2.message) {
-            uint8_t *o = msg_out;
-            memset(o, 0, 0x30);
-            *(uint64_t *)(void *)(o + 0) = m2.hwnd;
-            *(uint32_t *)(void *)(o + 8) = m2.message;
-            *(uint64_t *)(void *)(o + 0x10) = m2.wparam;
-            *(int64_t *)(void *)(o + 0x18) = m2.lparam;
-            *(uint32_t *)(void *)(o + 0x20) = m2.time;
+        if (queue_pop(&m)) {
+            fill_msg(msg_out, &m);
             return 1;
         }
-        /* Block until a posted message, a timer deadline, or a backend
-         * event. Waiting happens on the wake eventfd with the timer
-         * deadline (capped), then backend events are drained without
-         * blocking — a pure pump(-1) would starve timers forever. */
+        if (pump_once())
+            continue;
+        /* Block until a posted message, a timer deadline, or backend
+         * input. The backend's poll fd makes X11 input wake us instantly
+         * (the old 100ms-capped poll made mouse tracking sluggish). */
         uint64_t now = wn_monotonic_ns() / 1000000;
         int wait = 100;
         for (int i = 0; i < 32; i++) {
@@ -1187,18 +1347,25 @@ static WN_API int32_t u32_GetMessageA(void *msg_out, uint64_t hwnd,
                     wait = ms;
             }
         }
+        struct pollfd pfds[2];
+        int n = 0;
         if (g_msg_fd >= 0) {
-            struct pollfd pfd = { .fd = g_msg_fd, .events = POLLIN };
-            poll(&pfd, 1, wait);
+            pfds[n].fd = g_msg_fd;
+            pfds[n].events = POLLIN;
+            n++;
+        }
+        const wn_backend *be = wn_backend_get();
+        if (be && be->poll_fd && be->poll_fd() >= 0) {
+            pfds[n].fd = be->poll_fd();
+            pfds[n].events = POLLIN;
+            n++;
+        }
+        if (n)
+            poll(pfds, n, wait);
+        if (g_msg_fd >= 0) {
             uint64_t v;
             (void)!read(g_msg_fd, &v, 8);
-        } else {
-            struct timespec ts = { .tv_sec = 0,
-                                   .tv_nsec = (long)wait * 1000000L };
-            nanosleep(&ts, NULL);
         }
-        if (be && be->pump)
-            be->pump(0);
     }
 }
 
@@ -1208,25 +1375,25 @@ static WN_API int32_t u32_PeekMessageA(void *msg_out, uint64_t hwnd,
 {
     (void)hwnd; (void)min; (void)max;   /* filters unsupported yet */
     wn_msg m;
-    if (queue_pop(&m) && m.message) {
-        uint8_t *o = msg_out;
-        memset(o, 0, 0x30);
-        *(uint64_t *)(void *)(o + 0) = m.hwnd;
-        *(uint32_t *)(void *)(o + 8) = m.message;
-        *(uint64_t *)(void *)(o + 0x10) = m.wparam;
-        *(int64_t *)(void *)(o + 0x18) = m.lparam;
-        *(uint32_t *)(void *)(o + 0x20) = m.time;
-        (void)remove;
-        return 1;
-    }
+    /* PeekMessage must pump (Windows processes sent messages and input
+     * here); modal loops that poll with PM_NOREMOVE previously starved
+     * the whole input path. */
+    pump_once();
     if (g_quit_posted) {
-        uint8_t *o = msg_out;
-        memset(o, 0, 0x30);
-        *(uint32_t *)(void *)(o + 8) = WN_WM_QUIT;
-        *(uint64_t *)(void *)(o + 0x10) = g_quit_code;
+        wn_msg q = { .hwnd = 0, .message = WN_WM_QUIT,
+                     .wparam = g_quit_code };
+        fill_msg(msg_out, &q);
         return 0;
     }
-    return 0;
+    if (remove & 1 /* PM_NOREMOVE */) {
+        if (!queue_peek(&m))
+            return 0;
+    } else {
+        if (!queue_pop(&m))
+            return 0;
+    }
+    fill_msg(msg_out, &m);
+    return 1;
 }
 
 static WN_API uint64_t u32_DispatchMessageA(const void *msg)
@@ -1316,7 +1483,8 @@ static WN_API int32_t u32_TranslateMessage(const void *msg)
     return 0;   /* WM_CHAR is generated directly by the backend */
 }
 
-/* RECT: left, top, right, bottom (4 LONGs). */
+/* GetClientRect uses the canonical size too (cw/ch == bwin size since the
+ * create/resize paths keep them in lockstep). */
 static WN_API int32_t u32_GetClientRect(uint64_t hwnd, void *rect)
 {
     wn_window *w = win_from_hwnd(hwnd);
@@ -1325,20 +1493,8 @@ static WN_API int32_t u32_GetClientRect(uint64_t hwnd, void *rect)
     int32_t *r = rect;
     r[0] = 0;
     r[1] = 0;
-    r[2] = w->bwin ? w->bwin->width : 0;
-    r[3] = w->bwin ? w->bwin->height : 0;
-    return 1;
-}
-
-static WN_API int32_t u32_GetWindowRect(uint64_t hwnd, void *rect)
-{
-    wn_window *w = win_from_hwnd(hwnd);
-    if (!w || !rect)
-        return 0;
-    int32_t *r = rect;
-    r[0] = 0; r[1] = 0;
-    r[2] = w->bwin ? w->bwin->width : 0;
-    r[3] = w->bwin ? w->bwin->height : 0;
+    r[2] = w->cw;
+    r[3] = w->ch;
     return 1;
 }
 
@@ -1538,6 +1694,8 @@ extern WN_API uint32_t g32_SetBkColor(wn_handle hdc, uint32_t color);
 
 static void ctl_notify(wn_window *w, uint32_t code)
 {
+    wn_log(WN_LOG_TRACE, "user32: ctl_notify id=%llu code=%u -> parent",
+           (unsigned long long)w->id, code);
     if (w->parent)
         post_msg(w->parent, WN_WM_COMMAND,
                  (w->id & 0xFFFF) | ((uint64_t)code << 16),
@@ -1546,7 +1704,14 @@ static void ctl_notify(wn_window *w, uint32_t code)
 
 static void ctl_repaint(wn_window *w)
 {
-    post_msg((uint64_t)(uintptr_t)hwnd_of_window(w), WN_WM_PAINT, 0, 0);
+    /* Damage the full control surface; the pump synthesizes ONE WM_PAINT
+     * (no direct queue posts — putty adds dozens of list items in a burst
+     * and every post used to be a queue slot). Compose immediately so the
+     * pixels already rendered are visible without waiting for the pump. */
+    w->dirty.l = 0;
+    w->dirty.t = 0;
+    w->dirty.r = w->cw;
+    w->dirty.b = w->ch;
     compose_child(w);
 }
 
@@ -1713,7 +1878,8 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
         wn_handle_close(lite);
         int rh = ctl_row_h();
         int focused = g_focus_hwnd == hwnd;
-        g32_SetTextColor(hdc, focused && k == CTL_EDIT ? 0 : 0);
+        int disabled = (w->style & 0x08000000u) != 0;
+        g32_SetTextColor(hdc, disabled ? 0x00808080 /*COLOR_GRAYTEXT*/ : 0);
         g32_SetBkMode(hdc, 1 /* TRANSPARENT */);
         switch (k) {
         case CTL_BUTTON: {
@@ -1736,14 +1902,28 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
                 g32_DrawTextA(hdc, w->title, -1, tr,
                               0x20 | 0x100 | 0x24);
             } else {
-                /* push button */
+                /* push button: raised 3D frame + centered text + focus */
+                extern WN_API int32_t g32_DrawEdge(wn_handle, void *rect,
+                                                   uint32_t, uint32_t);
+                int32_t fr[4] = { 0, 0, W - 1, H - 1 };
+                g32_DrawEdge(hdc, fr, 0 /*BDR_RAISEDOUTER|BDR_RAISEDINNER*/,
+                             0x4 /*BF_RECT*/);
                 int32_t tr[4] = { 4, 0, W - 4, H };
                 uint32_t old = g32_SetBkColor(hdc, 0x00C8D0D4);
                 (void)old;
                 g32_SetBkMode(hdc, 1);
                 g32_DrawTextA(hdc, w->title, -1, tr,
-                              0x20 | 0x100 | 0x24 |
-                              (focused ? 6u /*CENTER*/ : 6u));
+                              0x20 | 0x100 | 0x24 | 6 /*CENTER*/);
+                if (focused && !disabled) {   /* dotted focus rect */
+                    extern WN_API int32_t g32_SetPixel(wn_handle, int32_t,
+                                                        int32_t, uint32_t);
+                    for (int fy = 2; fy < H - 2; fy += 2) {
+                        for (int fx = 2; fx < W - 2; fx += 2) {
+                            if (fy == 2 || fy > H - 5 || fx == 2 || fx > W - 5)
+                                g32_SetPixel(hdc, fx, fy, 0);
+                        }
+                    }
+                }
             }
             break;
         }
@@ -2133,10 +2313,21 @@ static uint64_t create_dialog_from_template(uint64_t hinst,
     (void)cls;
     (void)tit;
 
-    /* dialog window itself (class #32770 -> our trampoline) */
+    /* dialog window itself: class #32770, a TOP-LEVEL owned popup (the
+     * WS_CHILD bit is never set for dialogs). Template coordinates are
+     * dialog units relative to the OWNER's client origin unless
+     * DS_ABSALIGN (0x80) — matching Windows' dialog manager. */
+    int dx = DLG_X(x), dy = DLG_Y(y);
+    if (!(style & 0x80 /*DS_ABSALIGN*/) && parent) {
+        wn_window *ow = win_from_hwnd(parent);
+        if (ow) {
+            dx += ow->wx;
+            dy += ow->wy;
+        }
+    }
     uint64_t hwnd = u32_CreateWindowExA(ex_style, "#32770", title,
                                         style | (force_visible ? 0x10000000u : 0),
-                                        DLG_X(x), DLG_Y(y),
+                                        dx, dy,
                                         DLG_X(cx), DLG_Y(cy),
                                         parent, 0, hinst, 0);
     if (!hwnd)
@@ -2337,13 +2528,13 @@ static WN_API int64_t u32_DialogBoxParamA(uint64_t hinst, const void *tmpl,
         user32_set_focus_internal(first_tab ? first_tab : hwnd);
         u32_SetActiveWindow(hwnd);
     }
-    wn_msg m;
+    uint8_t msgbuf[0x30];   /* guest MSG layout; wn_msg is smaller! */
     while (!dw->dlg_done) {
-        int32_t r = u32_GetMessageA(&m, 0, 0, 0);
+        int32_t r = u32_GetMessageA(msgbuf, 0, 0, 0);
         if (r <= 0)
             break;
-        if (!u32_IsDialogMessageA(hwnd, &m))
-            u32_DispatchMessageA(&m);
+        if (!u32_IsDialogMessageA(hwnd, msgbuf))
+            u32_DispatchMessageA(msgbuf);
     }
     user32_set_focus_internal(0);
     u32_SetActiveWindow(parent ? parent : 0);
@@ -2531,6 +2722,821 @@ static WN_API int32_t u32_DrawTextW(wn_handle hdc, const uint16_t *s,
     return g32_DrawTextW(hdc, s, count, rect, fmt);
 }
 
+/* ========================================================================== */
+/* EnableWindow, MessageBeep, monitor/DPI, coordinate, and interaction batch  */
+/* ========================================================================== */
+
+/* WS_DISABLED = 0x08000000. Windows: EnableWindow returns the PREVIOUS state
+ * (nonzero = was enabled). putty disables its config box for every modal
+ * child; the old stub returned 0 ("it WAS disabled"), which apps read as
+ * failure — and our input path then fed clicks into the "disabled" window. */
+static WN_API int32_t u32_EnableWindow(uint64_t hwnd, int32_t enable)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    int was = !(w->style & 0x08000000u);
+    if (enable)
+        w->style &= ~0x08000000u;
+    else {
+        w->style |= 0x08000000u;
+        /* A disabled window cannot keep focus. */
+        if (g_focus_hwnd == hwnd)
+            user32_set_focus_internal(0);
+    }
+    if (w->parent && w->visible)
+        ctl_repaint(w);
+    else if (w->visible) {
+        w->dirty.l = 0; w->dirty.t = 0;
+        w->dirty.r = w->cw; w->dirty.b = w->ch;
+    }
+    return was;
+}
+
+static WN_API int32_t u32_IsWindowEnabled(uint64_t hwnd)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    return w ? !(w->style & 0x08000000u) : 0;
+}
+
+/* MessageBeep: ring the backend's bell (XBell on X11); success by contract. */
+static WN_API int32_t u32_MessageBeep(uint32_t type)
+{
+    const wn_backend *be = wn_backend_get();
+    if (be && be->beep)
+        be->beep();
+    (void)type;
+    return 1;
+}
+
+/* --- screen origin + rectangles ------------------------------------------------ */
+
+/* Absolute screen origin of a window (walks the parent chain; top-level
+ * wx/wy are tracked from backend ConfigureNotify/move ops). */
+static void win_screen_origin(wn_window *w, int *x, int *y)
+{
+    *x = 0;
+    *y = 0;
+    while (w) {
+        *x += w->wx;
+        *y += w->wy;
+        w = w->parent ? win_from_hwnd(w->parent) : NULL;
+    }
+}
+
+static WN_API int32_t u32_GetWindowRect(uint64_t hwnd, void *rect)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !rect)
+        return 0;
+    int x, y;
+    win_screen_origin(w, &x, &y);
+    int32_t *r = rect;
+    r[0] = x;
+    r[1] = y;
+    r[2] = x + w->cw;
+    r[3] = y + w->ch;
+    wn_log(WN_LOG_TRACE, "user32: GetWindowRect(0x%llx) -> %d,%d %dx%d",
+           (unsigned long long)hwnd, r[0], r[1], r[2] - r[0], r[3] - r[1]);
+    return 1;
+}
+
+static WN_API int32_t u32_ScreenToClient(uint64_t hwnd, void *pt)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !pt)
+        return 0;
+    int x, y;
+    win_screen_origin(w, &x, &y);
+    int32_t *p = pt;
+    p[0] -= x;
+    p[1] -= y;
+    return 1;
+}
+
+static WN_API int32_t u32_ClientToScreen(uint64_t hwnd, void *pt)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !pt)
+        return 0;
+    int x, y;
+    win_screen_origin(w, &x, &y);
+    int32_t *p = pt;
+    p[0] += x;
+    p[1] += y;
+    return 1;
+}
+
+static WN_API uint64_t u32_GetParent(uint64_t hwnd)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    /* Windows: WS_CHILD -> parent; WS_POPUP (dialogs) -> owner. */
+    return w->is_child ? w->parent : w->owner;
+}
+
+static WN_API int32_t u32_OffsetRect(void *rect, int32_t dx, int32_t dy)
+{
+    if (!rect)
+        return 0;
+    int32_t *r = rect;
+    r[0] += dx; r[1] += dy; r[2] += dx; r[3] += dy;
+    return 1;
+}
+
+/* --- metrics / monitors / DPI ---------------------------------------------------
+ * One virtual monitor covering the whole screen (single X screen). That is
+ * enough for apps to place dialogs ON screen — putty positioned its config
+ * box at y=-104 when these were stubs. */
+
+static void screen_dims(int *w, int *h)
+{
+    const wn_backend *be = wn_backend_get();
+    if (be && be->screen_size) {
+        be->screen_size(w, h);
+        return;
+    }
+    *w = 800;
+    *h = 600;
+}
+
+static WN_API int32_t u32_GetSystemMetrics(int32_t idx)
+{
+    int w, h;
+    screen_dims(&w, &h);
+    switch (idx) {
+    case 0:  return w;          /* SM_CXSCREEN */
+    case 1:  return h;          /* SM_CYSCREEN */
+    case 2:  return 17;         /* SM_CXVSCROLL */
+    case 3:  return 17;         /* SM_CYHSCROLL */
+    case 4:  return 22;         /* SM_CYCAPTION */
+    case 5:  return 1;          /* SM_CXBORDER */
+    case 6:  return 1;          /* SM_CYBORDER */
+    case 7:  return 3;          /* SM_CXDLGFRAME */
+    case 8:  return 3;          /* SM_CYDLGFRAME */
+    case 9:  return 17;         /* SM_CYVTHUMB */
+    case 10: return 17;         /* SM_CXHTHUMB */
+    case 11: return 32;         /* SM_CXICON */
+    case 12: return 32;         /* SM_CYICON */
+    case 13: return 32;         /* SM_CXCURSOR */
+    case 14: return 32;         /* SM_CYCURSOR */
+    case 15: return 20;         /* SM_CYMENU */
+    case 16: return w;          /* SM_CXFULLSCREEN (work area) */
+    case 17: return h;          /* SM_CYFULLSCREEN */
+    case 19: return 1;          /* SM_MOUSEPRESENT */
+    case 20: return 17;         /* SM_CYVSCROLL */
+    case 21: return 17;         /* SM_CXHSCROLL */
+    case 23: return 0;          /* SM_SWAPBUTTON */
+    case 28: return 112;        /* SM_CXMIN */
+    case 29: return 27;         /* SM_CYMIN */
+    case 30: return 18;         /* SM_CXSIZE (caption buttons) */
+    case 31: return 18;         /* SM_CYSIZE */
+    case 32: return 4;          /* SM_CXFRAME */
+    case 33: return 4;          /* SM_CYFRAME */
+    case 34: return 112;        /* SM_CXMINTRACK */
+    case 35: return 27;         /* SM_CYMINTRACK */
+    case 42: return 0;          /* SM_SHOWSOUNDS */
+    case 43: return 3;          /* SM_CMOUSEBUTTONS */
+    case 54: return 0;          /* SM_MIDEASTENABLED */
+    case 67: return 6;          /* SM_CXSMICON */
+    case 68: return 6;          /* SM_CYSMICON */
+    case 76: return 0;          /* SM_REMOTESESSION */
+    default:
+        wn_log(WN_LOG_DEBUG, "user32: GetSystemMetrics(%d) -> 0", idx);
+        return 0;
+    }
+}
+
+/* MONITORINFO x64: cbSize@0(4) rcMonitor@4(16) rcWork@0x14(16) dwFlags@0x24. */
+static WN_API int32_t u32_GetMonitorInfoA(uint64_t hmon, void *mi)
+{
+    (void)hmon;
+    if (!mi)
+        return 0;
+    int w, h;
+    screen_dims(&w, &h);
+    int32_t *r = mi;
+    uint32_t cb = (uint32_t)r[0];
+    memset(r, 0, cb < 40 ? 40 : (cb > 72 ? 72 : cb));
+    r[0] = cb ? (int32_t)cb : 40;
+    r[1] = 0; r[2] = 0; r[3] = w; r[4] = h;      /* rcMonitor */
+    r[5] = 0; r[6] = 0; r[7] = w; r[8] = h;      /* rcWork (no taskbar) */
+    r[9] = 1;                                    /* MONITORINFOF_PRIMARY */
+    if (cb >= 72)
+        snprintf((char *)mi + 40, 32, "DISPLAY");
+    return 1;
+}
+
+static WN_API int32_t u32_GetMonitorInfoW(uint64_t hmon, void *mi)
+{
+    if (!mi)
+        return 0;
+    int32_t *r = mi;
+    uint32_t cb = (uint32_t)r[0];
+    if (cb >= 72) {
+        /* wide device name at offset 40 */
+        static const uint16_t dev[7] = { 'D','I','S','P','L','A','Y' };
+        uint16_t *dst = (uint16_t *)((uint8_t *)mi + 40);
+        for (int i = 0; i < 32; i++)
+            dst[i] = i < 7 ? dev[i] : 0;
+    }
+    return u32_GetMonitorInfoA(hmon, mi);
+}
+
+static WN_API uint64_t u32_MonitorFromWindow(uint64_t hwnd, uint32_t flags)
+{
+    int w, h;
+    screen_dims(&w, &h);
+    if (hwnd) {
+        wn_window *win = win_from_hwnd(hwnd);
+        if (win) {
+            int x, y;
+            win_screen_origin(win, &x, &y);
+            if (x + win->cw > 0 && y + win->ch > 0 && x < w && y < h)
+                return 1;   /* intersects the virtual screen */
+        }
+    }
+    if (flags & 2 /*MONITOR_DEFAULTTOPRIMARY*/ || flags & 1 /*TONEAREST*/)
+        return 1;
+    return 0;
+}
+
+static WN_API uint64_t u32_MonitorFromRect(const void *rect, uint32_t flags)
+{
+    (void)rect;
+    return (flags & 3) ? 1 : 0;
+}
+
+/* MonitorFromPoint takes POINT BY VALUE: an 8-byte struct arrives packed
+ * in RCX under the MS x64 ABI (x=low dword, y=high dword) — declaring it
+ * as (x, y, flags) reads y out of RDX and flags out of R8. Same ABI trap
+ * class as the IsDialogMessage bug. */
+static WN_API uint64_t u32_MonitorFromPoint(uint64_t point, uint32_t flags)
+{
+    int32_t x = (int32_t)(point & 0xFFFFFFFF);
+    int32_t y = (int32_t)(point >> 32);
+    int w, h;
+    screen_dims(&w, &h);
+    if (x >= 0 && y >= 0 && x < w && y < h)
+        return 1;
+    return (flags & 3) ? 1 : 0;
+}
+
+typedef WN_API int32_t (*mon_enum_cb)(uint64_t, uint64_t, const void *,
+                                      int64_t);
+static WN_API int32_t u32_EnumDisplayMonitors(uint64_t hdc, const void *clip,
+                                              mon_enum_cb cb, int64_t lparam)
+{
+    (void)hdc;
+    (void)clip;
+    if (!cb)
+        return 0;
+    int w, h;
+    screen_dims(&w, &h);
+    int32_t rc[4] = { 0, 0, w, h };
+    cb(1, 0, rc, lparam);
+    return 1;
+}
+
+/* SystemParametersInfoA: the values apps actually read at startup. */
+static WN_API int32_t u32_SystemParametersInfoA(uint32_t action, uint32_t uparam,
+                                                void *pv, uint32_t winini)
+{
+    (void)uparam; (void)winini;
+    switch (action) {
+    case 48: {    /* SPI_GETWORKAREA */
+        if (!pv)
+            return 0;
+        int w, h;
+        screen_dims(&w, &h);
+        int32_t *r = pv;
+        r[0] = 0; r[1] = 0; r[2] = w; r[3] = h;
+        return 1;
+    }
+    default:
+        wn_log(WN_LOG_DEBUG, "user32: SystemParametersInfoA(0x%x) -> TRUE "
+               "(accepted, no side effect)", action);
+        return 1;
+    }
+}
+
+static WN_API int32_t u32_SystemParametersInfoW(uint32_t a, uint32_t b,
+                                                void *c, uint32_t d)
+{
+    return u32_SystemParametersInfoA(a, b, c, d);
+}
+
+static WN_API int32_t u32_SetProcessDPIAware(void)
+{
+    return 1;   /* we render at native pixels; DPI-aware by construction */
+}
+
+static WN_API uint32_t u32_GetDpiForWindow(uint64_t hwnd)
+{
+    (void)hwnd;
+    return 96;   /* system DPI until per-monitor support lands */
+}
+
+static WN_API uint32_t u32_GetDpiForSystem(void)
+{
+    return 96;
+}
+
+/* --- invalidation ------------------------------------------------------------ */
+
+static WN_API int32_t u32_InvalidateRect(uint64_t hwnd, const void *rect,
+                                         int32_t erase)
+{
+    (void)erase;
+    if (!hwnd) {
+        for (int i = 0; i < g_hwnd_count; i++) {
+            wn_window *w = g_hwnds[i].win;
+            if (w && w->visible && !w->in_destroy) {
+                w->dirty.l = 0; w->dirty.t = 0;
+                w->dirty.r = w->cw; w->dirty.b = w->ch;
+            }
+        }
+        return 1;
+    }
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    if (rect) {
+        const int32_t *r = rect;
+        if (w->dirty.l < 0) {
+            w->dirty.l = r[0]; w->dirty.t = r[1];
+            w->dirty.r = r[2]; w->dirty.b = r[3];
+        } else {
+            if (r[0] < w->dirty.l) w->dirty.l = r[0];
+            if (r[1] < w->dirty.t) w->dirty.t = r[1];
+            if (r[2] > w->dirty.r) w->dirty.r = r[2];
+            if (r[3] > w->dirty.b) w->dirty.b = r[3];
+        }
+    } else {
+        w->dirty.l = 0; w->dirty.t = 0;
+        w->dirty.r = w->cw; w->dirty.b = w->ch;
+    }
+    return 1;
+}
+
+static WN_API int32_t u32_ValidateRect(uint64_t hwnd, const void *rect)
+{
+    (void)rect;   /* precise validation: later; full-window for now */
+    wn_window *w = hwnd ? win_from_hwnd(hwnd) : NULL;
+    if (w) {
+        w->dirty.l = -1;
+        w->paint_pending = 0;
+    }
+    return 1;
+}
+
+/* --- system colors (classic palette to match control painting) ---------------- */
+
+static const uint32_t g_sys_colors[31] = {
+    0x00D4D0C8, /* 0 SCROLLBAR */
+    0x008A6E3A, /* 1 BACKGROUND (desktop) */
+    0x0099B4D1, /* 2 ACTIVECAPTION */
+    0x00DBCD9F, /* 3 INACTIVECAPTION */
+    0x00F0F0F0, /* 4 MENU */
+    0x00FFFFFF, /* 5 WINDOW */
+    0x00646464, /* 6 WINDOWFRAME */
+    0x00000000, /* 7 MENUTEXT */
+    0x00000000, /* 8 WINDOWTEXT */
+    0x00000000, /* 9 CAPTIONTEXT */
+    0x00B4B4B4, /* 10 ACTIVEBORDER */
+    0x00E8E8E8, /* 11 INACTIVEBORDER */
+    0x00ABABAB, /* 12 APPWORKSPACE */
+    0x00D47800, /* 13 HIGHLIGHT (BGR) */
+    0x00FFFFFF, /* 14 HIGHLIGHTTEXT */
+    0x00D4D0C8, /* 15 BTNFACE */
+    0x00A0A0A0, /* 16 BTNSHADOW */
+    0x00808080, /* 17 GRAYTEXT */
+    0x00000000, /* 18 BTNTEXT */
+    0x00DBCD9F, /* 19 INACTIVECAPTIONTEXT */
+    0x00FFFFFF, /* 20 BTNHIGHLIGHT */
+    0x00808080, /* 21 3DDKSHADOW */
+    0x00F0F0F0, /* 22 3DLIGHT */
+    0x00F0F0F0, /* 23 INFOTEXT ... */
+    0x00FFFFE1, /* 24 INFOBK */
+    0x00D4D0C8, /* 25 BUTTONHILIGHT */
+    0x00D4D0C8, /* 26 BUTTONFACE alias */
+    0x00A0A0A0, /* 27 BUTTONSHADOW alias */
+    0x00000000, /* 28 GRAYTEXT alias */
+    0x00D4D0C8, /* 29 BUTTONFACE alt */
+    0x00000000, /* 30 DESKTOP */
+};
+
+static WN_API uint32_t u32_GetSysColor(int32_t idx)
+{
+    if (idx < 0 || idx > 30)
+        return 0;
+    return g_sys_colors[idx];
+}
+
+static WN_API wn_handle u32_GetSysColorBrush(int32_t idx)
+{
+    static wn_handle cache[31];
+    if (idx < 0 || idx > 30)
+        return (wn_handle)0;
+    if (!cache[idx]) {
+        extern WN_API wn_handle g32_CreateSolidBrush(uint32_t);
+        cache[idx] = g32_CreateSolidBrush(g_sys_colors[idx]);
+    }
+    return cache[idx];
+}
+
+/* --- misc interaction states ---------------------------------------------------- */
+
+static int g_cursor_count;       /* ShowCursor counter */
+static WN_API int32_t u32_ShowCursor(int32_t show)
+{
+    g_cursor_count += show ? 1 : -1;
+    return g_cursor_count;
+}
+
+static WN_API int32_t u32_GetCursorPos(void *pt)
+{
+    if (!pt)
+        return 0;
+    int32_t *p = pt;
+    p[0] = g_mouse_x < 0 ? 0 : g_mouse_x;
+    p[1] = g_mouse_y < 0 ? 0 : g_mouse_y;
+    return 1;
+}
+
+static WN_API int32_t u32_GetKeyboardState(uint8_t *state)
+{
+    if (!state)
+        return 0;
+    memcpy(state, g_key_state, 256);
+    return 1;
+}
+
+static WN_API int32_t u32_SetKeyboardState(const uint8_t *state)
+{
+    if (!state)
+        return 0;
+    memcpy(g_key_state, state, 256);
+    return 1;
+}
+
+static WN_API uint64_t u32_GetKeyboardLayout(uint32_t id)
+{
+    (void)id;
+    return 0x04090409;   /* en-US */
+}
+
+static WN_API uint32_t u32_GetDoubleClickTime(void)  { return 500; }
+static WN_API uint32_t u32_GetCaretBlinkTime(void)   { return 530; }
+
+static WN_API uint32_t u32_GetMessageTime(void)      { return g_last_msg_time; }
+
+static WN_API uint32_t u32_GetQueueStatus(uint32_t flags)
+{
+    (void)flags;
+    return g_q_count ? (0x08 /*QS_POSTMESSAGE*/ | 0x40 /*QS_INPUT*/) : 0;
+}
+
+static WN_API int32_t u32_IsIconic(uint64_t hwnd)
+{
+    (void)hwnd;
+    return 0;
+}
+
+static WN_API int32_t u32_IsZoomed(uint64_t hwnd)
+{
+    (void)hwnd;
+    return 0;
+}
+
+static WN_API int32_t u32_FlashWindow(uint64_t hwnd, int32_t invert)
+{
+    (void)hwnd; (void)invert;
+    return 0;
+}
+
+static WN_API int32_t u32_SetForegroundWindow(uint64_t hwnd)
+{
+    if (!win_from_hwnd(hwnd))
+        return 0;
+    u32_SetActiveWindow(hwnd);
+    return 1;
+}
+
+/* WINDOWPLACEMENT x64: length@0 flags@4 showCmd@8 ptMin@0xC ptMax@0x14
+ * rcNormal@0x1C — 44 bytes. */
+static WN_API int32_t u32_GetWindowPlacement(uint64_t hwnd, void *wp)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !wp)
+        return 0;
+    int32_t *p = wp;
+    uint32_t cb = (uint32_t)p[0];
+    memset(p, 0, cb < 44 ? 44 : cb);
+    p[0] = 44;
+    p[1] = 0;               /* flags */
+    p[2] = 1;               /* showCmd = SW_SHOWNORMAL */
+    int x, y;
+    win_screen_origin(w, &x, &y);
+    p[7] = x; p[8] = y; p[9] = x + w->cw; p[10] = y + w->ch;
+    return 1;
+}
+
+static WN_API int32_t u32_SetWindowPlacement(uint64_t hwnd, const void *wp)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !wp)
+        return 0;
+    const int32_t *p = wp;
+    int x = p[7], y = p[8], x2 = p[9], y2 = p[10];
+    if (x2 > x && y2 > y)
+        u32_MoveWindow(hwnd, x, y, x2 - x, y2 - y, 1);
+    return 1;
+}
+
+/* --- W-variant message APIs + dialog text ---------------------------------------- */
+
+static WN_API int32_t u32_PeekMessageW(void *out, uint64_t hwnd, uint32_t min,
+                                       uint32_t max, uint32_t remove)
+{
+    return u32_PeekMessageA(out, hwnd, min, max, remove);
+}
+
+static WN_API int32_t u32_GetMessageW(void *out, uint64_t hwnd, uint32_t min,
+                                      uint32_t max)
+{
+    return u32_GetMessageA(out, hwnd, min, max);
+}
+
+static WN_API uint64_t u32_DispatchMessageW(const void *msg)
+{
+    return u32_DispatchMessageA(msg);
+}
+
+static WN_API uint64_t u32_DefWindowProcW(uint64_t hwnd, uint32_t msg,
+                                          uint64_t wp, int64_t lp)
+{
+    return u32_DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static WN_API uint64_t u32_SendMessageW(uint64_t hwnd, uint32_t msg,
+                                        uint64_t wp, int64_t lp)
+{
+    return u32_SendMessageA(hwnd, msg, wp, lp);
+}
+
+static WN_API int32_t u32_PostMessageW(uint64_t hwnd, uint32_t msg,
+                                       uint64_t wp, int64_t lp)
+{
+    return u32_PostMessageA(hwnd, msg, wp, lp);
+}
+
+static WN_API int32_t u32_SetWindowTextW(uint64_t hwnd, const uint16_t *text)
+{
+    char *a = text ? wn_utf16_to_utf8(text, 4096) : NULL;
+    int32_t r = u32_SetWindowTextA(hwnd, a ? a : "");
+    free(a);
+    return r;
+}
+
+static WN_API int32_t u32_GetWindowTextW(uint64_t hwnd, uint16_t *buf,
+                                         int32_t max)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !buf || max <= 0)
+        return 0;
+    size_t i = 0;
+    while (w->wtext[i] && (int)i + 1 < max) {
+        buf[i] = w->wtext[i];
+        i++;
+    }
+    buf[i] = 0;
+    return (int32_t)i;
+}
+
+static WN_API int32_t u32_GetWindowTextLengthA(uint64_t hwnd)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    return (int32_t)strlen(w->title);
+}
+
+static WN_API int32_t u32_GetWindowTextLengthW(uint64_t hwnd)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w)
+        return 0;
+    size_t n = 0;
+    while (w->wtext[n])
+        n++;
+    return (int32_t)n;
+}
+
+static WN_API int32_t u32_SetDlgItemTextW(uint64_t hwnd, int32_t id,
+                                          const uint16_t *text)
+{
+    uint64_t c = u32_GetDlgItem(hwnd, id);
+    if (!c)
+        return 0;
+    return (int32_t)u32_SendMessageW(c, WN_WM_SETTEXT, 0,
+                                     (int64_t)(uintptr_t)text);
+}
+
+static WN_API uint32_t u32_GetDlgItemTextA(uint64_t hdlg, int32_t id,
+                                           char *buf, uint32_t max)
+{
+    uint64_t c = u32_GetDlgItem(hdlg, id);
+    if (!c || !buf || !max)
+        return 0;
+    uint64_t r = u32_SendMessageA(c, WN_WM_GETTEXT, max,
+                                  (int64_t)(uintptr_t)buf);
+    return (uint32_t)r;
+}
+
+static WN_API uint32_t u32_GetDlgItemTextW(uint64_t hdlg, int32_t id,
+                                           uint16_t *buf, uint32_t max)
+{
+    uint64_t c = u32_GetDlgItem(hdlg, id);
+    if (!c || !buf || !max)
+        return 0;
+    if (max > 4096)
+        max = 4096;
+    char tmp[4096];
+    uint64_t r = u32_SendMessageA(c, WN_WM_GETTEXT, sizeof tmp,
+                                  (int64_t)(uintptr_t)tmp);
+    size_t n = 0;
+    while (n + 1 < max && tmp[n]) {
+        buf[n] = (uint16_t)(unsigned char)tmp[n];   /* Latin-1 fold */
+        n++;
+    }
+    buf[n] = 0;
+    (void)r;
+    return (uint32_t)n;
+}
+
+static WN_API int64_t u32_SendDlgItemMessageA(uint64_t hdlg, int32_t id,
+                                              uint32_t msg, uint64_t wp,
+                                              int64_t lp)
+{
+    uint64_t c = u32_GetDlgItem(hdlg, id);
+    if (!c)
+        return 0;
+    return (int64_t)u32_SendMessageA(c, msg, wp, lp);
+}
+
+static WN_API int64_t u32_SendDlgItemMessageW(uint64_t hdlg, int32_t id,
+                                              uint32_t msg, uint64_t wp,
+                                              int64_t lp)
+{
+    return u32_SendDlgItemMessageA(hdlg, id, msg, wp, lp);
+}
+
+static WN_API int64_t u32_DefDlgProcA(uint64_t hwnd, uint32_t msg, uint64_t wp,
+                                      int64_t lp)
+{
+    /* our #32770 proc already implements DefDlgProc semantics; dialogs with
+     * an explicit DefDlgProc call get the same behavior */
+    return ctl_proc(hwnd, msg, wp, lp);
+}
+
+static WN_API int32_t u32_MessageBoxIndirectW(uint64_t hwnd, const void *params)
+{
+    /* MSGBOXPARAMSW: cbSize@0, hwndOwner@8, hInstance@0x10, lpszText@0x18,
+     * lpszCaption@0x20, dwStyle@0x28, ... */
+    const uint8_t *p = params;
+    const uint16_t *text = params ? *(const uint16_t **)(const void *)(p + 0x18) : NULL;
+    const uint16_t *cap = params ? *(const uint16_t **)(const void *)(p + 0x20) : NULL;
+    return u32_MessageBoxW(hwnd, text, cap,
+                           params ? *(const uint32_t *)(const void *)(p + 0x28) : 0);
+}
+
+static WN_API uint64_t u32_FindWindowA(const char *cls, const char *title)
+{
+    for (int i = 0; i < g_hwnd_count; i++) {
+        wn_window *w = g_hwnds[i].win;
+        if (!w || !w->cls)
+            continue;
+        if (cls && *cls && !wn_strcaseeq(w->cls->name, cls))
+            continue;
+        if (title && *title && strcmp(w->title, title))
+            continue;
+        return (uint64_t)(uintptr_t)g_hwnds[i].h;
+    }
+    return 0;
+}
+
+static WN_API wn_handle u32_LoadImageA(uint64_t hinst, const char *name,
+                                       uint32_t type, int32_t cx, int32_t cy,
+                                       uint32_t load)
+{
+    (void)cx; (void)cy; (void)load;
+    if (type == 1 /*IMAGE_ICON*/)
+        return u32_LoadIconA(hinst, name);
+    wn_log(WN_LOG_WARN, "user32: LoadImageA(type=%u '%s') bitmaps not "
+           "supported yet", type, (name && (uintptr_t)name >= 0x10000) ? name : "#int");
+    return (wn_handle)0;
+}
+
+static WN_API int32_t u32_DestroyIcon(wn_handle icon)
+{
+    if (!icon)
+        return 0;
+    wn_handle_close(icon);
+    return 1;
+}
+
+/* --- caret (single global caret, drawn by the focused Edit) --------------------- */
+
+static struct {
+    uint64_t hwnd;
+    int w, h, x, y;
+    int visible;
+    int count;        /* ShowCaret/HideCaret counter */
+} g_caret;
+
+static WN_API int32_t u32_CreateCaret(uint64_t hwnd, uint64_t bmp,
+                                      int32_t w, int32_t h)
+{
+    (void)bmp;
+    g_caret.hwnd = hwnd;
+    g_caret.w = w > 0 ? w : 1;
+    g_caret.h = h > 0 ? h : 16;
+    g_caret.visible = 0;
+    g_caret.count = 0;
+    return 1;
+}
+
+static WN_API int32_t u32_DestroyCaret(void)
+{
+    g_caret.hwnd = 0;
+    g_caret.visible = 0;
+    return 1;
+}
+
+static WN_API int32_t u32_ShowCaret(uint64_t hwnd)
+{
+    if (g_caret.hwnd && hwnd && g_caret.hwnd != hwnd)
+        return 0;
+    g_caret.count++;
+    g_caret.visible = g_caret.count >= 0;
+    return 1;
+}
+
+static WN_API int32_t u32_HideCaret(uint64_t hwnd)
+{
+    if (g_caret.hwnd && hwnd && g_caret.hwnd != hwnd)
+        return 0;
+    g_caret.count--;
+    g_caret.visible = g_caret.count >= 0;
+    return 1;
+}
+
+static WN_API int32_t u32_SetCaretPos(int32_t x, int32_t y)
+{
+    g_caret.x = x;
+    g_caret.y = y;
+    return 1;
+}
+
+/* --- MsgWaitForMultipleObjects (queue-aware approximation) ---------------------- */
+
+static WN_API uint32_t u32_MsgWaitForMultipleObjects(uint32_t count,
+                                                     const uint64_t *handles,
+                                                     uint32_t wait_all,
+                                                     uint32_t ms,
+                                                     uint32_t wake_mask)
+{
+    (void)wait_all; (void)wake_mask;
+    uint64_t t0 = wn_monotonic_ns() / 1000000;
+    for (;;) {
+        if (g_q_count)
+            return count;          /* WAIT_OBJECT_0 + n: message arrived */
+        /* Probe the handles with a zero timeout through the sync engine. */
+        if (count) {
+            extern uint32_t wn_wait_multiple(uint32_t, const wn_handle *,
+                                             int, uint32_t);
+            uint32_t wr = wn_wait_multiple(count,
+                                           (const wn_handle *)handles,
+                                           (int)wait_all, 0);
+            if (wr != 0xFFFFFFFF /*FAILED*/ && wr != 0x102 /*TIMEOUT*/ &&
+                wr != 0x80 /*ABANDONED*/)
+                return wr & 0xFF;     /* WAIT_OBJECT_0 + index */
+        }
+        uint64_t now = wn_monotonic_ns() / 1000000;
+        if (ms != 0xFFFFFFFFu && (uint32_t)(now - t0) >= ms)
+            return 258;            /* WAIT_TIMEOUT */
+        struct pollfd pfd = { .fd = g_msg_fd, .events = POLLIN };
+        poll(&pfd, 1, 5);
+        if (g_msg_fd >= 0) {
+            uint64_t v;
+            (void)!read(g_msg_fd, &v, 8);
+        }
+        pump_once();
+    }
+}
+
 /* --- export table ----------------------------------------------------------------- */
 
 
@@ -2641,5 +3647,69 @@ const wn_export_entry wn_user32_exports[] = {
     { "SetWindowLongPtrA", u32_SetWindowLongPtrA },
     { "MessageBoxA", u32_MessageBoxA },
     { "MessageBoxW", u32_MessageBoxW },
+    { "MessageBoxIndirectW", u32_MessageBoxIndirectW },
+    { "EnableWindow", u32_EnableWindow },
+    { "IsWindowEnabled", u32_IsWindowEnabled },
+    { "MessageBeep", u32_MessageBeep },
+    { "GetMonitorInfoA", u32_GetMonitorInfoA },
+    { "GetMonitorInfoW", u32_GetMonitorInfoW },
+    { "MonitorFromWindow", u32_MonitorFromWindow },
+    { "MonitorFromRect", u32_MonitorFromRect },
+    { "MonitorFromPoint", u32_MonitorFromPoint },
+    { "EnumDisplayMonitors", u32_EnumDisplayMonitors },
+    { "GetSystemMetrics", u32_GetSystemMetrics },
+    { "SystemParametersInfoA", u32_SystemParametersInfoA },
+    { "SystemParametersInfoW", u32_SystemParametersInfoW },
+    { "SetProcessDPIAware", u32_SetProcessDPIAware },
+    { "GetDpiForWindow", u32_GetDpiForWindow },
+    { "GetDpiForSystem", u32_GetDpiForSystem },
+    { "ScreenToClient", u32_ScreenToClient },
+    { "ClientToScreen", u32_ClientToScreen },
+    { "GetParent", u32_GetParent },
+    { "OffsetRect", u32_OffsetRect },
+    { "InvalidateRect", u32_InvalidateRect },
+    { "ValidateRect", u32_ValidateRect },
+    { "GetSysColor", u32_GetSysColor },
+    { "GetSysColorBrush", u32_GetSysColorBrush },
+    { "ShowCursor", u32_ShowCursor },
+    { "GetCursorPos", u32_GetCursorPos },
+    { "GetKeyboardState", u32_GetKeyboardState },
+    { "SetKeyboardState", u32_SetKeyboardState },
+    { "GetKeyboardLayout", u32_GetKeyboardLayout },
+    { "GetDoubleClickTime", u32_GetDoubleClickTime },
+    { "GetCaretBlinkTime", u32_GetCaretBlinkTime },
+    { "GetMessageTime", u32_GetMessageTime },
+    { "GetQueueStatus", u32_GetQueueStatus },
+    { "IsIconic", u32_IsIconic },
+    { "IsZoomed", u32_IsZoomed },
+    { "FlashWindow", u32_FlashWindow },
+    { "SetForegroundWindow", u32_SetForegroundWindow },
+    { "GetWindowPlacement", u32_GetWindowPlacement },
+    { "SetWindowPlacement", u32_SetWindowPlacement },
+    { "PeekMessageW", u32_PeekMessageW },
+    { "GetMessageW", u32_GetMessageW },
+    { "DispatchMessageW", u32_DispatchMessageW },
+    { "DefWindowProcW", u32_DefWindowProcW },
+    { "DefDlgProcA", u32_DefDlgProcA },
+    { "SendMessageW", u32_SendMessageW },
+    { "PostMessageW", u32_PostMessageW },
+    { "SetWindowTextW", u32_SetWindowTextW },
+    { "GetWindowTextW", u32_GetWindowTextW },
+    { "GetWindowTextLengthA", u32_GetWindowTextLengthA },
+    { "GetWindowTextLengthW", u32_GetWindowTextLengthW },
+    { "SetDlgItemTextW", u32_SetDlgItemTextW },
+    { "GetDlgItemTextA", u32_GetDlgItemTextA },
+    { "GetDlgItemTextW", u32_GetDlgItemTextW },
+    { "SendDlgItemMessageA", u32_SendDlgItemMessageA },
+    { "SendDlgItemMessageW", u32_SendDlgItemMessageW },
+    { "FindWindowA", u32_FindWindowA },
+    { "LoadImageA", u32_LoadImageA },
+    { "DestroyIcon", u32_DestroyIcon },
+    { "CreateCaret", u32_CreateCaret },
+    { "DestroyCaret", u32_DestroyCaret },
+    { "ShowCaret", u32_ShowCaret },
+    { "HideCaret", u32_HideCaret },
+    { "SetCaretPos", u32_SetCaretPos },
+    { "MsgWaitForMultipleObjects", u32_MsgWaitForMultipleObjects },
     { NULL, NULL },
 };

@@ -22,7 +22,7 @@ ok: CreateFontA
 ok: GetTextMetricsA
 ok: metrics sane (cell + advance)
 ok: GetTextExtentPoint32A
-ok: extent = n * advance
+ok: extent plausible (proportional ok)
 ok: DrawTextA DT_CALCRECT
 ok: DeleteObject(font)
 t15 locale+font: PASS (0 failures)

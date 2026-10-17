@@ -4,7 +4,7 @@ ok: kernel32!Beep by bare-module handle
 ok: GetSystemDirectoryA
 ok: LoadLibraryA(system32\IMM32.DLL) case-insensitive
 ok: FindFirstFileA(system32\IMM32.DLL)
-ok: LoadLibraryA("wship6.dll") fails
+ok: LoadLibraryA("winnux-missing-test.dll") fails
 ok: GetLastError() == ERROR_MOD_NOT_FOUND
 ok: GetProcAddress missing fails
 ok: GetLastError() == ERROR_PROC_NOT_FOUND
