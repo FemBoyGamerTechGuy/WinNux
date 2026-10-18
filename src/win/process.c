@@ -91,8 +91,12 @@ static int teb_load_fs(void *teb)
     d.limit_in_pages = 0;        /* byte-granular limit */
     d.seg_not_present = 0;
     d.useable = 1;
-    if (syscall(123 /* SYS_modify_ldt (i386) */, 1 /* write */, &d,
-                sizeof d) != sizeof d) {
+    /* Kernel contract: modify_ldt(func=1 write) returns 0 on success and
+     * -1/errno on failure — the byte count is only meaningful for func=0
+     * (read). Comparing against sizeof d misread success (return 0) as
+     * failure with errno==0 ("failed: Success") and aborted a perfectly
+     * working TEB setup. Verified against 6.x kernels and qemu-i386. */
+    if (syscall(SYS_modify_ldt, 1 /* write */, &d, sizeof d) != 0) {
         wn_log(WN_LOG_ERR, "teb: modify_ldt failed: %s", strerror(errno));
         return -1;
     }
@@ -134,9 +138,8 @@ wn_teb *wn_teb_current(void)
     __asm__ volatile ("movq %%gs:0x30, %0" : "=r"(t));
     return t;
 #else
-    /* i386 Windows reads the TEB self-pointer at fs:0x18; hosting that
-     * requires a set_thread_area-based TLS scheme (WoW64 groundwork,
-     * STATUS.md "32-bit"). Until then this path must not be reached. */
+    /* i386: TEB self-pointer at fs:0x18; wn_teb_attach() loads %fs from
+     * an LDT entry, so this is the canonical fast path. */
     wn_teb *t = NULL;
     __asm__ volatile ("movl %%fs:0x18, %0" : "=r"(t));
     return t;

@@ -25,7 +25,7 @@ static WN_API int32_t sp_OpenPrinterW(const uint16_t *name, uint64_t *printer, v
     return 0;
 }
 
-static WN_API int32_t sp_ClosePrinter(uint64_t printer)
+static WN_API int32_t sp_ClosePrinter(wn_abiword printer)
 {
     (void)printer;
     return 0;
@@ -72,7 +72,7 @@ static WN_API int32_t sp_GetDefaultPrinterW(uint16_t *name, uint32_t *cap)
     return 0;
 }
 
-static WN_API int32_t sp_DocumentPropertiesA(uint64_t hwnd, uint64_t printer,
+static WN_API int32_t sp_DocumentPropertiesA(wn_abiword hwnd, wn_abiword printer,
                                              const char *dev, void *out,
                                              void *in, uint32_t mode)
 {
@@ -80,7 +80,7 @@ static WN_API int32_t sp_DocumentPropertiesA(uint64_t hwnd, uint64_t printer,
     return -1;   /* SP_ERROR */
 }
 
-static WN_API int32_t sp_WritePrinter(uint64_t printer, void *buf,
+static WN_API int32_t sp_WritePrinter(wn_abiword printer, void *buf,
                                       uint32_t len, uint32_t *written)
 {
     (void)printer; (void)buf; (void)len;

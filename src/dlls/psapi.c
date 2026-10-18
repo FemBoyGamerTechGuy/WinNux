@@ -42,7 +42,7 @@ static wn_module **collect_modules(size_t *n)
     return arr;
 }
 
-static WN_API int32_t ps_EnumProcessModules(uint64_t h, uint64_t *mods,
+static WN_API int32_t ps_EnumProcessModules(wn_abiword h, uint64_t *mods,
                                             uint32_t cb, uint32_t *needed)
 {
     (void)h;
@@ -84,7 +84,7 @@ static int copy_name(wn_module *m, char *out, uint32_t cap)
     return (int)(l + 1);
 }
 
-static WN_API int32_t ps_GetModuleBaseNameA(uint64_t h, uint64_t hmod,
+static WN_API int32_t ps_GetModuleBaseNameA(wn_abiword h, wn_abiword hmod,
                                             char *base, uint32_t cap)
 {
     (void)h;
@@ -93,7 +93,7 @@ static WN_API int32_t ps_GetModuleBaseNameA(uint64_t h, uint64_t hmod,
                      base, cap);
 }
 
-static WN_API int32_t ps_GetModuleFileNameExA(uint64_t h, uint64_t hmod,
+static WN_API int32_t ps_GetModuleFileNameExA(wn_abiword h, wn_abiword hmod,
                                               char *out, uint32_t cap)
 {
     (void)h;
@@ -112,7 +112,7 @@ static WN_API int32_t ps_GetModuleFileNameExA(uint64_t h, uint64_t hmod,
     return (int32_t)(l + 1);
 }
 
-static WN_API int32_t ps_GetModuleFileNameExW(uint64_t h, uint64_t hmod,
+static WN_API int32_t ps_GetModuleFileNameExW(wn_abiword h, wn_abiword hmod,
                                               uint16_t *out, uint32_t cap)
 {
     (void)h;
@@ -140,7 +140,7 @@ static WN_API int32_t ps_GetModuleFileNameExW(uint64_t h, uint64_t hmod,
 }
 
 /* MODULEINFO {lpBaseOfImage; DWORD SizeOfImage; DWORD EntryPoint;} */
-static WN_API int32_t ps_GetModuleInformation(uint64_t h, uint64_t hmod,
+static WN_API int32_t ps_GetModuleInformation(wn_abiword h, wn_abiword hmod,
                                               void *mi, uint32_t cb)
 {
     (void)h;
@@ -157,7 +157,7 @@ static WN_API int32_t ps_GetModuleInformation(uint64_t h, uint64_t hmod,
     return 1;
 }
 
-static WN_API int32_t ps_EmptyWorkingSet(uint64_t h)
+static WN_API int32_t ps_EmptyWorkingSet(wn_abiword h)
 {
     (void)h;
     /* Nothing to trim: host kernel manages residency. Documented no-op

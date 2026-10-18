@@ -54,6 +54,21 @@ typedef WN_API void (*wn_fnptr_void)(void);
 typedef WN_API uintptr_t (*wn_fnptr_generic)(uintptr_t, uintptr_t, uintptr_t,
                                              uintptr_t);
 
+/* Width-adaptive ABI scalar: Windows' SIZE_T / ULONG_PTR / DWORD_PTR /
+ * WPARAM / LPARAM / HANDLE-as-value are 8 bytes on x64 and 4 on i386 —
+ * exactly what guest code pushes. NEVER type these uint64_t in a builtin
+ * signature: on i386 everything is stack-passed, so an 8-byte decl makes
+ * GCC clean ret-N for 16 bytes where the guest pushed 12 (stack skew) and
+ * read garbage upper dwords. On x64 wn_abiword IS uint64_t (register args
+ * are width-tolerant), so the 64-bit build is unchanged. */
+#if defined(__x86_64__)
+typedef uint64_t  wn_abiword;
+typedef int64_t   wn_abiword_s;
+#else
+typedef uint32_t  wn_abiword;
+typedef int32_t   wn_abiword_s;
+#endif
+
 /* Booleans and status codes as Windows sees them. */
 typedef int32_t wn_bool32;            /* BOOL */
 #define WN_TRUE  1

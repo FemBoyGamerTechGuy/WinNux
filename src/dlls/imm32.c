@@ -16,34 +16,34 @@
 
 #define IMM_ERROR_NODATA   ((int32_t)-1)
 
-static WN_API void *im32_GetContext(uint64_t hwnd)
+static WN_API void *im32_GetContext(wn_abiword hwnd)
 {
     (void)hwnd;
     wn_log(WN_LOG_DEBUG, "imm32: ImmGetContext -> NULL (no IME engine)");
     return NULL;
 }
 
-static WN_API int32_t im32_ReleaseContext(uint64_t hwnd, uint64_t himc)
+static WN_API int32_t im32_ReleaseContext(wn_abiword hwnd, wn_abiword himc)
 {
     (void)hwnd;
     (void)himc;
     return 0;   /* FALSE: we never hand out a context */
 }
 
-static WN_API void *im32_AssociateContext(uint64_t hwnd, uint64_t himc)
+static WN_API void *im32_AssociateContext(wn_abiword hwnd, wn_abiword himc)
 {
     (void)hwnd;
     (void)himc;
     return NULL; /* previous context: none */
 }
 
-static WN_API int32_t im32_GetOpenStatus(uint64_t himc)
+static WN_API int32_t im32_GetOpenStatus(wn_abiword himc)
 {
     (void)himc;
     return 0;
 }
 
-static WN_API int32_t im32_SetOpenStatus(uint64_t himc, int32_t open)
+static WN_API int32_t im32_SetOpenStatus(wn_abiword himc, int32_t open)
 {
     (void)himc;
     (void)open;
@@ -51,7 +51,7 @@ static WN_API int32_t im32_SetOpenStatus(uint64_t himc, int32_t open)
     return 0;
 }
 
-static WN_API int32_t im32_GetCompositionStringW(uint64_t himc, uint32_t index,
+static WN_API int32_t im32_GetCompositionStringW(wn_abiword himc, uint32_t index,
                                                  void *buf, uint32_t len)
 {
     (void)himc;
@@ -61,7 +61,7 @@ static WN_API int32_t im32_GetCompositionStringW(uint64_t himc, uint32_t index,
     return IMM_ERROR_NODATA;
 }
 
-static WN_API int32_t im32_GetCompositionStringA(uint64_t himc, uint32_t index,
+static WN_API int32_t im32_GetCompositionStringA(wn_abiword himc, uint32_t index,
                                                  void *buf, uint32_t len)
 {
     (void)himc;
@@ -71,7 +71,7 @@ static WN_API int32_t im32_GetCompositionStringA(uint64_t himc, uint32_t index,
     return IMM_ERROR_NODATA;
 }
 
-static WN_API int32_t im32_SetCompositionWindow(uint64_t himc, const void *cf)
+static WN_API int32_t im32_SetCompositionWindow(wn_abiword himc, const void *cf)
 {
     (void)himc;
     (void)cf;
@@ -79,7 +79,7 @@ static WN_API int32_t im32_SetCompositionWindow(uint64_t himc, const void *cf)
     return 0;
 }
 
-static WN_API int32_t im32_SetCompositionFontA(uint64_t himc, const void *lf)
+static WN_API int32_t im32_SetCompositionFontA(wn_abiword himc, const void *lf)
 {
     (void)himc;
     (void)lf;
@@ -87,7 +87,7 @@ static WN_API int32_t im32_SetCompositionFontA(uint64_t himc, const void *lf)
     return 0;
 }
 
-static WN_API int32_t im32_SetCompositionFontW(uint64_t himc, const void *lf)
+static WN_API int32_t im32_SetCompositionFontW(wn_abiword himc, const void *lf)
 {
     (void)himc;
     (void)lf;
@@ -95,14 +95,14 @@ static WN_API int32_t im32_SetCompositionFontW(uint64_t himc, const void *lf)
     return 0;
 }
 
-static WN_API int32_t im32_SetCandidateWindow(uint64_t himc, const void *cf)
+static WN_API int32_t im32_SetCandidateWindow(wn_abiword himc, const void *cf)
 {
     (void)himc;
     (void)cf;
     return 0;
 }
 
-static WN_API int32_t im32_NotifyIME(uint64_t himc, uint32_t action,
+static WN_API int32_t im32_NotifyIME(wn_abiword himc, uint32_t action,
                                      uint32_t index, uint32_t value)
 {
     (void)himc;

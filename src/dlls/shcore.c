@@ -24,7 +24,7 @@ static WN_API int32_t sc_SetProcessDpiAwareness(uint32_t value)
     return 0;
 }
 
-static WN_API int32_t sc_GetDpiForMonitor(uint64_t hmon, uint32_t type,
+static WN_API int32_t sc_GetDpiForMonitor(wn_abiword hmon, uint32_t type,
                                           uint32_t *x, uint32_t *y)
 {
     (void)hmon;
@@ -36,7 +36,7 @@ static WN_API int32_t sc_GetDpiForMonitor(uint64_t hmon, uint32_t type,
     return 0;     /* S_OK */
 }
 
-static WN_API int32_t sc_GetScaleFactorForMonitor(uint64_t hmon, uint32_t *scale)
+static WN_API int32_t sc_GetScaleFactorForMonitor(wn_abiword hmon, uint32_t *scale)
 {
     (void)hmon;
     if (scale)
@@ -53,8 +53,8 @@ const wn_export_entry wn_shcore_exports[] = {
 
 /* --- hhctrl.ocx (HTML help) -------------------------------------------------------- */
 
-static WN_API uint64_t hh_HtmlHelpA(uint64_t hwnd, const char *file,
-                                    uint32_t cmd, uint64_t data)
+static WN_API uint64_t hh_HtmlHelpA(wn_abiword hwnd, const char *file,
+                                    uint32_t cmd, wn_abiword data)
 {
     (void)hwnd; (void)cmd; (void)data;
     wn_log(WN_LOG_WARN, "hhctrl: HtmlHelpA('%s') — no CHM viewer, returning 0",
@@ -62,8 +62,8 @@ static WN_API uint64_t hh_HtmlHelpA(uint64_t hwnd, const char *file,
     return 0;
 }
 
-static WN_API uint64_t hh_HtmlHelpW(uint64_t hwnd, const uint16_t *file,
-                                    uint32_t cmd, uint64_t data)
+static WN_API uint64_t hh_HtmlHelpW(wn_abiword hwnd, const uint16_t *file,
+                                    uint32_t cmd, wn_abiword data)
 {
     char *a = file ? wn_utf16_to_utf8(file, 256) : NULL;
     uint64_t r = hh_HtmlHelpA(hwnd, a, cmd, data);

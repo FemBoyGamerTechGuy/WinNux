@@ -108,7 +108,7 @@ static WN_API uint64_t w2_socket(int32_t af, int32_t type, int32_t proto)
     return sock_new(fd);
 }
 
-static WN_API int32_t w2_closesocket(uint64_t s)
+static WN_API int32_t w2_closesocket(wn_abiword s)
 {
     wn_sock *sk = sock_of(s);
     if (!sk) {
@@ -120,7 +120,7 @@ static WN_API int32_t w2_closesocket(uint64_t s)
     return 0;
 }
 
-static WN_API int32_t w2_connect(uint64_t s, const void *name, int32_t namelen)
+static WN_API int32_t w2_connect(wn_abiword s, const void *name, int32_t namelen)
 {
     wn_sock *sk = sock_of(s);
     if (!sk || !name)
@@ -132,7 +132,7 @@ static WN_API int32_t w2_connect(uint64_t s, const void *name, int32_t namelen)
     return 0;
 }
 
-static WN_API int32_t w2_bind(uint64_t s, const void *name, int32_t namelen)
+static WN_API int32_t w2_bind(wn_abiword s, const void *name, int32_t namelen)
 {
     wn_sock *sk = sock_of(s);
     if (!sk || !name)
@@ -144,7 +144,7 @@ static WN_API int32_t w2_bind(uint64_t s, const void *name, int32_t namelen)
     return 0;
 }
 
-static WN_API int32_t w2_listen(uint64_t s, int32_t backlog)
+static WN_API int32_t w2_listen(wn_abiword s, int32_t backlog)
 {
     wn_sock *sk = sock_of(s);
     if (!sk)
@@ -156,7 +156,7 @@ static WN_API int32_t w2_listen(uint64_t s, int32_t backlog)
     return 0;
 }
 
-static WN_API uint64_t w2_accept(uint64_t s, void *addr, int32_t *addrlen)
+static WN_API uint64_t w2_accept(wn_abiword s, void *addr, int32_t *addrlen)
 {
     wn_sock *sk = sock_of(s);
     if (!sk)
@@ -173,7 +173,7 @@ static WN_API uint64_t w2_accept(uint64_t s, void *addr, int32_t *addrlen)
     return sock_new(fd);
 }
 
-static WN_API int32_t w2_send(uint64_t s, const void *buf, int32_t len,
+static WN_API int32_t w2_send(wn_abiword s, const void *buf, int32_t len,
                               int32_t flags)
 {
     wn_sock *sk = sock_of(s);
@@ -185,7 +185,7 @@ static WN_API int32_t w2_send(uint64_t s, const void *buf, int32_t len,
     return (int32_t)r;
 }
 
-static WN_API int32_t w2_recv(uint64_t s, void *buf, int32_t len, int32_t flags)
+static WN_API int32_t w2_recv(wn_abiword s, void *buf, int32_t len, int32_t flags)
 {
     wn_sock *sk = sock_of(s);
     if (!sk || !buf || len < 0)
@@ -196,7 +196,7 @@ static WN_API int32_t w2_recv(uint64_t s, void *buf, int32_t len, int32_t flags)
     return (int32_t)r;
 }
 
-static WN_API int32_t w2_shutdown(uint64_t s, int32_t how)
+static WN_API int32_t w2_shutdown(wn_abiword s, int32_t how)
 {
     wn_sock *sk = sock_of(s);
     if (!sk)
@@ -204,7 +204,7 @@ static WN_API int32_t w2_shutdown(uint64_t s, int32_t how)
     return shutdown(sk->fd, how);
 }
 
-static WN_API int32_t w2_ioctlsocket(uint64_t s, int32_t cmd, uint32_t *argp)
+static WN_API int32_t w2_ioctlsocket(wn_abiword s, int32_t cmd, uint32_t *argp)
 {
     wn_sock *sk = sock_of(s);
     if (!sk || !argp)
@@ -303,7 +303,7 @@ static WN_API int32_t w2_select(int32_t nfds, void *rs, void *ws_, void *es,
 }
 
 /* FD_ISSET on Windows compiles to this imported helper. */
-static WN_API int32_t w2___WSAFDIsSet(uint64_t s, void *setp)
+static WN_API int32_t w2___WSAFDIsSet(wn_abiword s, void *setp)
 {
     win_fd_set *set = setp;
     if (!set)

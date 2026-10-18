@@ -11,6 +11,7 @@
 #include "wn_handle.h"
 #include "wn_log.h"
 #include "wn_util.h"
+#include "wn_format.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -37,7 +38,8 @@ typedef struct wn_msg {
 
 typedef struct wn_wndclass {
     char name[64];
-    WN_API uint64_t (*proc)(uint64_t, uint32_t, uint64_t, int64_t);
+    WN_API wn_abiword (*proc)(wn_abiword, uint32_t, wn_abiword,
+                              wn_abiword_s);
     uint32_t style;
     uint32_t cb_wnd_extra;      /* bytes of GWLP storage past the fixed area */
     int used;
@@ -48,7 +50,7 @@ typedef struct wn_timer {
     uintptr_t id;
     uint64_t period_ms;
     uint64_t next_fire;
-    WN_API void (*proc)(uint64_t, uint32_t, uintptr_t, uint32_t);
+    WN_API void (*proc)(wn_abiword, uint32_t, uintptr_t, uint32_t);
     int active;
 } wn_timer;
 
@@ -117,9 +119,9 @@ static int g_bwin_count;
 static void compose_child(wn_window *child);
 static void present_root(wn_window *w);
 static void win_screen_origin(wn_window *w, int *x, int *y);
-static WN_API uint64_t u32_SendMessageA(uint64_t hwnd, uint32_t msg,
-                                        uint64_t wp, int64_t lp);
-static WN_API int32_t u32_MessageBoxW(uint64_t hwnd, const uint16_t *text,
+static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
+                                        wn_abiword wp, wn_abiword_s lp);
+static WN_API int32_t u32_MessageBoxW(wn_abiword hwnd, const uint16_t *text,
                                      const uint16_t *caption, uint32_t type);
 #define DLG_X(n) ((int)((n) * 4 / 2 + ((n) & 1)))
 #define DLG_Y(n) ((int)((n) * 8 / 2))
@@ -482,7 +484,7 @@ static int ensure_gui(void)
     return 0;
 }
 
-static WN_API int32_t u32_ShowWindow(uint64_t hwnd, int32_t cmd)
+static WN_API int32_t u32_ShowWindow(wn_abiword hwnd, int32_t cmd)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !w->bwin)
@@ -566,7 +568,7 @@ static void user32_move_resize(uint64_t hwnd, int x, int y, int w, int h,
         compose_child(win);
 }
 
-static WN_API int32_t u32_MoveWindow(uint64_t hwnd, int32_t x, int32_t y,
+static WN_API int32_t u32_MoveWindow(wn_abiword hwnd, int32_t x, int32_t y,
                                      int32_t w, int32_t h, int32_t repaint)
 {
     (void)repaint;
@@ -580,7 +582,7 @@ static WN_API int32_t u32_MoveWindow(uint64_t hwnd, int32_t x, int32_t y,
     return 1;
 }
 
-static WN_API int32_t u32_SetWindowPos(uint64_t hwnd, uint64_t after,
+static WN_API int32_t u32_SetWindowPos(wn_abiword hwnd, wn_abiword after,
                                        int32_t x, int32_t y, int32_t cx,
                                        int32_t cy, uint32_t flags)
 {
@@ -644,7 +646,7 @@ int user32_set_focus_internal(uint64_t hwnd)
     return 1;
 }
 
-static WN_API uint64_t u32_SetFocus(uint64_t hwnd)
+static WN_API uint64_t u32_SetFocus(wn_abiword hwnd)
 {
     uint64_t old = g_focus_hwnd;
     user32_set_focus_internal(hwnd);
@@ -656,7 +658,7 @@ static WN_API uint64_t u32_GetFocus(void)
     return g_focus_hwnd;
 }
 
-static WN_API uint64_t u32_SetActiveWindow(uint64_t hwnd)
+static WN_API uint64_t u32_SetActiveWindow(wn_abiword hwnd)
 {
     uint64_t old = g_active_hwnd;
     if (hwnd == g_active_hwnd)
@@ -689,7 +691,7 @@ static WN_API uint64_t u32_GetForegroundWindow(void)
  * Putty's button handlers call ReleaseCapture on every click. */
 static uint32_t g_next_regmsg = 0xC000;
 
-static WN_API uint64_t u32_SetCapture(uint64_t hwnd)
+static WN_API uint64_t u32_SetCapture(wn_abiword hwnd)
 {
     uint64_t old = g_capture_hwnd;
     if (win_from_hwnd(hwnd))
@@ -848,42 +850,42 @@ static int64_t winlong_set(wn_window *w, int32_t idx, int64_t v)
     return old;
 }
 
-static WN_API int64_t u32_GetWindowLongA(uint64_t hwnd, int32_t idx)
+static WN_API int64_t u32_GetWindowLongA(wn_abiword hwnd, int32_t idx)
 {
     return winlong_get(win_from_hwnd(hwnd), idx);
 }
 
-static WN_API int64_t u32_GetWindowLongW(uint64_t hwnd, int32_t idx)
+static WN_API int64_t u32_GetWindowLongW(wn_abiword hwnd, int32_t idx)
 {
     return winlong_get(win_from_hwnd(hwnd), idx);
 }
 
-static WN_API int64_t u32_GetWindowLongPtrA(uint64_t hwnd, int32_t idx)
+static WN_API int64_t u32_GetWindowLongPtrA(wn_abiword hwnd, int32_t idx)
 {
     return winlong_get(win_from_hwnd(hwnd), idx);
 }
 
-static WN_API int64_t u32_GetWindowLongPtrW(uint64_t hwnd, int32_t idx)
+static WN_API int64_t u32_GetWindowLongPtrW(wn_abiword hwnd, int32_t idx)
 {
     return winlong_get(win_from_hwnd(hwnd), idx);
 }
 
-static WN_API int64_t u32_SetWindowLongA(uint64_t hwnd, int32_t idx, int64_t v)
+static WN_API int64_t u32_SetWindowLongA(wn_abiword hwnd, int32_t idx, wn_abiword_s v)
 {
     return winlong_set(win_from_hwnd(hwnd), idx, v);
 }
 
-static WN_API int64_t u32_SetWindowLongW(uint64_t hwnd, int32_t idx, int64_t v)
+static WN_API int64_t u32_SetWindowLongW(wn_abiword hwnd, int32_t idx, wn_abiword_s v)
 {
     return winlong_set(win_from_hwnd(hwnd), idx, v);
 }
 
-static WN_API int64_t u32_SetWindowLongPtrA(uint64_t hwnd, int32_t idx, int64_t v)
+static WN_API int64_t u32_SetWindowLongPtrA(wn_abiword hwnd, int32_t idx, wn_abiword_s v)
 {
     return winlong_set(win_from_hwnd(hwnd), idx, v);
 }
 
-static WN_API int64_t u32_SetWindowLongPtrW(uint64_t hwnd, int32_t idx, int64_t v)
+static WN_API int64_t u32_SetWindowLongPtrW(wn_abiword hwnd, int32_t idx, wn_abiword_s v)
 {
     return winlong_set(win_from_hwnd(hwnd), idx, v);
 }
@@ -903,7 +905,7 @@ static wn_window *dlg_item(wn_window *dlg, uint64_t id)
     return NULL;
 }
 
-static WN_API uint64_t u32_GetDlgItem(uint64_t hdlg, int32_t id)
+static WN_API uint64_t u32_GetDlgItem(wn_abiword hdlg, int32_t id)
 {
     wn_window *d = win_from_hwnd(hdlg);
     wn_window *c = d ? dlg_item(d, (uint64_t)(int64_t)id) : NULL;
@@ -912,7 +914,7 @@ static WN_API uint64_t u32_GetDlgItem(uint64_t hdlg, int32_t id)
 }
 
 /* Dialog base units: consistent with DLG_X/DLG_Y below (2 px / 4 px). */
-static WN_API int32_t u32_MapDialogRect(uint64_t hdlg, void *rect)
+static WN_API int32_t u32_MapDialogRect(wn_abiword hdlg, void *rect)
 {
     wn_window *d = win_from_hwnd(hdlg);
     if (!d || !rect)
@@ -925,7 +927,7 @@ static WN_API int32_t u32_MapDialogRect(uint64_t hdlg, void *rect)
     return 1;
 }
 
-static WN_API int32_t u32_IsDlgButtonChecked(uint64_t hdlg, int32_t id)
+static WN_API int32_t u32_IsDlgButtonChecked(wn_abiword hdlg, int32_t id)
 {
     uint64_t c = u32_GetDlgItem(hdlg, id);
     wn_window *w = c ? win_from_hwnd(c) : NULL;
@@ -934,7 +936,7 @@ static WN_API int32_t u32_IsDlgButtonChecked(uint64_t hdlg, int32_t id)
     return (int32_t)w->check;
 }
 
-static WN_API int32_t u32_CheckDlgButton(uint64_t hdlg, int32_t id,
+static WN_API int32_t u32_CheckDlgButton(wn_abiword hdlg, int32_t id,
                                          uint32_t check)
 {
     uint64_t c = u32_GetDlgItem(hdlg, id);
@@ -946,7 +948,7 @@ static WN_API int32_t u32_CheckDlgButton(uint64_t hdlg, int32_t id,
     return 1;
 }
 
-static WN_API int32_t u32_CheckRadioButton(uint64_t hdlg, int32_t first,
+static WN_API int32_t u32_CheckRadioButton(wn_abiword hdlg, int32_t first,
                                            int32_t last, int32_t check)
 {
     wn_window *d = win_from_hwnd(hdlg);
@@ -969,12 +971,27 @@ static WN_API int32_t u32_CheckRadioButton(uint64_t hdlg, int32_t first,
 static WN_API uint64_t u32_RegisterClassA(const void *wc)
 {
     /* WNDCLASSA x64: style@0(4), lpfnWndProc@8(8), cbClsExtra@0x10,
-     * cbWndExtra@0x14, hInstance@0x18, ..., lpszClassName@0x40. */
+     * cbWndExtra@0x14, hInstance@0x18, ..., lpszClassName@0x40.
+     * i386: style@0, lpfnWndProc@4, cbClsExtra@8, cbWndExtra@0xC,
+     * hInstance@0x10, ..., lpszClassName@0x24 (40-byte struct). */
     const uint8_t *p = wc;
+#if defined(__x86_64__)
     const char *name = *(const char **)(const void *)(p + 0x40);
-    WN_API uint64_t (*proc)(uint64_t, uint32_t, uint64_t, int64_t) =
-        (WN_API uint64_t (*)(uint64_t, uint32_t, uint64_t, int64_t))
+    WN_API wn_abiword (*proc)(wn_abiword, uint32_t, wn_abiword,
+                              wn_abiword_s) =
+        (WN_API wn_abiword (*)(wn_abiword, uint32_t, wn_abiword,
+                               wn_abiword_s))
         *(const void **)(const void *)(p + 8);
+    uint32_t cb_wnd_extra = *(const uint32_t *)(const void *)(p + 0x14);
+#else
+    const char *name = *(const char **)(const void *)(p + 0x24);
+    WN_API wn_abiword (*proc)(wn_abiword, uint32_t, wn_abiword,
+                              wn_abiword_s) =
+        (WN_API wn_abiword (*)(wn_abiword, uint32_t, wn_abiword,
+                               wn_abiword_s))
+        *(const void **)(const void *)(p + 4);
+    uint32_t cb_wnd_extra = *(const uint32_t *)(const void *)(p + 0xC);
+#endif
     if (!name || !proc) {
         wn_last_error_set(WN_ERR_INVALID_PARAMETER);
         return 0;
@@ -990,7 +1007,7 @@ static WN_API uint64_t u32_RegisterClassA(const void *wc)
             snprintf(g_classes[i].name, sizeof g_classes[i].name, "%s", name);
             g_classes[i].proc = proc;
             g_classes[i].style = *(const uint32_t *)(const void *)p;
-            g_classes[i].cb_wnd_extra = *(const uint32_t *)(const void *)(p + 0x14);
+            g_classes[i].cb_wnd_extra = cb_wnd_extra;
             g_classes[i].used = 1;
             wn_log(WN_LOG_DEBUG, "user32: class '%s' registered (proc %p)",
                    name, (void *)proc);
@@ -1036,8 +1053,8 @@ static void compose_child(wn_window *child);
 static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_name,
                                            const char *title, uint32_t style,
                                            int x, int y, int w, int h,
-                                           uint64_t parent, uint64_t menu,
-                                           uint64_t hinst, void *param)
+                                           wn_abiword parent, wn_abiword menu,
+                                           wn_abiword hinst, void *param)
 {
     if (ensure_gui() != 0 && !parent) {
         wn_last_error_set(WN_ERR_NOT_SUPPORTED);
@@ -1163,8 +1180,8 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
 static WN_API uint64_t u32_CreateWindowExW(uint32_t ex, const uint16_t *cls,
                                            const uint16_t *title, uint32_t style,
                                            int x, int y, int w, int h,
-                                           uint64_t parent, uint64_t menu,
-                                           uint64_t hinst, void *param)
+                                           wn_abiword parent, wn_abiword menu,
+                                           wn_abiword hinst, void *param)
 {
     char *c = cls ? wn_utf16_to_utf8(cls, 256) : NULL;
     char *t = title ? wn_utf16_to_utf8(title, 256) : NULL;
@@ -1180,7 +1197,7 @@ static WN_API uint64_t u32_CreateWindowExW(uint32_t ex, const uint16_t *cls,
     return r;
 }
 
-static WN_API int32_t u32_DestroyWindow(uint64_t hwnd)
+static WN_API int32_t u32_DestroyWindow(wn_abiword hwnd)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
@@ -1315,15 +1332,39 @@ void wn_user32_paint_rect(uint64_t hwnd, int *l, int *t, int *r, int *b)
 
 /* Fill the guest MSG x64 struct from an internal message:
  * hwnd@0, message@8, wParam@0x10, lParam@0x18, time@0x20, pt@0x24. */
+/* Guest MSG layout (winuser.h): x64 = 48 bytes, i386 = 28 bytes. Writing
+ * the x64 shape on i386 smashes the caller's frame past its 28-byte MSG. */
+#if defined(__x86_64__)
+#define WN_MSG_HOFF    0x00
+#define WN_MSG_MSGOFF  0x08
+#define WN_MSG_WPOFF   0x10
+#define WN_MSG_LPOFF   0x18
+#define WN_MSG_TIMEOFF 0x20
+#define WN_MSG_FILL    0x30
+#else
+#define WN_MSG_HOFF    0x00
+#define WN_MSG_MSGOFF  0x04
+#define WN_MSG_WPOFF   0x08
+#define WN_MSG_LPOFF   0x0C
+#define WN_MSG_TIMEOFF 0x10
+#define WN_MSG_FILL    0x1C
+#endif
+
 static void fill_msg(void *msg_out, const wn_msg *m)
 {
     uint8_t *o = msg_out;
-    memset(o, 0, 0x30);
-    *(uint64_t *)(void *)(o + 0) = m->hwnd;
-    *(uint32_t *)(void *)(o + 8) = m->message;
-    *(uint64_t *)(void *)(o + 0x10) = m->wparam;
-    *(int64_t *)(void *)(o + 0x18) = m->lparam;
-    *(uint32_t *)(void *)(o + 0x20) = m->time;
+    memset(o, 0, WN_MSG_FILL);
+#if defined(__x86_64__)
+    *(uint64_t *)(void *)(o + WN_MSG_HOFF) = m->hwnd;
+    *(uint64_t *)(void *)(o + WN_MSG_WPOFF) = m->wparam;
+    *(int64_t *)(void *)(o + WN_MSG_LPOFF) = m->lparam;
+#else
+    *(uint32_t *)(void *)(o + WN_MSG_HOFF) = (uint32_t)m->hwnd;
+    *(uint32_t *)(void *)(o + WN_MSG_WPOFF) = (uint32_t)m->wparam;
+    *(int32_t *)(void *)(o + WN_MSG_LPOFF) = (int32_t)m->lparam;
+#endif
+    *(uint32_t *)(void *)(o + WN_MSG_MSGOFF) = m->message;
+    *(uint32_t *)(void *)(o + WN_MSG_TIMEOFF) = m->time;
     g_last_msg_time = m->time;    /* GetMessageTime */
 }
 
@@ -1344,7 +1385,7 @@ static int pump_once(void)
     return got || g_q_count || g_quit_posted;
 }
 
-static WN_API int32_t u32_GetMessageA(void *msg_out, uint64_t hwnd,
+static WN_API int32_t u32_GetMessageA(void *msg_out, wn_abiword hwnd,
                                       uint32_t min, uint32_t max)
 {
     (void)hwnd; (void)min; (void)max;
@@ -1400,7 +1441,7 @@ static WN_API int32_t u32_GetMessageA(void *msg_out, uint64_t hwnd,
     }
 }
 
-static WN_API int32_t u32_PeekMessageA(void *msg_out, uint64_t hwnd,
+static WN_API int32_t u32_PeekMessageA(void *msg_out, wn_abiword hwnd,
                                        uint32_t min, uint32_t max,
                                        uint32_t remove)
 {
@@ -1430,18 +1471,18 @@ static WN_API int32_t u32_PeekMessageA(void *msg_out, uint64_t hwnd,
 static WN_API uint64_t u32_DispatchMessageA(const void *msg)
 {
     const uint8_t *p = msg;
-    uint64_t hwnd = *(const uint64_t *)(const void *)(p + 0);
-    uint32_t message = *(const uint32_t *)(const void *)(p + 8);
-    uint64_t wp = *(const uint64_t *)(const void *)(p + 0x10);
-    int64_t lp = *(const int64_t *)(const void *)(p + 0x18);
+    wn_abiword hwnd = *(const wn_abiword *)(const void *)(p + WN_MSG_HOFF);
+    uint32_t message = *(const uint32_t *)(const void *)(p + WN_MSG_MSGOFF);
+    wn_abiword wp = *(const wn_abiword *)(const void *)(p + WN_MSG_WPOFF);
+    wn_abiword_s lp = *(const wn_abiword_s *)(const void *)(p + WN_MSG_LPOFF);
     wn_window *w = win_from_hwnd(hwnd);
     if (w && w->cls && w->cls->proc)
         return w->cls->proc(hwnd, message, wp, lp);
     return 0;
 }
 
-static WN_API uint64_t u32_DefWindowProcA(uint64_t hwnd, uint32_t msg,
-                                          uint64_t wp, int64_t lp)
+static WN_API uint64_t u32_DefWindowProcA(wn_abiword hwnd, uint32_t msg,
+                                          wn_abiword wp, wn_abiword_s lp)
 {
     switch (msg) {
     case WN_WM_CLOSE:
@@ -1460,15 +1501,15 @@ static WN_API uint64_t u32_DefWindowProcA(uint64_t hwnd, uint32_t msg,
     (void)wp; (void)lp;
 }
 
-static WN_API int32_t u32_PostMessageA(uint64_t hwnd, uint32_t msg,
-                                       uint64_t wp, int64_t lp)
+static WN_API int32_t u32_PostMessageA(wn_abiword hwnd, uint32_t msg,
+                                       wn_abiword wp, wn_abiword_s lp)
 {
     post_msg(hwnd, msg, wp, lp);
     return 1;
 }
 
-static WN_API uint64_t u32_SendMessageA(uint64_t hwnd, uint32_t msg,
-                                        uint64_t wp, int64_t lp)
+static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
+                                        wn_abiword wp, wn_abiword_s lp)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (w && w->cls && w->cls->proc)
@@ -1476,9 +1517,9 @@ static WN_API uint64_t u32_SendMessageA(uint64_t hwnd, uint32_t msg,
     return u32_DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-static WN_API uintptr_t u32_SetTimer(uint64_t hwnd, uintptr_t id,
+static WN_API uintptr_t u32_SetTimer(wn_abiword hwnd, uintptr_t id,
                                      uint32_t ms,
-                                     WN_API void (*proc)(uint64_t, uint32_t,
+                                     WN_API void (*proc)(wn_abiword, uint32_t,
                                                          uintptr_t, uint32_t))
 {
     for (int i = 0; i < 32; i++) {
@@ -1496,7 +1537,7 @@ static WN_API uintptr_t u32_SetTimer(uint64_t hwnd, uintptr_t id,
     return 0;
 }
 
-static WN_API int32_t u32_KillTimer(uint64_t hwnd, uintptr_t id)
+static WN_API int32_t u32_KillTimer(wn_abiword hwnd, uintptr_t id)
 {
     for (int i = 0; i < 32; i++) {
         if (g_timers[i].active && g_timers[i].hwnd == hwnd &&
@@ -1516,7 +1557,7 @@ static WN_API int32_t u32_TranslateMessage(const void *msg)
 
 /* GetClientRect uses the canonical size too (cw/ch == bwin size since the
  * create/resize paths keep them in lockstep). */
-static WN_API int32_t u32_GetClientRect(uint64_t hwnd, void *rect)
+static WN_API int32_t u32_GetClientRect(wn_abiword hwnd, void *rect)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !rect)
@@ -1530,12 +1571,12 @@ static WN_API int32_t u32_GetClientRect(uint64_t hwnd, void *rect)
 }
 
 
-static WN_API int32_t u32_IsWindow(uint64_t hwnd)
+static WN_API int32_t u32_IsWindow(wn_abiword hwnd)
 {
     return win_from_hwnd(hwnd) != NULL;
 }
 
-static WN_API int32_t u32_UpdateWindow(uint64_t hwnd)
+static WN_API int32_t u32_UpdateWindow(wn_abiword hwnd)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !w->bwin || !w->visible)
@@ -2247,8 +2288,8 @@ static void ctl_paint_check(wn_handle hdc, int x, int y, int state, int radio)
     g32_DrawCtlFrame(hdc, x, y, radio, state);
 }
 
-static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
-                                int64_t lp)
+static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
+                                  wn_abiword wp, wn_abiword_s lp)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
@@ -2276,8 +2317,8 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
             w->dirty.l = -1;
             w->paint_pending = 0;   /* re-arm generate_paints */
         }
-        typedef WN_API int64_t (*dlgproc_fn)(uint64_t, uint32_t, uint64_t,
-                                             int64_t);
+        typedef WN_API wn_abiword_s (*dlgproc_fn)(
+            wn_abiword, uint32_t, wn_abiword, wn_abiword_s);
         int64_t r = ((dlgproc_fn)(uintptr_t)w->dlgproc)(hwnd, msg, wp, lp);
         if (r)
             return (uint64_t)r;
@@ -3037,8 +3078,8 @@ static uint64_t create_dialog_from_template(uint64_t hinst,
 
     /* WM_INITDIALOG -> guest dlgproc */
     if (dlgproc) {
-        typedef WN_API int64_t (*dlgproc_fn)(uint64_t, uint32_t, uint64_t,
-                                             int64_t);
+        typedef WN_API wn_abiword_s (*dlgproc_fn)(
+            wn_abiword, uint32_t, wn_abiword, wn_abiword_s);
         ((dlgproc_fn)(uintptr_t)dlgproc)(hwnd, WN_WM_INITDIALOG, 0,
                                          (int64_t)param);
     }
@@ -3060,9 +3101,9 @@ static int32_t u32_IsDialogMessage_impl(uint64_t hdlg, const uint8_t *msg)
 {
     if (!msg)
         return 0;
-    uint64_t hwnd = *(const uint64_t *)(const void *)msg;
-    uint32_t message = *(const uint32_t *)(const void *)(msg + 8);
-    uint64_t wp = *(const uint64_t *)(const void *)(msg + 0x10);
+    wn_abiword hwnd = *(const wn_abiword *)(const void *)(msg + WN_MSG_HOFF);
+    uint32_t message = *(const uint32_t *)(const void *)(msg + WN_MSG_MSGOFF);
+    wn_abiword wp = *(const wn_abiword *)(const void *)(msg + WN_MSG_WPOFF);
     (void)hdlg;
     wn_window *dlg = win_from_hwnd(hwnd);
     if (!dlg || !dlg->is_dialog)
@@ -3149,14 +3190,14 @@ static int32_t u32_IsDialogMessage_impl(uint64_t hdlg, const uint8_t *msg)
     return 0;
 }
 
-static WN_API int32_t u32_IsDialogMessageA(uint64_t hdlg, const void *msg)
+static WN_API int32_t u32_IsDialogMessageA(wn_abiword hdlg, const void *msg)
 {
     return u32_IsDialogMessage_impl(hdlg, (const uint8_t *)msg);
 }
 
-static WN_API int64_t u32_DialogBoxParamA(uint64_t hinst, const void *tmpl,
-                                          uint64_t parent, uint64_t dlgproc,
-                                          uint64_t param)
+static WN_API int64_t u32_DialogBoxParamA(wn_abiword hinst, const void *tmpl,
+                                          wn_abiword parent, wn_abiword dlgproc,
+                                          wn_abiword param)
 {
     uint64_t hwnd = create_dialog_from_template(hinst, tmpl, parent, dlgproc,
                                                 param, 1);
@@ -3189,14 +3230,14 @@ static WN_API int64_t u32_DialogBoxParamA(uint64_t hinst, const void *tmpl,
     return result;
 }
 
-static WN_API uint64_t u32_CreateDialogParamA(uint64_t hinst, const void *tmpl,
-                                              uint64_t parent, uint64_t dlgproc,
-                                              uint64_t param)
+static WN_API uint64_t u32_CreateDialogParamA(wn_abiword hinst, const void *tmpl,
+                                              wn_abiword parent, wn_abiword dlgproc,
+                                              wn_abiword param)
 {
     return create_dialog_from_template(hinst, tmpl, parent, dlgproc, param, 0);
 }
 
-static WN_API void u32_EndDialog(uint64_t hwnd, int64_t result)
+static WN_API void u32_EndDialog(wn_abiword hwnd, wn_abiword_s result)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !w->is_dialog) {
@@ -3209,7 +3250,7 @@ static WN_API void u32_EndDialog(uint64_t hwnd, int64_t result)
     post_msg(hwnd, 0, 0, 0);   /* wake the modal loop */
 }
 
-static WN_API int32_t u32_SetDlgItemTextA(uint64_t hwnd, int32_t id,
+static WN_API int32_t u32_SetDlgItemTextA(wn_abiword hwnd, int32_t id,
                                           const char *text)
 {
     uint64_t c = u32_GetDlgItem(hwnd, id);
@@ -3224,7 +3265,7 @@ static WN_API int32_t u32_SetDlgItemTextA(uint64_t hwnd, int32_t id,
 
 /* --- window text + longs --------------------------------------------------- */
 
-static WN_API int32_t u32_SetWindowTextA(uint64_t hwnd, const char *text)
+static WN_API int32_t u32_SetWindowTextA(wn_abiword hwnd, const char *text)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
@@ -3236,7 +3277,7 @@ static WN_API int32_t u32_SetWindowTextA(uint64_t hwnd, const char *text)
     return 1;
 }
 
-static WN_API int32_t u32_GetWindowTextA(uint64_t hwnd, char *buf, int32_t max)
+static WN_API int32_t u32_GetWindowTextA(wn_abiword hwnd, char *buf, int32_t max)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !buf || max <= 0)
@@ -3300,7 +3341,7 @@ static const char *const g_idi_names[] = {
     "IDI_WINLOGO", NULL
 };
 
-static WN_API wn_handle u32_LoadCursorA(uint64_t hinst, const char *name)
+static WN_API wn_handle u32_LoadCursorA(wn_abiword hinst, const char *name)
 {
     (void)hinst;   /* process-defined cursors: not yet (documented gap) */
     uint32_t id = res_name_to_id(name, g_idc_names, 32512 /*IDC_ARROW base*/);
@@ -3309,7 +3350,7 @@ static WN_API wn_handle u32_LoadCursorA(uint64_t hinst, const char *name)
     return res_handle(id, 0);
 }
 
-static WN_API wn_handle u32_LoadCursorW(uint64_t hinst, const uint16_t *name)
+static WN_API wn_handle u32_LoadCursorW(wn_abiword hinst, const uint16_t *name)
 {
     if ((uintptr_t)name < 0x10000)   /* MAKEINTRESOURCEW */
         return u32_LoadCursorA(hinst, (const char *)(uintptr_t)name);
@@ -3319,7 +3360,7 @@ static WN_API wn_handle u32_LoadCursorW(uint64_t hinst, const uint16_t *name)
     return h;
 }
 
-static WN_API wn_handle u32_LoadIconA(uint64_t hinst, const char *name)
+static WN_API wn_handle u32_LoadIconA(wn_abiword hinst, const char *name)
 {
     uint32_t id = res_name_to_id(name, g_idi_names, 100 /*IDI base*/);
     if (hinst && hinst != (uint64_t)(uintptr_t)g_proc.exe->base) {
@@ -3331,7 +3372,7 @@ static WN_API wn_handle u32_LoadIconA(uint64_t hinst, const char *name)
     return res_handle(id, 1);
 }
 
-static WN_API wn_handle u32_LoadIconW(uint64_t hinst, const uint16_t *name)
+static WN_API wn_handle u32_LoadIconW(wn_abiword hinst, const uint16_t *name)
 {
     if ((uintptr_t)name < 0x10000)   /* MAKEINTRESOURCEW */
         return u32_LoadIconA(hinst, (const char *)(uintptr_t)name);
@@ -3376,7 +3417,7 @@ static WN_API int32_t u32_DrawTextW(wn_handle hdc, const uint16_t *s,
  * (nonzero = was enabled). putty disables its config box for every modal
  * child; the old stub returned 0 ("it WAS disabled"), which apps read as
  * failure — and our input path then fed clicks into the "disabled" window. */
-static WN_API int32_t u32_EnableWindow(uint64_t hwnd, int32_t enable)
+static WN_API int32_t u32_EnableWindow(wn_abiword hwnd, int32_t enable)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
@@ -3399,7 +3440,7 @@ static WN_API int32_t u32_EnableWindow(uint64_t hwnd, int32_t enable)
     return was;
 }
 
-static WN_API int32_t u32_IsWindowEnabled(uint64_t hwnd)
+static WN_API int32_t u32_IsWindowEnabled(wn_abiword hwnd)
 {
     wn_window *w = win_from_hwnd(hwnd);
     return w ? !(w->style & 0x08000000u) : 0;
@@ -3430,7 +3471,7 @@ static void win_screen_origin(wn_window *w, int *x, int *y)
     }
 }
 
-static WN_API int32_t u32_GetWindowRect(uint64_t hwnd, void *rect)
+static WN_API int32_t u32_GetWindowRect(wn_abiword hwnd, void *rect)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !rect)
@@ -3447,7 +3488,7 @@ static WN_API int32_t u32_GetWindowRect(uint64_t hwnd, void *rect)
     return 1;
 }
 
-static WN_API int32_t u32_ScreenToClient(uint64_t hwnd, void *pt)
+static WN_API int32_t u32_ScreenToClient(wn_abiword hwnd, void *pt)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !pt)
@@ -3460,7 +3501,7 @@ static WN_API int32_t u32_ScreenToClient(uint64_t hwnd, void *pt)
     return 1;
 }
 
-static WN_API int32_t u32_ClientToScreen(uint64_t hwnd, void *pt)
+static WN_API int32_t u32_ClientToScreen(wn_abiword hwnd, void *pt)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !pt)
@@ -3473,7 +3514,7 @@ static WN_API int32_t u32_ClientToScreen(uint64_t hwnd, void *pt)
     return 1;
 }
 
-static WN_API uint64_t u32_GetParent(uint64_t hwnd)
+static WN_API uint64_t u32_GetParent(wn_abiword hwnd)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
@@ -3555,7 +3596,7 @@ static WN_API int32_t u32_GetSystemMetrics(int32_t idx)
 }
 
 /* MONITORINFO x64: cbSize@0(4) rcMonitor@4(16) rcWork@0x14(16) dwFlags@0x24. */
-static WN_API int32_t u32_GetMonitorInfoA(uint64_t hmon, void *mi)
+static WN_API int32_t u32_GetMonitorInfoA(wn_abiword hmon, void *mi)
 {
     (void)hmon;
     if (!mi)
@@ -3574,7 +3615,7 @@ static WN_API int32_t u32_GetMonitorInfoA(uint64_t hmon, void *mi)
     return 1;
 }
 
-static WN_API int32_t u32_GetMonitorInfoW(uint64_t hmon, void *mi)
+static WN_API int32_t u32_GetMonitorInfoW(wn_abiword hmon, void *mi)
 {
     if (!mi)
         return 0;
@@ -3590,7 +3631,7 @@ static WN_API int32_t u32_GetMonitorInfoW(uint64_t hmon, void *mi)
     return u32_GetMonitorInfoA(hmon, mi);
 }
 
-static WN_API uint64_t u32_MonitorFromWindow(uint64_t hwnd, uint32_t flags)
+static WN_API uint64_t u32_MonitorFromWindow(wn_abiword hwnd, uint32_t flags)
 {
     int w, h;
     screen_dims(&w, &h);
@@ -3618,10 +3659,16 @@ static WN_API uint64_t u32_MonitorFromRect(const void *rect, uint32_t flags)
  * in RCX under the MS x64 ABI (x=low dword, y=high dword) — declaring it
  * as (x, y, flags) reads y out of RDX and flags out of R8. Same ABI trap
  * class as the IsDialogMessage bug. */
-static WN_API uint64_t u32_MonitorFromPoint(uint64_t point, uint32_t flags)
+static WN_API uint64_t u32_MonitorFromPoint(wn_abiword point, uint32_t flags)
 {
+#if defined(__x86_64__)
     int32_t x = (int32_t)(point & 0xFFFFFFFF);
     int32_t y = (int32_t)(point >> 32);
+#else
+    /* i386: POINT by value packs into one dword (y<<16 | x). */
+    int32_t x = (int32_t)(point & 0xFFFF);
+    int32_t y = (int32_t)((point >> 16) & 0xFFFF);
+#endif
     int w, h;
     screen_dims(&w, &h);
     if (x >= 0 && y >= 0 && x < w && y < h)
@@ -3629,10 +3676,10 @@ static WN_API uint64_t u32_MonitorFromPoint(uint64_t point, uint32_t flags)
     return (flags & 3) ? 1 : 0;
 }
 
-typedef WN_API int32_t (*mon_enum_cb)(uint64_t, uint64_t, const void *,
-                                      int64_t);
-static WN_API int32_t u32_EnumDisplayMonitors(uint64_t hdc, const void *clip,
-                                              mon_enum_cb cb, int64_t lparam)
+typedef WN_API int32_t (*mon_enum_cb)(wn_abiword, wn_abiword, const void *,
+                                      wn_abiword_s);
+static WN_API int32_t u32_EnumDisplayMonitors(wn_abiword hdc, const void *clip,
+                                              mon_enum_cb cb, wn_abiword_s lparam)
 {
     (void)hdc;
     (void)clip;
@@ -3678,7 +3725,7 @@ static WN_API int32_t u32_SetProcessDPIAware(void)
     return 1;   /* we render at native pixels; DPI-aware by construction */
 }
 
-static WN_API uint32_t u32_GetDpiForWindow(uint64_t hwnd)
+static WN_API uint32_t u32_GetDpiForWindow(wn_abiword hwnd)
 {
     (void)hwnd;
     return 96;   /* system DPI until per-monitor support lands */
@@ -3691,7 +3738,7 @@ static WN_API uint32_t u32_GetDpiForSystem(void)
 
 /* --- invalidation ------------------------------------------------------------ */
 
-static WN_API int32_t u32_InvalidateRect(uint64_t hwnd, const void *rect,
+static WN_API int32_t u32_InvalidateRect(wn_abiword hwnd, const void *rect,
                                          int32_t erase)
 {
     (void)erase;
@@ -3726,7 +3773,7 @@ static WN_API int32_t u32_InvalidateRect(uint64_t hwnd, const void *rect,
     return 1;
 }
 
-static WN_API int32_t u32_ValidateRect(uint64_t hwnd, const void *rect)
+static WN_API int32_t u32_ValidateRect(wn_abiword hwnd, const void *rect)
 {
     (void)rect;   /* precise validation: later; full-window for now */
     wn_window *w = hwnd ? win_from_hwnd(hwnd) : NULL;
@@ -3844,25 +3891,25 @@ static WN_API uint32_t u32_GetQueueStatus(uint32_t flags)
     return g_q_count ? (0x08 /*QS_POSTMESSAGE*/ | 0x40 /*QS_INPUT*/) : 0;
 }
 
-static WN_API int32_t u32_IsIconic(uint64_t hwnd)
+static WN_API int32_t u32_IsIconic(wn_abiword hwnd)
 {
     (void)hwnd;
     return 0;
 }
 
-static WN_API int32_t u32_IsZoomed(uint64_t hwnd)
+static WN_API int32_t u32_IsZoomed(wn_abiword hwnd)
 {
     (void)hwnd;
     return 0;
 }
 
-static WN_API int32_t u32_FlashWindow(uint64_t hwnd, int32_t invert)
+static WN_API int32_t u32_FlashWindow(wn_abiword hwnd, int32_t invert)
 {
     (void)hwnd; (void)invert;
     return 0;
 }
 
-static WN_API int32_t u32_SetForegroundWindow(uint64_t hwnd)
+static WN_API int32_t u32_SetForegroundWindow(wn_abiword hwnd)
 {
     if (!win_from_hwnd(hwnd))
         return 0;
@@ -3872,7 +3919,7 @@ static WN_API int32_t u32_SetForegroundWindow(uint64_t hwnd)
 
 /* WINDOWPLACEMENT x64: length@0 flags@4 showCmd@8 ptMin@0xC ptMax@0x14
  * rcNormal@0x1C — 44 bytes. */
-static WN_API int32_t u32_GetWindowPlacement(uint64_t hwnd, void *wp)
+static WN_API int32_t u32_GetWindowPlacement(wn_abiword hwnd, void *wp)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !wp)
@@ -3889,7 +3936,7 @@ static WN_API int32_t u32_GetWindowPlacement(uint64_t hwnd, void *wp)
     return 1;
 }
 
-static WN_API int32_t u32_SetWindowPlacement(uint64_t hwnd, const void *wp)
+static WN_API int32_t u32_SetWindowPlacement(wn_abiword hwnd, const void *wp)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w || !wp)
@@ -3903,13 +3950,13 @@ static WN_API int32_t u32_SetWindowPlacement(uint64_t hwnd, const void *wp)
 
 /* --- W-variant message APIs + dialog text ---------------------------------------- */
 
-static WN_API int32_t u32_PeekMessageW(void *out, uint64_t hwnd, uint32_t min,
+static WN_API int32_t u32_PeekMessageW(void *out, wn_abiword hwnd, uint32_t min,
                                        uint32_t max, uint32_t remove)
 {
     return u32_PeekMessageA(out, hwnd, min, max, remove);
 }
 
-static WN_API int32_t u32_GetMessageW(void *out, uint64_t hwnd, uint32_t min,
+static WN_API int32_t u32_GetMessageW(void *out, wn_abiword hwnd, uint32_t min,
                                       uint32_t max)
 {
     return u32_GetMessageA(out, hwnd, min, max);
@@ -3920,25 +3967,25 @@ static WN_API uint64_t u32_DispatchMessageW(const void *msg)
     return u32_DispatchMessageA(msg);
 }
 
-static WN_API uint64_t u32_DefWindowProcW(uint64_t hwnd, uint32_t msg,
-                                          uint64_t wp, int64_t lp)
+static WN_API uint64_t u32_DefWindowProcW(wn_abiword hwnd, uint32_t msg,
+                                          wn_abiword wp, wn_abiword_s lp)
 {
     return u32_DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-static WN_API uint64_t u32_SendMessageW(uint64_t hwnd, uint32_t msg,
-                                        uint64_t wp, int64_t lp)
+static WN_API uint64_t u32_SendMessageW(wn_abiword hwnd, uint32_t msg,
+                                        wn_abiword wp, wn_abiword_s lp)
 {
     return u32_SendMessageA(hwnd, msg, wp, lp);
 }
 
-static WN_API int32_t u32_PostMessageW(uint64_t hwnd, uint32_t msg,
-                                       uint64_t wp, int64_t lp)
+static WN_API int32_t u32_PostMessageW(wn_abiword hwnd, uint32_t msg,
+                                       wn_abiword wp, wn_abiword_s lp)
 {
     return u32_PostMessageA(hwnd, msg, wp, lp);
 }
 
-static WN_API int32_t u32_SetWindowTextW(uint64_t hwnd, const uint16_t *text)
+static WN_API int32_t u32_SetWindowTextW(wn_abiword hwnd, const uint16_t *text)
 {
     char *a = text ? wn_utf16_to_utf8(text, 4096) : NULL;
     int32_t r = u32_SetWindowTextA(hwnd, a ? a : "");
@@ -3946,7 +3993,7 @@ static WN_API int32_t u32_SetWindowTextW(uint64_t hwnd, const uint16_t *text)
     return r;
 }
 
-static WN_API int32_t u32_GetWindowTextW(uint64_t hwnd, uint16_t *buf,
+static WN_API int32_t u32_GetWindowTextW(wn_abiword hwnd, uint16_t *buf,
                                          int32_t max)
 {
     wn_window *w = win_from_hwnd(hwnd);
@@ -3961,7 +4008,7 @@ static WN_API int32_t u32_GetWindowTextW(uint64_t hwnd, uint16_t *buf,
     return (int32_t)i;
 }
 
-static WN_API int32_t u32_GetWindowTextLengthA(uint64_t hwnd)
+static WN_API int32_t u32_GetWindowTextLengthA(wn_abiword hwnd)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
@@ -3969,7 +4016,7 @@ static WN_API int32_t u32_GetWindowTextLengthA(uint64_t hwnd)
     return (int32_t)strlen(w->title);
 }
 
-static WN_API int32_t u32_GetWindowTextLengthW(uint64_t hwnd)
+static WN_API int32_t u32_GetWindowTextLengthW(wn_abiword hwnd)
 {
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
@@ -3980,7 +4027,7 @@ static WN_API int32_t u32_GetWindowTextLengthW(uint64_t hwnd)
     return (int32_t)n;
 }
 
-static WN_API int32_t u32_SetDlgItemTextW(uint64_t hwnd, int32_t id,
+static WN_API int32_t u32_SetDlgItemTextW(wn_abiword hwnd, int32_t id,
                                           const uint16_t *text)
 {
     uint64_t c = u32_GetDlgItem(hwnd, id);
@@ -3990,7 +4037,7 @@ static WN_API int32_t u32_SetDlgItemTextW(uint64_t hwnd, int32_t id,
                                      (int64_t)(uintptr_t)text);
 }
 
-static WN_API uint32_t u32_GetDlgItemTextA(uint64_t hdlg, int32_t id,
+static WN_API uint32_t u32_GetDlgItemTextA(wn_abiword hdlg, int32_t id,
                                            char *buf, uint32_t max)
 {
     uint64_t c = u32_GetDlgItem(hdlg, id);
@@ -4001,7 +4048,7 @@ static WN_API uint32_t u32_GetDlgItemTextA(uint64_t hdlg, int32_t id,
     return (uint32_t)r;
 }
 
-static WN_API uint32_t u32_GetDlgItemTextW(uint64_t hdlg, int32_t id,
+static WN_API uint32_t u32_GetDlgItemTextW(wn_abiword hdlg, int32_t id,
                                            uint16_t *buf, uint32_t max)
 {
     uint64_t c = u32_GetDlgItem(hdlg, id);
@@ -4022,9 +4069,9 @@ static WN_API uint32_t u32_GetDlgItemTextW(uint64_t hdlg, int32_t id,
     return (uint32_t)n;
 }
 
-static WN_API int64_t u32_SendDlgItemMessageA(uint64_t hdlg, int32_t id,
-                                              uint32_t msg, uint64_t wp,
-                                              int64_t lp)
+static WN_API int64_t u32_SendDlgItemMessageA(wn_abiword hdlg, int32_t id,
+                                              uint32_t msg, wn_abiword wp,
+                                              wn_abiword_s lp)
 {
     uint64_t c = u32_GetDlgItem(hdlg, id);
     if (!c)
@@ -4032,22 +4079,22 @@ static WN_API int64_t u32_SendDlgItemMessageA(uint64_t hdlg, int32_t id,
     return (int64_t)u32_SendMessageA(c, msg, wp, lp);
 }
 
-static WN_API int64_t u32_SendDlgItemMessageW(uint64_t hdlg, int32_t id,
-                                              uint32_t msg, uint64_t wp,
-                                              int64_t lp)
+static WN_API int64_t u32_SendDlgItemMessageW(wn_abiword hdlg, int32_t id,
+                                              uint32_t msg, wn_abiword wp,
+                                              wn_abiword_s lp)
 {
     return u32_SendDlgItemMessageA(hdlg, id, msg, wp, lp);
 }
 
-static WN_API int64_t u32_DefDlgProcA(uint64_t hwnd, uint32_t msg, uint64_t wp,
-                                      int64_t lp)
+static WN_API int64_t u32_DefDlgProcA(wn_abiword hwnd, uint32_t msg, wn_abiword wp,
+                                      wn_abiword_s lp)
 {
     /* our #32770 proc already implements DefDlgProc semantics; dialogs with
      * an explicit DefDlgProc call get the same behavior */
     return ctl_proc(hwnd, msg, wp, lp);
 }
 
-static WN_API int32_t u32_MessageBoxIndirectW(uint64_t hwnd, const void *params)
+static WN_API int32_t u32_MessageBoxIndirectW(wn_abiword hwnd, const void *params)
 {
     /* MSGBOXPARAMSW: cbSize@0, hwndOwner@8, hInstance@0x10, lpszText@0x18,
      * lpszCaption@0x20, dwStyle@0x28, ... */
@@ -4073,7 +4120,7 @@ static WN_API uint64_t u32_FindWindowA(const char *cls, const char *title)
     return 0;
 }
 
-static WN_API wn_handle u32_LoadImageA(uint64_t hinst, const char *name,
+static WN_API wn_handle u32_LoadImageA(wn_abiword hinst, const char *name,
                                        uint32_t type, int32_t cx, int32_t cy,
                                        uint32_t load)
 {
@@ -4102,7 +4149,7 @@ static struct {
     int count;        /* ShowCaret/HideCaret counter */
 } g_caret;
 
-static WN_API int32_t u32_CreateCaret(uint64_t hwnd, uint64_t bmp,
+static WN_API int32_t u32_CreateCaret(wn_abiword hwnd, wn_abiword bmp,
                                       int32_t w, int32_t h)
 {
     (void)bmp;
@@ -4121,7 +4168,7 @@ static WN_API int32_t u32_DestroyCaret(void)
     return 1;
 }
 
-static WN_API int32_t u32_ShowCaret(uint64_t hwnd)
+static WN_API int32_t u32_ShowCaret(wn_abiword hwnd)
 {
     if (g_caret.hwnd && hwnd && g_caret.hwnd != hwnd)
         return 0;
@@ -4130,7 +4177,7 @@ static WN_API int32_t u32_ShowCaret(uint64_t hwnd)
     return 1;
 }
 
-static WN_API int32_t u32_HideCaret(uint64_t hwnd)
+static WN_API int32_t u32_HideCaret(wn_abiword hwnd)
 {
     if (g_caret.hwnd && hwnd && g_caret.hwnd != hwnd)
         return 0;
@@ -4189,7 +4236,7 @@ static WN_API uint32_t u32_MsgWaitForMultipleObjects(uint32_t count,
 /* MessageBox: no dialog engine yet, so the box is PRINTED (loudly) and we
  * answer IDOK. This keeps apps running and makes their complaints visible
  * in the log - a deliberate diagnostic aid, not a fake window. */
-static WN_API int32_t u32_MessageBoxA(uint64_t hwnd, const char *text,
+static WN_API int32_t u32_MessageBoxA(wn_abiword hwnd, const char *text,
                                       const char *caption, uint32_t type)
 {
     (void)hwnd;
@@ -4199,7 +4246,7 @@ static WN_API int32_t u32_MessageBoxA(uint64_t hwnd, const char *text,
     return 1;   /* IDOK */
 }
 
-static WN_API int32_t u32_MessageBoxW(uint64_t hwnd, const uint16_t *text,
+static WN_API int32_t u32_MessageBoxW(wn_abiword hwnd, const uint16_t *text,
                                       const uint16_t *caption, uint32_t type)
 {
     (void)hwnd;
@@ -4219,6 +4266,85 @@ static WN_API int32_t u32_MessageBoxW(uint64_t hwnd, const uint16_t *text,
     free(t);
     free(c);
     return 1;   /* IDOK */
+}
+
+/* --- wsprintf family ---------------------------------------------------------- */
+
+/* user32's own printf: no size parameter by design (MSDN caps the output
+ * at 1024 chars); we hard-bound at 4 KiB and always NUL-terminate. %s
+ * follows the A/W direction, %S is the flip side; the engine is
+ * wn_vformat() (shared with msvcrt). No floating point per MSDN. */
+#define WN_WSPRINTF_CAP 4096
+
+static WN_CRTAPI int32_t u32_wsprintfA(char *dst, const char *fmt, ...)
+{
+    if (!dst)
+        return -1;
+    wn_ms_va ap;
+    WN_VA_START(ap, fmt);
+    int64_t r = wn_wsprintf_buf(dst, WN_WSPRINTF_CAP, fmt, (char *)ap, 0);
+    WN_VA_END(ap);
+    return (int32_t)r;
+}
+
+static WN_CRTAPI int32_t u32_wvsprintfA(char *dst, const char *fmt, char *ap)
+{
+    if (!dst)
+        return -1;
+    return (int32_t)wn_wsprintf_buf(dst, WN_WSPRINTF_CAP, fmt, ap, 0);
+}
+
+/* W side: convert the format to UTF-8, format with wide-direction args,
+ * convert the result back to UTF-16. */
+static int32_t wsprintf_w_impl(uint16_t *dst, const uint16_t *fmt, char *ap)
+{
+    *dst = 0;
+    if (!fmt)
+        return -1;
+    size_t l16 = 0;
+    while (fmt[l16])
+        l16++;
+    char *fmt8 = wn_utf16_to_utf8(fmt, l16);
+    if (!fmt8)
+        return -1;
+    char *buf = wn_xmalloc(WN_WSPRINTF_CAP);
+    int64_t r = wn_wsprintf_buf(buf, WN_WSPRINTF_CAP, fmt8, ap, 1);
+    free(fmt8);
+    if (r < 0) {
+        free(buf);
+        return -1;
+    }
+    uint16_t *w = wn_utf8_to_utf16(buf, NULL);
+    free(buf);
+    size_t n = 0;
+    if (w) {
+        while (w[n] && n < WN_WSPRINTF_CAP - 1) {
+            dst[n] = w[n];
+            n++;
+        }
+        free(w);
+    }
+    dst[n] = 0;
+    return (int32_t)n;
+}
+
+static WN_CRTAPI int32_t u32_wsprintfW(uint16_t *dst, const uint16_t *fmt, ...)
+{
+    if (!dst)
+        return -1;
+    wn_ms_va ap;
+    WN_VA_START(ap, fmt);
+    int32_t r = wsprintf_w_impl(dst, fmt, (char *)ap);
+    WN_VA_END(ap);
+    return r;
+}
+
+static WN_CRTAPI int32_t u32_wvsprintfW(uint16_t *dst, const uint16_t *fmt,
+                                     char *ap)
+{
+    if (!dst)
+        return -1;
+    return wsprintf_w_impl(dst, fmt, ap);
 }
 
 const wn_export_entry wn_user32_exports[] = {
@@ -4357,5 +4483,9 @@ const wn_export_entry wn_user32_exports[] = {
     { "HideCaret", u32_HideCaret },
     { "SetCaretPos", u32_SetCaretPos },
     { "MsgWaitForMultipleObjects", u32_MsgWaitForMultipleObjects },
+    { "wsprintfA", u32_wsprintfA },
+    { "wsprintfW", u32_wsprintfW },
+    { "wvsprintfA", u32_wvsprintfA },
+    { "wvsprintfW", u32_wvsprintfW },
     { NULL, NULL },
 };

@@ -26,7 +26,7 @@ static void profile_win_path(char *out, size_t cap)
     snprintf(out, cap, "%s/drive_c/users/%s", g_proc.prefix, user);
 }
 
-static WN_API int32_t ue_GetUserProfileDirectoryA(uint64_t token, char *buf,
+static WN_API int32_t ue_GetUserProfileDirectoryA(wn_abiword token, char *buf,
                                                   uint32_t *need)
 {
     (void)token;
@@ -44,7 +44,7 @@ static WN_API int32_t ue_GetUserProfileDirectoryA(uint64_t token, char *buf,
     return 1;
 }
 
-static WN_API int32_t ue_GetUserProfileDirectoryW(uint64_t token, uint16_t *buf,
+static WN_API int32_t ue_GetUserProfileDirectoryW(wn_abiword token, uint16_t *buf,
                                                   uint32_t *need)
 {
     (void)token;
@@ -72,7 +72,7 @@ static WN_API int32_t ue_GetUserProfileDirectoryW(uint64_t token, uint16_t *buf,
 /* Environment block: UTF-16 "NAME=value\0" entries, terminated by an extra
  * \0. We pass the host environment through (minus our own knobs) plus the
  * standard Windows paths. */
-static WN_API int32_t ue_CreateEnvironmentBlock(void **out, uint64_t token,
+static WN_API int32_t ue_CreateEnvironmentBlock(void **out, wn_abiword token,
                                                 int32_t inherit)
 {
     (void)token;
@@ -128,7 +128,7 @@ static WN_API void ue_DestroyEnvironmentBlock(void *env)
     free(env);
 }
 
-static WN_API int32_t ue_LoadUserProfileA(uint64_t token, void *lpi, void *out)
+static WN_API int32_t ue_LoadUserProfileA(wn_abiword token, void *lpi, void *out)
 {
     (void)token; (void)lpi; (void)out;
     wn_log(WN_LOG_WARN, "userenv: LoadUserProfileA not implemented -> FALSE");

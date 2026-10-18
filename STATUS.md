@@ -1,3 +1,83 @@
+## Date: 2026-10-18 (session 7)
+
+### 32-bit i386: FIRST REAL RUNS — qemu-i386 unlocked local execution
+
+The user's box aborted at TEB setup ("teb: modify_ldt failed: Success").
+That "Success" was the bug: **the kernel returns 0 for modify_ldt(func=1
+write), not the byte count** (byte counts are only for func=0 reads) —
+the check compared against sizeof(desc)=8, so a WORKING LDT install was
+misread as failure. One-line fix; verified against qemu-i386 + kernel
+source. His kernel was fine all along.
+
+Bigger unlock: **qemu-user (extracted to toolchain/qemu) can execute the
+i386 build here** even though the container seccomp kills native i386
+(SIGSYS) — `qemu-i386 -L toolchain/root32 bin/winnux32 run hello32.exe`
+is now the local 32-bit test loop (modify_ldt and %fs LDT hosting both
+pass through qemu). A local glibc32 sysroot was rebuilt from Debian debs
+(apt-get download + dpkg -x, no root) after the sandbox reset wiped
+session 6's copy; the mingw i686/x86_64 cross toolchains were re-extracted
+the same way.
+
+Then qemu found a bug class the 64-bit build could never show: **every
+builtin parameter typed uint64_t where Windows declares a pointer-width
+type (SIZE_T, WPARAM, LPARAM, HWND, callbacks...) skews the i386 guest
+stack** — on i386 all args are stack-passed, so GCC computed ret-N for
+16 bytes where mingw pushed 12, and read garbage upper dwords (HeapAlloc
+"size" 0x40D0516000000000 for a 128 ask). Session 6's "hello32 worked"
+was luck: the garbage slot happened to be small. Fixed systemically:
+
+- **wn_abiword/wn_abiword_s** (wn_types.h): 8B on x64 = zero change,
+  4B on i386. 203 builtin signatures converted across 18 DLL files
+  (mechanical pass + manual review; dbghelp's genuine DWORD64 params
+  excluded). thread_start_shim stays uint64_t — host-side contract.
+- **Guest MSG overlay**: fill_msg now writes the 28-byte i386 MSG (was
+  48-byte x64 shape — a frame smash on every GetMessage/PeekMessage);
+  DispatchMessage/IsDialogMessage read guest-shaped fields.
+- **Window-proc typedefs** (wn_wndclass.proc, dlgproc_fn, mon_enum_cb,
+  TIMERPROC) + RegisterClassA/W read the 40-byte i386 WNDCLASS.
+- **MSVC FILE stride is 32 bytes on i386** (48 on x64): mingw computes
+  stdout as _iob()+N*sizeof(FILE); the wrong stride landed mid-entry,
+  failed the magic check, and every fwrite silently no-ops — 32-bit
+  printf output vanished. Fixed.
+- MonitorFromPoint: POINT by value packs (y<<16|x) on i386, (lo=x,hi=y)
+  in one register on x64.
+
+New exports that real 32-bit apps hit immediately (all found by qemu):
+**GetVersion** (10.0.19045, bit31 clear like NT), **GetVersionExW**
+(OSVERSIONINFOW=276/EXW=284), **wsprintfA/W + wvsprintfA/W** (the shared
+printf engine gained a wide-mode: %s follows the A/W direction, %S flips,
+%ls/%hs override; the whole wsprintf family is cdecl, NOT stdcall —
+varargs can't be stdcall), **_onexit** (returns fn on success per MSVC
+contract — mingw CRT registers its cleanup through it), **localtime/
+_localtime32/_localtime64/gmtime** (guest-shaped 36-byte MSVC struct tm,
+NOT glibc's), **qsort** (in-tree heapsort — the comparator is guest code,
+called through a WN_CRTAPI fn-ptr so the convention is right on both
+arches; host libc qsort would call it SysV), **_strupr/_strlwr**.
+
+Also: the Makefile had **no rule to create obj32/**, so a fresh clone
+failed `make winnux32` with "No rule to make target 'obj32/...'" (the
+order-only prereq was unsatisfiable — make rejects the whole pattern);
+the user's box worked only because of leftover dirs. Plus the sysroot
+mode now re-adds /usr/include/x86_64-linux-gnu to the -m32 chain
+(glibc's bits/ headers are bi-arch; wordsize.h dispatches on __x86_64__)
+and auto-detects the gcc version dir.
+
+**Verification**: hello32 (CRT startup, WriteFile, GetCommandLineA,
+ExitProcess(42) → exit 42), heap32 (HeapAlloc), torture32 (printf
+width/precision/floats, malloc family, strdup/strcat/strupr, strtol,
+qsort with guest callbacks, fopen/fwrite/fread/fseek/ftell/remove,
+argv+env, time/localtime) — all pass under qemu with ZERO stub calls,
+and `winnux run 32bit.exe -e args...` forwards guest argv through the
+re-exec. The 64-bit suite: **15/15 PASS** (wn_abiword is uint64_t there,
+so the width pass is a semantic no-op by construction).
+
+Honest limits: 32-bit GUI beyond the MSG path is still x64-shaped
+(TVITEM/DRAWITEMSTRUCT/NMTREEVIEW, WNDCLASSEX other fields); classic
+msvcrt time-t-through-pointer (time(&t)) writes 8 bytes on a mingw
+i386 guest's 4-byte slot — fine for mingw (64-bit time_t), legacy MSVC
+i386 exes would need a 32-bit variant; stub arity metadata for stdcall
+i386 still open (see TODO P0.3).
+
 ## Date: 2026-10-18 (session 6)
 
 ### The PuTTY config box is now the REAL dialog

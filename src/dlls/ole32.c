@@ -56,14 +56,14 @@ static WN_API int32_t ole_CoGetCurrentProcess(void)
 
 /* --- task allocator: plain malloc (documented) -------------------------------- */
 
-static WN_API void *ole_CoTaskMemAlloc(uint64_t size)
+static WN_API void *ole_CoTaskMemAlloc(wn_abiword size)
 {
     if (size == 0)
         return NULL;
     return malloc((size_t)size);
 }
 
-static WN_API void *ole_CoTaskMemRealloc(void *p, uint64_t size)
+static WN_API void *ole_CoTaskMemRealloc(void *p, wn_abiword size)
 {
     if (size == 0) {
         free(p);

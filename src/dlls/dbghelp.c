@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 
-static WN_API int32_t db_SymInitialize(uint64_t h, const char *path,
+static WN_API int32_t db_SymInitialize(wn_abiword h, const char *path,
                                        int32_t invade)
 {
     (void)path; (void)invade;
@@ -20,13 +20,13 @@ static WN_API int32_t db_SymInitialize(uint64_t h, const char *path,
     return 1;
 }
 
-static WN_API int32_t db_SymCleanup(uint64_t h)
+static WN_API int32_t db_SymCleanup(wn_abiword h)
 {
     (void)h;
     return 1;
 }
 
-static WN_API uint64_t db_SymLoadModule64(uint64_t h, uint64_t file,
+static WN_API uint64_t db_SymLoadModule64(wn_abiword h, wn_abiword file,
                                           const char *name, const char *path,
                                           uint64_t base, uint32_t size)
 {
@@ -36,7 +36,7 @@ static WN_API uint64_t db_SymLoadModule64(uint64_t h, uint64_t file,
     return 0;
 }
 
-static WN_API int32_t db_SymGetSymFromName(uint64_t h, const char *name,
+static WN_API int32_t db_SymGetSymFromName(wn_abiword h, const char *name,
                                            void *sym)
 {
     (void)h; (void)name; (void)sym;
@@ -44,7 +44,7 @@ static WN_API int32_t db_SymGetSymFromName(uint64_t h, const char *name,
     return 0;
 }
 
-static WN_API int32_t db_SymFromAddr(uint64_t h, uint64_t addr, uint64_t *disp,
+static WN_API int32_t db_SymFromAddr(wn_abiword h, uint64_t addr, uint64_t *disp,
                                      void *sym)
 {
     (void)h; (void)addr; (void)disp; (void)sym;
@@ -52,8 +52,8 @@ static WN_API int32_t db_SymFromAddr(uint64_t h, uint64_t addr, uint64_t *disp,
     return 0;
 }
 
-static WN_API int32_t db_StackWalk64(uint32_t machine, uint64_t h,
-                                     uint64_t thread, void *ctx, void *frame,
+static WN_API int32_t db_StackWalk64(uint32_t machine, wn_abiword h,
+                                     wn_abiword thread, void *ctx, void *frame,
                                      void *proc, void *fn, void *mod,
                                      void *data)
 {
@@ -63,8 +63,8 @@ static WN_API int32_t db_StackWalk64(uint32_t machine, uint64_t h,
     return 0;
 }
 
-static WN_API int32_t db_MiniDumpWriteDump(uint64_t h, uint32_t pid,
-                                           uint64_t file, uint32_t type,
+static WN_API int32_t db_MiniDumpWriteDump(wn_abiword h, uint32_t pid,
+                                           wn_abiword file, uint32_t type,
                                            void *exc, void *cb, void *param)
 {
     (void)h; (void)pid; (void)file; (void)type; (void)exc; (void)cb; (void)param;

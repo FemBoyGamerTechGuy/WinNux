@@ -332,7 +332,7 @@ static WN_API int32_t k32_TlsFree(uint32_t idx);
 static WN_API void *k32_TlsGetValue(uint32_t idx);
 static WN_API int32_t k32_TlsSetValue(uint32_t idx, void *v);
 
-static WN_API uint32_t k32_FlsAlloc(uint64_t callback)
+static WN_API uint32_t k32_FlsAlloc(wn_abiword callback)
 {
     uint32_t idx = k32_TlsAlloc();
     if (idx == 0xFFFFFFFFu)
@@ -828,7 +828,7 @@ extern int   wn_virtual_free(void *addr, uint64_t size, uint32_t type);
 extern int   wn_virtual_protect(void *addr, uint64_t size, uint32_t newprot, uint32_t *old);
 extern int   wn_virtual_query(void *addr, void *mbi);
 
-static WN_API void *k32_VirtualAlloc(void *addr, uint64_t size, uint32_t type,
+static WN_API void *k32_VirtualAlloc(void *addr, wn_abiword size, uint32_t type,
                                      uint32_t prot)
 {
     void *p = wn_virtual_alloc(addr, size, type, prot);
@@ -837,7 +837,7 @@ static WN_API void *k32_VirtualAlloc(void *addr, uint64_t size, uint32_t type,
     return p;
 }
 
-static WN_API int32_t k32_VirtualFree(void *addr, uint64_t size, uint32_t type)
+static WN_API int32_t k32_VirtualFree(void *addr, wn_abiword size, uint32_t type)
 {
     if (!wn_virtual_free(addr, size, type)) {
         wn_last_error_set(WN_ERR_INVALID_PARAMETER);
@@ -846,7 +846,7 @@ static WN_API int32_t k32_VirtualFree(void *addr, uint64_t size, uint32_t type)
     return 1;
 }
 
-static WN_API int32_t k32_VirtualProtect(void *addr, uint64_t size, uint32_t prot,
+static WN_API int32_t k32_VirtualProtect(void *addr, wn_abiword size, uint32_t prot,
                                          uint32_t *old)
 {
     uint32_t o = 0;
@@ -869,7 +869,7 @@ static WN_API wn_handle k32_GetProcessHeap(void)
     return g_proc.process_heap;
 }
 
-static WN_API void *k32_HeapAlloc(wn_handle heap, uint32_t flags, uint64_t size)
+static WN_API void *k32_HeapAlloc(wn_handle heap, uint32_t flags, wn_abiword size)
 {
     (void)heap;
     if (size > 0x7FFFFFFF) {
@@ -884,7 +884,7 @@ static WN_API void *k32_HeapAlloc(wn_handle heap, uint32_t flags, uint64_t size)
 }
 
 static WN_API void *k32_HeapReAlloc(wn_handle heap, uint32_t flags, void *ptr,
-                                    uint64_t size)
+                                    wn_abiword size)
 {
     (void)heap;
     if (size > 0x7FFFFFFF) {
@@ -908,7 +908,7 @@ static WN_API int32_t k32_HeapFree(wn_handle heap, uint32_t flags, void *ptr)
     return 1;
 }
 
-static WN_API wn_handle k32_HeapCreate(uint32_t flags, uint64_t init, uint64_t max)
+static WN_API wn_handle k32_HeapCreate(uint32_t flags, wn_abiword init, wn_abiword max)
 {
     (void)flags;
     (void)init;
@@ -923,7 +923,7 @@ static WN_API int32_t k32_HeapDestroy(wn_handle h)
 }
 
 /* Global/Local: fixed allocations only (documented limitation). */
-static WN_API void *k32_GlobalAlloc(uint32_t flags, uint64_t size)
+static WN_API void *k32_GlobalAlloc(uint32_t flags, wn_abiword size)
 {
     void *p = (flags & 0x40 /* GMEM_ZEROINIT */) ? calloc(1, (size_t)size)
                                                  : malloc((size_t)size);
@@ -954,7 +954,7 @@ static WN_API wn_handle k32_GlobalFree(wn_handle h)
     return 0;
 }
 
-static WN_API void *k32_LocalAlloc(uint32_t flags, uint64_t size)
+static WN_API void *k32_LocalAlloc(uint32_t flags, wn_abiword size)
 {
     return k32_GlobalAlloc(flags, size);
 }
@@ -2303,7 +2303,7 @@ static WN_API int32_t k32_SetThreadPriority(wn_handle h, int32_t prio)
     return 1;   /* accepted; host scheduling unaffected (documented) */
 }
 
-static WN_API uint32_t k32_SetThreadAffinityMask(wn_handle h, uint64_t mask)
+static WN_API uint32_t k32_SetThreadAffinityMask(wn_handle h, wn_abiword mask)
 {
     (void)h;
     (void)mask;
@@ -2323,6 +2323,33 @@ static WN_API void k32_GetSystemInfo(void *si)
     *(uint32_t *)(p + 32) = g_proc.peb->number_of_processors;
     *(uint32_t *)(p + 36) = 8664;      /* PROCESSOR_AMD_X8664 */
     *(uint32_t *)(p + 40) = 0x10000;   /* allocation granularity */
+}
+
+static WN_API uint32_t k32_GetVersion(void)
+{
+    /* DWORD layout: build<<16 | minor<<8 | major. NT never sets bit 31
+     * (that was the Win9x platform flag). Matches GetVersionExA: 10.0
+     * build 19045. */
+    return (19045u << 16) | (0u << 8) | 10u;
+}
+
+static WN_API int32_t k32_GetVersionExW(void *vi)
+{
+    /* OSVERSIONINFOW: 276 bytes, OSVERSIONINFOEXW: 284 (same fields as A
+     * but szCSDVersion is 128 UTF-16 units). */
+    uint32_t cb = *(uint32_t *)vi;
+    if (cb != 276 && cb != 284) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    memset(vi, 0, cb);
+    *(uint32_t *)vi = cb;
+    uint8_t *p = vi;
+    *(uint32_t *)(p + 4) = 10;     /* major */
+    *(uint32_t *)(p + 8) = 0;      /* minor */
+    *(uint32_t *)(p + 12) = 19045; /* build */
+    *(uint32_t *)(p + 16) = 2;     /* VER_PLATFORM_WIN32_NT */
+    return 1;
 }
 
 static WN_API int32_t k32_GetVersionExA(void *vi)
@@ -2517,7 +2544,7 @@ WN_API uint64_t k32_FindResourceA(uint64_t hmod, const char *name,
     }
 }
 
-static WN_API uint64_t k32_LoadResource(uint64_t hmod, uint64_t hres)
+static WN_API uint64_t k32_LoadResource(wn_abiword hmod, wn_abiword hres)
 {
     (void)hmod;
     wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
@@ -2541,7 +2568,7 @@ WN_API void *k32_LockResource(uint64_t hres)
     return p;
 }
 
-static WN_API uint32_t k32_SizeofResource(uint64_t hmod, uint64_t hres)
+static WN_API uint32_t k32_SizeofResource(wn_abiword hmod, wn_abiword hres)
 {
     (void)hmod;
     wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
@@ -2607,7 +2634,7 @@ static WN_API int32_t k32_DuplicateHandle(wn_handle src_proc, wn_handle src,
 static uint64_t g_ctrl_handlers[16];
 static int32_t g_ctrl_handler_count;
 
-static WN_API int32_t k32_SetConsoleCtrlHandler(uint64_t handler, int32_t add)
+static WN_API int32_t k32_SetConsoleCtrlHandler(wn_abiword handler, int32_t add)
 {
     if (!add) {
         for (int i = 0; i < g_ctrl_handler_count; i++)
@@ -2697,7 +2724,9 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "GetTempPathA", k32_GetTempPathA },
     { "GetTickCount", k32_GetTickCount },
     { "GetTickCount64", k32_GetTickCount64 },
+    { "GetVersion", k32_GetVersion },
     { "GetVersionExA", k32_GetVersionExA },
+    { "GetVersionExW", k32_GetVersionExW },
     { "GetVolumeInformationA", k32_GetVolumeInformationA },
     { "GlobalAlloc", k32_GlobalAlloc },
     { "GlobalFree", k32_GlobalFree },

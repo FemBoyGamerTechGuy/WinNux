@@ -3,23 +3,32 @@
 Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
-## P0 — 32-bit (i386) runtime bring-up (user priority, next session)
+## P0 — 32-bit (i386): real-hardware bring-up (user priority)
 
-1. **Run 7zr.exe on the user's Arch box**: `make winn32` — no:
-   `make winnux32 && ./bin/winnux run 7zr.exe`. The loader, build, and
-   re-exec are all in place (session 6); runtime debugging needs a kernel
-   that allows i386 syscalls (the dev container's seccomp does not).
-   Likely first bugs: mingw CRT startup edge cases, printf/heap details,
-   handle-table 32-bit truncation. Also test the mingw-built hello32.exe
-   (50/50 imports clean) and LuaForWindows_v5.1.5-52.exe (NSIS installer
-   — needs more DLL coverage: setupapi/RichEdit).
-2. **32-bit GUI structures**: MSG/TVITEM/DRAWITEMSTRUCT/NMTREEVIEW/
-   DLGTEMPLATE32 are still x64-shaped; guard or dual-layout them.
-   (i386 GUI = after 7zr/console-class apps work.)
+Console-class PE32 now runs end-to-end (session 7: modify_ldt check,
+wn_abiword width pass, FILE stride, MSG overlay, wsprintf/onexit/
+localtime/qsort — all qemu-verified, 64-bit 15/15). Next:
+
+1. **User's Arch box validation**: `make winnux32 && ./bin/winnux run
+   LuaForWindows_v5.1.5-52.exe -e 'print(1+2*3, ("win"):upper())'` —
+   qemu passed hello32/heap32/torture32, but the user's box is the
+   ground truth (his kernel + real apps). 7zr.exe (console) is the
+   next-best candidate. NSIS installer GUI = P0.2 territory.
+2. **32-bit GUI structures beyond MSG**: TVITEM/DRAWITEMSTRUCT/
+   NMTREEVIEW/WINDOWPLACEMENT + WNDCLASSEX remaining fields are still
+   x64-shaped. Fill_msg/RegisterClass/Dispatch/IsDialogMessage/proc
+   typedefs are done; the rest of the dialog+control read paths need
+   the same dual-layout treatment (pattern: wn_abiword + arch #if).
+   ALSO: 32-bit X11 for local GUI testing — extract libx11-6:i386 +
+   deps into toolchain/root32 (apt-get download by pool URL), then
+   qemu can run 32-bit GUI apps.
 3. **Stub arg-count metadata for stdcall i386**: unimplemented imports
    leak the caller's arg frame (real exports are fine — their convention
    is compiled in). A per-export arity table for the top ~50 stubs
-   covers the rest.
+   covers the rest. Evidence: stub trace in torture32 pre-fix.
+4. **time_t width on i386**: time(&t)/ctime with legacy MSVC i386
+   time_t (4 bytes) writes 8 — mingw (64-bit time_t) is fine; add
+   _time32 variants if a real app needs them.
 
 ## P1 — make PuTTY OPEN an SSH session
 
@@ -47,8 +56,9 @@ put it here. Never silently drop items; move them to STATUS.md when done.
 
 ## P3 — breadth
 
-13. msvcrt gaps: _beginthreadex (7zr), signal/raise, _onexit/__dllonexit,
-    _XcptFilter, _except_handler3 (32-bit), qsort stability nuances.
+13. msvcrt gaps: _beginthreadex (7zr), signal/raise, __dllonexit,
+    _XcptFilter, _except_handler3 (32-bit). (_onexit, qsort, strupr/
+    strlwr, localtime/gmtime family landed in session 7.)
 14. ws2_32: getaddrinfo/getnameinfo (AI), WSAAsyncSelect via window
     messages.
 15. wininet/winhttp REAL over ws2_32 (curl.exe test app).

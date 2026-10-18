@@ -39,13 +39,13 @@ static WN_API void *ni_InternetOpenW(const uint16_t *agent, uint32_t type,
     return NULL;
 }
 
-static WN_API int32_t ni_InternetCloseHandle(uint64_t h)
+static WN_API int32_t ni_InternetCloseHandle(wn_abiword h)
 {
     (void)h;
     return 0;
 }
 
-static WN_API void *ni_InternetConnectA(uint64_t h, const char *server,
+static WN_API void *ni_InternetConnectA(wn_abiword h, const char *server,
                                         uint32_t port, const char *user,
                                         const char *pass, uint32_t service,
                                         uint32_t flags, uint64_t ctx)
@@ -56,7 +56,7 @@ static WN_API void *ni_InternetConnectA(uint64_t h, const char *server,
     return NULL;
 }
 
-static WN_API void *ni_HttpOpenRequestA(uint64_t h, const char *verb,
+static WN_API void *ni_HttpOpenRequestA(wn_abiword h, const char *verb,
                                         const char *obj, const char *ver,
                                         const char *ref, const char **types,
                                         uint32_t flags, uint64_t ctx)
@@ -67,7 +67,7 @@ static WN_API void *ni_HttpOpenRequestA(uint64_t h, const char *verb,
     return NULL;
 }
 
-static WN_API int32_t ni_InternetReadFile(uint64_t h, void *buf, uint32_t want,
+static WN_API int32_t ni_InternetReadFile(wn_abiword h, void *buf, uint32_t want,
                                           uint32_t *got)
 {
     (void)h; (void)buf; (void)want;
@@ -105,13 +105,13 @@ static WN_API void *nh_WinHttpOpen(void)
     return NULL;
 }
 
-static WN_API int32_t nh_WinHttpCloseHandle(uint64_t h)
+static WN_API int32_t nh_WinHttpCloseHandle(wn_abiword h)
 {
     (void)h;
     return 0;
 }
 
-static WN_API void *nh_WinHttpConnect(uint64_t h, const uint16_t *server,
+static WN_API void *nh_WinHttpConnect(wn_abiword h, const uint16_t *server,
                                       uint32_t port, uint32_t rsv)
 {
     (void)h; (void)server; (void)port; (void)rsv;
@@ -128,7 +128,7 @@ const wn_export_entry wn_winhttp_exports[] = {
 
 /* --- mswsock ------------------------------------------------------------------ */
 
-static WN_API int32_t ms_WSAAsyncSelect(uint64_t sock, uint64_t hwnd,
+static WN_API int32_t ms_WSAAsyncSelect(wn_abiword sock, wn_abiword hwnd,
                                         uint32_t msg, uint32_t events)
 {
     (void)sock; (void)hwnd; (void)msg; (void)events;

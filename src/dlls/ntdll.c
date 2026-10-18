@@ -40,7 +40,7 @@ static WN_API void nt_RtlDeleteCriticalSection(wn_critsect *cs)
     wn_critsect_delete(cs);
 }
 
-static WN_API uint64_t nt_RtlAllocateHeap(uint64_t heap, uint32_t flags, uint64_t size)
+static WN_API uint64_t nt_RtlAllocateHeap(uint64_t heap, uint32_t flags, wn_abiword size)
 {
     (void)heap;
     void *p = (flags & 8) ? calloc(1, (size_t)size) : malloc((size_t)size);
@@ -80,13 +80,13 @@ static WN_API void *nt_RtlAddVectoredContinueHandler(uint32_t first, void *handl
     return wn_seh_veh_add(handler, (int)first);
 }
 
-static WN_API uint64_t nt_RtlFillMemory(void *dst, uint64_t n, uint8_t c)
+static WN_API uint64_t nt_RtlFillMemory(void *dst, wn_abiword n, uint8_t c)
 {
     memset(dst, c, (size_t)n);
     return (uint64_t)(uintptr_t)dst;
 }
 
-static WN_API uint64_t nt_RtlZeroMemory(void *dst, uint64_t n)
+static WN_API uint64_t nt_RtlZeroMemory(void *dst, wn_abiword n)
 {
     memset(dst, 0, (size_t)n);
     return (uint64_t)(uintptr_t)dst;

@@ -191,8 +191,8 @@ static int sh_folder_path(uint32_t csidl, int wide, void *out, size_t out_cap)
     return 0;
 }
 
-static WN_API int32_t sh_SHGetFolderPathA(uint64_t hwnd, uint32_t csidl,
-                                          uint64_t token, uint32_t flags,
+static WN_API int32_t sh_SHGetFolderPathA(wn_abiword hwnd, uint32_t csidl,
+                                          wn_abiword token, uint32_t flags,
                                           char *path)
 {
     (void)hwnd; (void)token; (void)flags;
@@ -201,8 +201,8 @@ static WN_API int32_t sh_SHGetFolderPathA(uint64_t hwnd, uint32_t csidl,
     return sh_folder_path(csidl, 0, path, 260) == 0 ? 0 : -2147467259;
 }
 
-static WN_API int32_t sh_SHGetFolderPathW(uint64_t hwnd, uint32_t csidl,
-                                          uint64_t token, uint32_t flags,
+static WN_API int32_t sh_SHGetFolderPathW(wn_abiword hwnd, uint32_t csidl,
+                                          wn_abiword token, uint32_t flags,
                                           uint16_t *path)
 {
     (void)hwnd; (void)token; (void)flags;
@@ -211,7 +211,7 @@ static WN_API int32_t sh_SHGetFolderPathW(uint64_t hwnd, uint32_t csidl,
     return sh_folder_path(csidl, 1, path, 520) == 0 ? 0 : -2147467259;
 }
 
-static WN_API int32_t sh_SHGetSpecialFolderPathA(uint64_t hwnd, char *path,
+static WN_API int32_t sh_SHGetSpecialFolderPathA(wn_abiword hwnd, char *path,
                                                  uint32_t csidl, int32_t create)
 {
     (void)hwnd;
@@ -221,7 +221,7 @@ static WN_API int32_t sh_SHGetSpecialFolderPathA(uint64_t hwnd, char *path,
                           path, 260) == 0;
 }
 
-static WN_API int32_t sh_SHGetSpecialFolderPathW(uint64_t hwnd, uint16_t *path,
+static WN_API int32_t sh_SHGetSpecialFolderPathW(wn_abiword hwnd, uint16_t *path,
                                                  uint32_t csidl, int32_t create)
 {
     (void)hwnd;
@@ -349,7 +349,7 @@ static uintptr_t sh_execute_core(const char *verb, const char *file,
     return r;
 }
 
-static WN_API uint64_t sh_ShellExecuteA(uint64_t hwnd, const char *verb,
+static WN_API uint64_t sh_ShellExecuteA(wn_abiword hwnd, const char *verb,
                                         const char *file, const char *params,
                                         const char *dir, int32_t show)
 {
@@ -357,7 +357,7 @@ static WN_API uint64_t sh_ShellExecuteA(uint64_t hwnd, const char *verb,
     return (uint64_t)sh_execute_core(verb, file, params, dir);
 }
 
-static WN_API uint64_t sh_ShellExecuteW(uint64_t hwnd, const uint16_t *verb,
+static WN_API uint64_t sh_ShellExecuteW(wn_abiword hwnd, const uint16_t *verb,
                                         const uint16_t *file,
                                         const uint16_t *params,
                                         const uint16_t *dir, int32_t show)

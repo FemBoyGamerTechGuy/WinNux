@@ -12,6 +12,7 @@
 #include "wn_log.h"
 #include "wn_util.h"
 #include "wn_path.h"
+#include "wn_format.h"
 #include <fcntl.h>
 
 #include <ctype.h>
@@ -35,7 +36,15 @@ static char **g_initenv_ptr;          /* __initenv */
  * sizeof(FILE) == 48 on x64 — the shells MUST match that stride, and
  * fopen-returned FILEs carry a magic so we can validate guest pointers. */
 #define WN_MS_FILE_MAGIC 0x574E4646u   /* 'WNFF' */
+/* MSVC struct _iobuf: 48 bytes on x64, 32 on i386 (8 fields x 4). Guest
+ * CRTs compute stdout as __iob_func() + N * sizeof(FILE) — a wrong stride
+ * lands mid-entry, fails the magic check, and every fwrite silently
+ * no-ops (32-bit printf output vanished this way). */
+#if defined(__x86_64__)
 #define WN_MS_FILE_SIZE  48
+#else
+#define WN_MS_FILE_SIZE  32
+#endif
 
 typedef struct wn_ms_file {
     uint32_t magic;
@@ -90,38 +99,38 @@ static WN_CRTAPI int *ms__errno(void)
 
 /* --- alloc (map to host malloc; guest owns) ---------------------------------------- */
 
-static WN_CRTAPI void *ms_malloc(uint64_t n) { return malloc((size_t)n); }
-static WN_CRTAPI void *ms_calloc(uint64_t n, uint64_t sz) { return calloc((size_t)n, (size_t)sz); }
-static WN_CRTAPI void *ms_realloc(void *p, uint64_t n) { return realloc(p, (size_t)n); }
+static WN_CRTAPI void *ms_malloc(wn_abiword n) { return malloc((size_t)n); }
+static WN_CRTAPI void *ms_calloc(wn_abiword n, wn_abiword sz) { return calloc((size_t)n, (size_t)sz); }
+static WN_CRTAPI void *ms_realloc(void *p, wn_abiword n) { return realloc(p, (size_t)n); }
 static WN_CRTAPI void ms_free(void *p) { free(p); }
 
 /* --- strings (forward to libc; ms_abi wrappers) ------------------------------------- */
 
-static WN_CRTAPI uint64_t ms_memcpy(void *d, const void *s, uint64_t n)
+static WN_CRTAPI uint64_t ms_memcpy(void *d, const void *s, wn_abiword n)
 {
     return (uint64_t)(uintptr_t)memcpy(d, s, (size_t)n);
 }
-static WN_CRTAPI uint64_t ms_memset(void *d, int32_t c, uint64_t n)
+static WN_CRTAPI uint64_t ms_memset(void *d, int32_t c, wn_abiword n)
 {
     return (uint64_t)(uintptr_t)memset(d, c, (size_t)n);
 }
-static WN_CRTAPI int32_t ms_memcmp(const void *a, const void *b, uint64_t n)
+static WN_CRTAPI int32_t ms_memcmp(const void *a, const void *b, wn_abiword n)
 {
     return memcmp(a, b, (size_t)n) > 0 ? 1 : memcmp(a, b, (size_t)n) < 0 ? -1 : 0;
 }
-static WN_CRTAPI uint64_t ms_memmove(void *d, const void *s, uint64_t n)
+static WN_CRTAPI uint64_t ms_memmove(void *d, const void *s, wn_abiword n)
 {
     return (uint64_t)(uintptr_t)memmove(d, s, (size_t)n);
 }
 static WN_CRTAPI int64_t ms_strlen(const char *s) { return (int64_t)strlen(s); }
 static WN_CRTAPI int32_t ms_strcmp(const char *a, const char *b) { return strcmp(a, b); }
-static WN_CRTAPI int32_t ms_strncmp(const char *a, const char *b, uint64_t n)
+static WN_CRTAPI int32_t ms_strncmp(const char *a, const char *b, wn_abiword n)
 {
     int r = strncmp(a, b, (size_t)n);
     return (r > 0) - (r < 0);
 }
 static WN_CRTAPI char *ms_strcpy(char *d, const char *s) { return strcpy(d, s); }
-static WN_CRTAPI char *ms_strncpy(char *d, const char *s, uint64_t n)
+static WN_CRTAPI char *ms_strncpy(char *d, const char *s, wn_abiword n)
 {
     return strncpy(d, s, (size_t)n);
 }
@@ -148,7 +157,7 @@ static WN_CRTAPI int32_t ms_stricmp(const char *a, const char *b)
 {
     return strcasecmp(a, b) > 0 ? 1 : strcasecmp(a, b) < 0 ? -1 : 0;
 }
-static WN_CRTAPI int32_t ms_strnicmp(const char *a, const char *b, uint64_t n)
+static WN_CRTAPI int32_t ms_strnicmp(const char *a, const char *b, wn_abiword n)
 {
     return strncasecmp(a, b, (size_t)n) > 0 ? 1 : strncasecmp(a, b, (size_t)n) < 0 ? -1 : 0;
 }
@@ -163,7 +172,7 @@ static WN_CRTAPI int64_t ms_wcslen(const uint16_t *s)
     return n;
 }
 
-static WN_CRTAPI int32_t ms_setvbuf(wn_ms_file *f, char *buf, int32_t mode, uint64_t size)
+static WN_CRTAPI int32_t ms_setvbuf(wn_ms_file *f, char *buf, int32_t mode, wn_abiword size)
 {
     (void)buf;
     (void)mode;
@@ -205,7 +214,7 @@ static WN_CRTAPI uint64_t ms_strtoul(const char *s, char **e, int32_t b)
     return strtoul(s, e, b);
 }
 static WN_CRTAPI double ms_strtod(const char *s, char **e) { return strtod(s, e); }
-static WN_CRTAPI int64_t ms_abs(int64_t v) { return v < 0 ? -v : v; }
+static WN_CRTAPI int64_t ms_abs(wn_abiword_s v) { return v < 0 ? -v : v; }
 static WN_CRTAPI double ms_fabs(double v) { return fabs(v); }
 
 /* Helper: resolve a to-be-created file (parent must exist). */
@@ -248,6 +257,15 @@ static WN_CRTAPI void ms_abort(void)
 static WN_CRTAPI int32_t ms_atexit(void (*fn)(void))
 {
     return wn_process_atexit(fn) ? 0 : -1;
+}
+
+/* CRT _onexit: returns the function pointer on success, NULL when the
+ * table is full (MSVC contract); the function runs at process exit. */
+static WN_CRTAPI void *ms__onexit(void (*fn)(void))
+{
+    if (!fn)
+        return NULL;
+    return wn_process_atexit(fn) ? (void *)(uintptr_t)fn : NULL;
 }
 
 static WN_CRTAPI void ms__cexit(void)
@@ -390,14 +408,11 @@ void wn_ms_set_args(int argc, char **argv)
 
 typedef void (*emit_fn)(void *ctx, const char *data, size_t n);
 
-struct emit_buf {
-    char *p;
-    size_t left;
-};
-
-static void emit_to_buf(void *ctx, const char *data, size_t n)
+/* Public bounded-buffer emitter (declared in wn_format.h): writes at most
+ * left-1 bytes, always NUL-terminates, stops consuming once full. */
+void wn_emit_to_buf(void *ctx, const char *data, size_t n)
 {
-    struct emit_buf *b = ctx;
+    struct wn_emit_buf *b = ctx;
     if (b->left == 0)
         return;
     size_t c = n < b->left ? n : b->left - 1;
@@ -490,8 +505,10 @@ static double ms_next_double(void **app)
 #endif
 }
 
-/* Core formatter. Returns 0 on success (like vfprintf) or -1. */
-static int vformat_core(emit_fn emit, void *ctx, const char *fmt, char **ap)
+/* Core formatter (shared with user32 wsprintf — see wn_format.h).
+ * Returns 0 on success (like vfprintf) or -1. */
+int wn_vformat(wn_emit_fn emit, void *ctx, const char *fmt, char **ap,
+               int wide)
 {
     const char *p = fmt;
     char tmp[512];
@@ -554,16 +571,51 @@ static int vformat_core(emit_fn emit, void *ctx, const char *fmt, char **ap)
         case '%':
             emit(ctx, "%", 1);
             continue;
-        case 'c': {
+        case 'c':
+        case 'C': {
             int c = (int)ms_next((void **)ap);
-            char cc = (char)c;
-            emit(ctx, &cc, 1);
+            int this_wide = (conv == 'c') ? wide : !wide;
+            if (lng == 1) this_wide = 1;        /* %lc always wide   */
+            else if (lng == 4) this_wide = 0;   /* %hc always narrow */
+            if (this_wide) {
+                uint16_t wc[2] = { (uint16_t)c, 0 };
+                char *u8 = wn_utf16_to_utf8(wc, 1);
+                if (u8) {
+                    emit(ctx, u8, strlen(u8));
+                    free(u8);
+                }
+            } else {
+                char cc = (char)c;
+                emit(ctx, &cc, 1);
+            }
             continue;
         }
-        case 's': {
-            const char *s = (const char *)(uintptr_t)ms_next((void **)ap);
-            if (!s)
-                s = "(null)";
+        case 's':
+        case 'S': {
+            /* Direction: %s follows the wide flag, %S is flipped
+             * (printf-A: %s narrow / %S wide; W-side: %s wide / %S narrow).
+             * An explicit l/h prefix overrides either way. */
+            int this_wide = (conv == 's') ? wide : !wide;
+            if (lng == 1) this_wide = 1;        /* %ls always wide   */
+            else if (lng == 4) this_wide = 0;   /* %hs always narrow */
+            char *owned = NULL;
+            const char *s;
+            if (this_wide) {
+                const uint16_t *w =
+                    (const uint16_t *)(uintptr_t)ms_next((void **)ap);
+                if (!w) {
+                    s = "(null)";
+                } else {
+                    size_t l16 = 0;
+                    while (w[l16]) l16++;
+                    owned = wn_utf16_to_utf8(w, l16);
+                    s = owned ? owned : "";
+                }
+            } else {
+                s = (const char *)(uintptr_t)ms_next((void **)ap);
+                if (!s)
+                    s = "(null)";
+            }
             size_t l = strlen(s);
             if (prec >= 0 && (size_t)prec < l)
                 l = (size_t)prec;
@@ -578,6 +630,7 @@ static int vformat_core(emit_fn emit, void *ctx, const char *fmt, char **ap)
             } else {
                 emit(ctx, s, l);
             }
+            free(owned);
             continue;
         }
         case 'd':
@@ -700,44 +753,27 @@ static int vformat_core(emit_fn emit, void *ctx, const char *fmt, char **ap)
  * passes its ADDRESS (by reference), so `ms_vsnprintf(..., va_list ap)` +
  * `(char*)ap` read the va_list POINTER ITSELF as the first argument - every
  * sprintf/snprintf with %s produced garbage. GCC lowers va_start correctly
- * only when the walk stays inside one function.
- *
- * Correct model (matches Windows x64, where va_list is a plain char*):
- *   - every variadic export uses __builtin_ms_va_start and extracts
- *     `char *argp = (char *)ap` IN THE SAME FUNCTION;
- *   - v-family exports take `char *ap` BY VALUE (that IS what guests pass);
- *   - the formatter always receives char** and advances its own copy. */
-#if defined(__x86_64__)
-typedef __builtin_ms_va_list wn_ms_va;
-#define WN_VA_START(ap, last) __builtin_ms_va_start(ap, last)
-#define WN_VA_END(ap)         __builtin_ms_va_end(ap)
-#else
-/* i386: MSVC va_list IS a plain char* (args at ascending addresses), and
- * GCC's i386 __builtin_va_list is char* too — the same one-slot-per-arg
- * walk the formatter does applies unchanged. */
-typedef __builtin_va_list wn_ms_va;
-#define WN_VA_START(ap, last) __builtin_va_start(ap, last)
-#define WN_VA_END(ap)         __builtin_va_end(ap)
-#endif
-
+ * only when the walk stays inside one function. The wn_ms_va/WN_VA_START
+ * machinery for this model now lives in wn_format.h (shared with the
+ * user32 wsprintf family). */
 static int64_t vprintf_impl(const char *fmt, char *argp)
 {
     struct emit_fd e = { 1, isatty(1), 0 };
-    vformat_core(emit_to_fd, &e, fmt, &argp);
+    wn_vformat(emit_to_fd, &e, fmt, &argp, 0);
     return (int64_t)e.total;
 }
 
 static int64_t vfprintf_impl(int fd, const char *fmt, char *argp)
 {
     struct emit_fd e = { fd, isatty(fd), 0 };
-    vformat_core(emit_to_fd, &e, fmt, &argp);
+    wn_vformat(emit_to_fd, &e, fmt, &argp, 0);
     return (int64_t)e.total;
 }
 
 static int64_t vsprintf_impl(char *dst, const char *fmt, char *argp)
 {
-    struct emit_buf b = { dst, (size_t)-1 };
-    vformat_core(emit_to_buf, &b, fmt, &argp);
+    struct wn_emit_buf b = { dst, (size_t)-1 };
+    wn_vformat(wn_emit_to_buf, &b, fmt, &argp, 0);
     return (int64_t)strlen(dst);
 }
 
@@ -747,11 +783,23 @@ static int64_t vsnprintf_impl(char *dst, uint64_t cap, const char *fmt,
     if (!dst || cap == 0) {
         /* measure only: count bytes. */
         size_t total = 0;
-        vformat_core(emit_count, &total, fmt, &argp);
+        wn_vformat(emit_count, &total, fmt, &argp, 0);
         return (int64_t)total;
     }
-    struct emit_buf b = { dst, (size_t)cap };
-    vformat_core(emit_to_buf, &b, fmt, &argp);
+    struct wn_emit_buf b = { dst, (size_t)cap };
+    wn_vformat(wn_emit_to_buf, &b, fmt, &argp, 0);
+    return (int64_t)strlen(dst);
+}
+
+/* wsprintf-family convenience (user32): bounded, NUL-terminated. */
+int64_t wn_wsprintf_buf(char *dst, size_t cap, const char *fmt, char *ap,
+                        int wide)
+{
+    if (!dst || cap == 0 || !fmt)
+        return -1;
+    struct wn_emit_buf b = { dst, cap };
+    char *cur = ap;
+    wn_vformat(wn_emit_to_buf, &b, fmt, &cur, wide);
     return (int64_t)strlen(dst);
 }
 
@@ -808,7 +856,7 @@ static WN_CRTAPI int64_t ms_vsprintf(char *dst, const char *fmt, char *ap)
     return vsprintf_impl(dst, fmt, ap);
 }
 
-static WN_CRTAPI int64_t ms_snprintf(char *dst, uint64_t cap, const char *fmt, ...)
+static WN_CRTAPI int64_t ms_snprintf(char *dst, wn_abiword cap, const char *fmt, ...)
 {
     wn_ms_va ap;
     WN_VA_START(ap, fmt);
@@ -817,7 +865,7 @@ static WN_CRTAPI int64_t ms_snprintf(char *dst, uint64_t cap, const char *fmt, .
     return r;
 }
 
-static WN_CRTAPI int64_t ms_vsnprintf(char *dst, uint64_t cap, const char *fmt,
+static WN_CRTAPI int64_t ms_vsnprintf(char *dst, wn_abiword cap, const char *fmt,
                                    char *ap)
 {
     return vsnprintf_impl(dst, cap, fmt, ap);
@@ -1005,7 +1053,7 @@ static WN_CRTAPI int32_t ms_fclose(wn_ms_file *f)
     return 0;
 }
 
-static WN_CRTAPI int64_t ms_fread(void *buf, uint64_t sz, uint64_t n, wn_ms_file *f)
+static WN_CRTAPI int64_t ms_fread(void *buf, wn_abiword sz, wn_abiword n, wn_ms_file *f)
 {
     if (!f)
         return 0;
@@ -1023,7 +1071,7 @@ static WN_CRTAPI int64_t ms_fread(void *buf, uint64_t sz, uint64_t n, wn_ms_file
     return (int64_t)(sz ? got / (size_t)sz : 0);
 }
 
-static WN_CRTAPI int64_t ms_fwrite(const void *buf, uint64_t sz, uint64_t n, wn_ms_file *f)
+static WN_CRTAPI int64_t ms_fwrite(const void *buf, wn_abiword sz, wn_abiword n, wn_ms_file *f)
 {
     if (!f)
         return 0;
@@ -1079,6 +1127,143 @@ static WN_CRTAPI int64_t ms_time(int64_t *t)
 static WN_CRTAPI int64_t ms_clock(void)
 {
     return (int64_t)(clock() * 1000000 / CLOCKS_PER_SEC);
+}
+
+/* --- guest-shaped struct tm -----------------------------------------------------
+ * MSVC's struct tm is 9 ints = 36 bytes on BOTH arches (glibc's has
+ * tm_gmtoff/tm_zone); localtime/gmtime must fill the MSVC layout, not the
+ * host one. Classic msvcrt.dll `localtime` takes a time_t-sized pointer:
+ * 4 bytes on i386, 8 on x64 — read the guest word. */
+struct wn_ms_tm {
+    int32_t sec, min, hour, mday, mon, year, wday, yday, isdst;
+};
+_Static_assert(sizeof(struct wn_ms_tm) == 36, "MSVC struct tm ABI");
+
+static __thread struct wn_ms_tm g_ms_tm;
+
+static struct wn_ms_tm *ms_tm_fill(const struct tm *ht)
+{
+    if (!ht)
+        return NULL;
+    g_ms_tm.sec = (int32_t)ht->tm_sec;
+    g_ms_tm.min = (int32_t)ht->tm_min;
+    g_ms_tm.hour = (int32_t)ht->tm_hour;
+    g_ms_tm.mday = (int32_t)ht->tm_mday;
+    g_ms_tm.mon = (int32_t)ht->tm_mon;
+    g_ms_tm.year = (int32_t)ht->tm_year;
+    g_ms_tm.wday = (int32_t)ht->tm_wday;
+    g_ms_tm.yday = (int32_t)ht->tm_yday;
+    g_ms_tm.isdst = (int32_t)ht->tm_isdst;
+    return &g_ms_tm;
+}
+
+static WN_CRTAPI struct wn_ms_tm *ms_localtime(const wn_abiword *tp)
+{
+    if (!tp)
+        return NULL;
+    time_t t = (time_t)(intptr_t)(wn_abiword_s)*tp;
+    return ms_tm_fill(localtime(&t));
+}
+
+static WN_CRTAPI struct wn_ms_tm *ms__localtime32(const int32_t *tp)
+{
+    if (!tp)
+        return NULL;
+    time_t t = (time_t)*tp;
+    return ms_tm_fill(localtime(&t));
+}
+
+static WN_CRTAPI struct wn_ms_tm *ms__localtime64(const int64_t *tp)
+{
+    if (!tp)
+        return NULL;
+    time_t t = (time_t)*tp;
+    return ms_tm_fill(localtime(&t));
+}
+
+static WN_CRTAPI struct wn_ms_tm *ms_gmtime(const wn_abiword *tp)
+{
+    if (!tp)
+        return NULL;
+    time_t t = (time_t)(intptr_t)(wn_abiword_s)*tp;
+    return ms_tm_fill(gmtime(&t));
+}
+
+/* --- case ops (ASCII, locale-free like the C locale default) -------------------- */
+static WN_CRTAPI char *ms__strupr(char *s)
+{
+    if (!s)
+        return s;
+    for (char *p = s; *p; p++)
+        if (*p >= 'a' && *p <= 'z')
+            *p = (char)(*p - 'a' + 'A');
+    return s;
+}
+
+static WN_CRTAPI char *ms__strlwr(char *s)
+{
+    if (!s)
+        return s;
+    for (char *p = s; *p; p++)
+        if (*p >= 'A' && *p <= 'Z')
+            *p = (char)(*p - 'A' + 'a');
+    return s;
+}
+
+/* --- qsort ------------------------------------------------------------------------
+ * In-tree heapsort: the comparison callback is GUEST code, so it must be
+ * called through a WN_CRTAPI function pointer (cdecl on i386, ms_abi on
+ * x64) — host libc qsort would call it SysV and smash x64 guests. */
+static WN_CRTAPI void ms_qsort(void *base, wn_abiword n, wn_abiword sz,
+                               WN_CRTAPI int32_t (*cmp)(const void *,
+                                                        const void *))
+{
+    if (!base || n < 2 || sz == 0 || !cmp)
+        return;
+    unsigned char *a = base;
+    /* max heap: element i -> children 2i+1, 2i+2 */
+    wn_abiword start = n / 2;   /* signed math below; n < 2^31 in practice */
+    for (wn_abiword i = start; i-- > 0;) {
+        wn_abiword root = i;
+        for (;;) {
+            wn_abiword c = 2 * root + 1;
+            if (c >= n)
+                break;
+            if (c + 1 < n && cmp(a + (c + 1) * sz, a + c * sz) > 0)
+                c++;
+            if (cmp(a + root * sz, a + c * sz) >= 0)
+                break;
+            for (wn_abiword b = 0; b < sz; b++) {
+                unsigned char t = a[root * sz + b];
+                a[root * sz + b] = a[c * sz + b];
+                a[c * sz + b] = t;
+            }
+            root = c;
+        }
+    }
+    for (wn_abiword end = n - 1; end > 0; end--) {
+        for (wn_abiword b = 0; b < sz; b++) {
+            unsigned char t = a[end * sz + b];
+            a[end * sz + b] = a[b];
+            a[b] = t;
+        }
+        wn_abiword root = 0;
+        for (;;) {
+            wn_abiword c = 2 * root + 1;
+            if (c >= end)
+                break;
+            if (c + 1 < end && cmp(a + (c + 1) * sz, a + c * sz) > 0)
+                c++;
+            if (cmp(a + root * sz, a + c * sz) >= 0)
+                break;
+            for (wn_abiword b = 0; b < sz; b++) {
+                unsigned char t = a[root * sz + b];
+                a[root * sz + b] = a[c * sz + b];
+                a[c * sz + b] = t;
+            }
+            root = c;
+        }
+    }
 }
 
 static uint32_t g_seed = 1;
@@ -1237,6 +1422,7 @@ const wn_export_entry wn_msvcrt_exports[] = {
     { "toascii", ms_toascii },
     { "abs", (void *)ms_abs },
     { "atexit", ms_atexit },
+    { "_onexit", ms__onexit },
     { "atof", ms_atof },
     { "atoi", ms_atoi },
     { "_time64", ms_time },
@@ -1244,6 +1430,15 @@ const wn_export_entry wn_msvcrt_exports[] = {
     { "atoll", ms_atoll },
     { "calloc", ms_calloc },
     { "clock", ms_clock },
+    { "gmtime", ms_gmtime },
+    { "localtime", ms_localtime },
+    { "_localtime32", ms__localtime32 },
+    { "_localtime64", ms__localtime64 },
+    { "qsort", ms_qsort },
+    { "strlwr", ms__strlwr },
+    { "strupr", ms__strupr },
+    { "_strlwr", ms__strlwr },
+    { "_strupr", ms__strupr },
     { "exit", ms_exit },
     { "fabs", ms_fabs },
     { "fclose", ms_fclose },

@@ -70,7 +70,7 @@ static WN_API uint32_t bc_BCryptOpenAlgorithmProvider(uint64_t *handle,
     return STATUS_NOT_IMPLEMENTED;
 }
 
-static WN_API uint32_t bc_BCryptGenRandom(uint64_t handle, uint8_t *buf,
+static WN_API uint32_t bc_BCryptGenRandom(wn_abiword handle, uint8_t *buf,
                                           uint32_t len, uint32_t flags)
 {
     (void)handle;
@@ -86,7 +86,7 @@ static WN_API uint32_t bc_BCryptGenRandom(uint64_t handle, uint8_t *buf,
     return STATUS_SUCCESS;
 }
 
-static WN_API uint32_t bc_BCryptCloseAlgorithmProvider(uint64_t handle,
+static WN_API uint32_t bc_BCryptCloseAlgorithmProvider(wn_abiword handle,
                                                        uint32_t flags)
 {
     (void)handle;

@@ -225,8 +225,8 @@ static WN_API int32_t sl_PathMatchSpecW(const uint16_t *name,
 
 /* wnsprintf: bounded sprintf with the common format specifiers. */
 static WN_API int32_t sl_wnsprintfA(char *buf, uint32_t cap,
-                                    const char *fmt, uint64_t a1, uint64_t a2,
-                                    uint64_t a3, uint64_t a4, uint64_t a5,
+                                    const char *fmt, wn_abiword a1, wn_abiword a2,
+                                    wn_abiword a3, wn_abiword a4, uint64_t a5,
                                     uint64_t a6)
 {
     /* Hand-rolled: host snprintf with up to 6 positional int/str args is

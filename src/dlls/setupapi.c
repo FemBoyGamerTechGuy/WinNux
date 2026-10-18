@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 static WN_API uint64_t su_SetupDiGetClassDevsA(const void *cls, const char *enumid,
-                                               uint64_t hwnd, uint32_t flags)
+                                               wn_abiword hwnd, uint32_t flags)
 {
     (void)cls; (void)enumid; (void)hwnd; (void)flags;
     wn_log(WN_LOG_WARN, "setupapi: SetupDiGetClassDevsA -> INVALID_HANDLE_VALUE "
@@ -23,7 +23,7 @@ static WN_API uint64_t su_SetupDiGetClassDevsA(const void *cls, const char *enum
 
 static WN_API uint64_t su_SetupDiGetClassDevsW(const void *cls,
                                                const uint16_t *enumid,
-                                               uint64_t hwnd, uint32_t flags)
+                                               wn_abiword hwnd, uint32_t flags)
 {
     (void)cls; (void)enumid; (void)hwnd; (void)flags;
     wn_log(WN_LOG_WARN, "setupapi: SetupDiGetClassDevsW -> INVALID_HANDLE_VALUE "
@@ -32,7 +32,7 @@ static WN_API uint64_t su_SetupDiGetClassDevsW(const void *cls,
     return (uint64_t)(uintptr_t)WN_INVALID_HANDLE_VALUE;
 }
 
-static WN_API int32_t su_SetupDiEnumDeviceInfo(uint64_t set, uint32_t idx,
+static WN_API int32_t su_SetupDiEnumDeviceInfo(wn_abiword set, uint32_t idx,
                                                void *info)
 {
     (void)set; (void)idx; (void)info;
@@ -40,7 +40,7 @@ static WN_API int32_t su_SetupDiEnumDeviceInfo(uint64_t set, uint32_t idx,
     return 0;
 }
 
-static WN_API int32_t su_SetupDiGetDeviceInstanceIdA(uint64_t set, void *info,
+static WN_API int32_t su_SetupDiGetDeviceInstanceIdA(wn_abiword set, void *info,
                                                      char *buf, uint32_t cap,
                                                      uint32_t *need)
 {
@@ -51,13 +51,13 @@ static WN_API int32_t su_SetupDiGetDeviceInstanceIdA(uint64_t set, void *info,
     return 0;
 }
 
-static WN_API int32_t su_SetupDiDestroyDeviceInfoList(uint64_t set)
+static WN_API int32_t su_SetupDiDestroyDeviceInfoList(wn_abiword set)
 {
     (void)set;
     return 0;   /* FALSE: nothing was ever created */
 }
 
-static WN_API int32_t su_SetupDiGetDeviceRegistryPropertyA(uint64_t set,
+static WN_API int32_t su_SetupDiGetDeviceRegistryPropertyA(wn_abiword set,
                                                            void *info,
                                                            uint32_t prop,
                                                            uint32_t *type,
@@ -72,7 +72,7 @@ static WN_API int32_t su_SetupDiGetDeviceRegistryPropertyA(uint64_t set,
     return 0;
 }
 
-static WN_API int32_t su_SetupDiCallClassInstaller(uint32_t op, uint64_t set,
+static WN_API int32_t su_SetupDiCallClassInstaller(uint32_t op, wn_abiword set,
                                                    void *info)
 {
     (void)op; (void)set; (void)info;

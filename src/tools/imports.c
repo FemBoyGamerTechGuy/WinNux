@@ -596,8 +596,8 @@ int wn_cmd_imports(int argc, char **argv)
            "%u native-missing, %u bad; %u DLLs missing\n",
            total, c_ok, c_stub, c_native, c_nmiss, c_bad, c_missdll);
     if (!v.is64)
-        printf("32-bit image: runtime support not implemented yet "
-               "(WoW64-style PE32 loading is a major TODO).\n");
+        printf("32-bit image: runs via bin/winnux32 (make winnux32); "
+               "PE32 console-class is verified end-to-end.\n");
 
     free(buf);
     free(g_recs);

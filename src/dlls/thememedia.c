@@ -31,7 +31,7 @@ static WN_API int32_t ut_IsThemeActive(void)
     return 0;
 }
 
-static WN_API uint64_t ut_OpenThemeData(uint64_t hwnd, const uint16_t *classlist)
+static WN_API uint64_t ut_OpenThemeData(wn_abiword hwnd, const uint16_t *classlist)
 {
     (void)hwnd;
     (void)classlist;
@@ -39,26 +39,26 @@ static WN_API uint64_t ut_OpenThemeData(uint64_t hwnd, const uint16_t *classlist
     return 0;
 }
 
-static WN_API uint64_t ut_GetWindowTheme(uint64_t hwnd)
+static WN_API uint64_t ut_GetWindowTheme(wn_abiword hwnd)
 {
     (void)hwnd;
     return 0;
 }
 
-static WN_API int32_t ut_CloseThemeData(uint64_t theme)
+static WN_API int32_t ut_CloseThemeData(wn_abiword theme)
 {
     (void)theme;
     return (int32_t)0x80070006;   /* E_HANDLE: no theme handles exist */
 }
 
-static WN_API int32_t ut_SetWindowTheme(uint64_t hwnd, const uint16_t *sub,
+static WN_API int32_t ut_SetWindowTheme(wn_abiword hwnd, const uint16_t *sub,
                                         const uint16_t *name)
 {
     (void)hwnd; (void)sub; (void)name;
     return 1;   /* S_FALSE: not applied, not an error */
 }
 
-static WN_API int32_t ut_DrawThemeBackground(uint64_t theme, uint64_t hdc,
+static WN_API int32_t ut_DrawThemeBackground(wn_abiword theme, wn_abiword hdc,
                                              int32_t part, int32_t state,
                                              const void *rect, const void *clip)
 {
@@ -88,7 +88,7 @@ static WN_API int32_t dw_DwmIsCompositionEnabled(int32_t *enabled)
     return 0;   /* S_OK: the honest answer is "disabled" */
 }
 
-static WN_API int32_t dw_DwmExtendFrameIntoClientArea(uint64_t hwnd,
+static WN_API int32_t dw_DwmExtendFrameIntoClientArea(wn_abiword hwnd,
                                                       const void *margins)
 {
     (void)hwnd;
@@ -98,7 +98,7 @@ static WN_API int32_t dw_DwmExtendFrameIntoClientArea(uint64_t hwnd,
     return DWM_E_COMPOSITIONDISABLED;
 }
 
-static WN_API int32_t dw_DwmSetWindowAttribute(uint64_t hwnd, uint32_t attr,
+static WN_API int32_t dw_DwmSetWindowAttribute(wn_abiword hwnd, uint32_t attr,
                                                const void *val, uint32_t size)
 {
     (void)hwnd; (void)attr; (void)val; (void)size;
@@ -154,8 +154,8 @@ static WN_API uint32_t mm_timeGetDevCaps(void *caps, uint32_t size)
 }
 
 static WN_API uint32_t mm_waveOutOpen(uint64_t *out, uint32_t dev,
-                                      const void *fmt, uint64_t cb,
-                                      uint64_t inst, uint32_t flags)
+                                      const void *fmt, wn_abiword cb,
+                                      wn_abiword inst, uint32_t flags)
 {
     (void)out; (void)dev; (void)fmt; (void)cb; (void)inst; (void)flags;
     wn_log(WN_LOG_WARN, "winmm: waveOutOpen -> MMSYSERR_NODRIVER "
@@ -163,15 +163,15 @@ static WN_API uint32_t mm_waveOutOpen(uint64_t *out, uint32_t dev,
     return 2;   /* MMSYSERR_NODRIVER */
 }
 
-static WN_API uint32_t mm_midiOutOpen(uint64_t *out, uint32_t dev, uint64_t cb,
-                                      uint64_t inst, uint32_t flags)
+static WN_API uint32_t mm_midiOutOpen(uint64_t *out, uint32_t dev, wn_abiword cb,
+                                      wn_abiword inst, uint32_t flags)
 {
     (void)out; (void)dev; (void)cb; (void)inst; (void)flags;
     return 2;
 }
 
 static WN_API uint32_t mm_mciSendStringA(const char *cmd, char *ret,
-                                         uint32_t retlen, uint64_t hwnd)
+                                         uint32_t retlen, wn_abiword hwnd)
 {
     (void)cmd; (void)ret; (void)retlen; (void)hwnd;
     wn_log(WN_LOG_WARN, "winmm: mciSendStringA('%s') unsupported -> "
@@ -179,7 +179,7 @@ static WN_API uint32_t mm_mciSendStringA(const char *cmd, char *ret,
     return 257;   /* MCIERR_INVALID_DEVICE_ID */
 }
 
-static WN_API int32_t mm_PlaySoundA(const char *sound, uint64_t hmod,
+static WN_API int32_t mm_PlaySoundA(const char *sound, wn_abiword hmod,
                                     uint32_t flags)
 {
     (void)sound; (void)hmod; (void)flags;
