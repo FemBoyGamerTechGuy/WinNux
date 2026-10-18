@@ -46,6 +46,12 @@ extern const wn_export_entry wn_msvcp140_exports[];
 extern const wn_export_entry wn_wship6_exports[];
 extern const wn_export_entry wn_shcore_exports[];
 extern const wn_export_entry wn_hhctrl_exports[];
+extern const wn_export_entry wn_apphelp_exports[];
+extern const wn_export_entry wn_propsys_exports[];
+extern const wn_export_entry wn_oleacc_exports[];
+extern const wn_export_entry wn_profapi_exports[];
+extern const wn_export_entry wn_comres_exports[];
+extern const wn_export_entry wn_clbcatq_exports[];
 
 /* The full builtin table (name -> exports). */
 extern const wn_builtin_dll wn_builtin_table[];

@@ -1598,8 +1598,8 @@ uint64_t wn_user32_paint_count(void)
 
 /* DC lifetime functions live in gdi32.c implementation-wise but are
  * exported from user32.dll, exactly like real Windows. */
-extern WN_API wn_handle g32_BeginPaint(uint64_t hwnd, void *ps);
-extern WN_API int32_t g32_EndPaint(uint64_t hwnd, const void *ps);
+extern WN_API wn_handle g32_BeginPaint(wn_abiword hwnd, void *ps);
+extern WN_API int32_t g32_EndPaint(wn_abiword hwnd, const void *ps);
 extern WN_API wn_handle g32_GetDC(wn_abiword hwnd);
 extern WN_API int32_t g32_ReleaseDC(wn_abiword hwnd, wn_handle hdc);
 extern WN_API int32_t g32_FillRect(wn_handle hdc, const void *rect, wn_handle brush);
@@ -2967,9 +2967,9 @@ static WN_API uint16_t *u32_CharPrevW(const uint16_t *start, const uint16_t *cur
 static const uint16_t *load_string_lookup(wn_abiword hinst, uint32_t uid,
                                           uint16_t *len_out)
 {
-    extern WN_API uint64_t k32_FindResourceA(uint64_t, const char *,
+    extern WN_API uint64_t k32_FindResourceA(wn_abiword, const char *,
                                              const char *);
-    extern WN_API void *k32_LockResource(uint64_t);
+    extern WN_API void *k32_LockResource(wn_abiword);
     char rid[16];
     snprintf(rid, sizeof rid, "%u", (unsigned)(uid / 16) + 1);
     uint64_t hres = k32_FindResourceA(hinst, rid,
@@ -3039,9 +3039,9 @@ static uint64_t create_dialog_from_template(uint64_t hinst,
     /* Template argument may be a MAKEINTRESOURCE id -> resolve RT_DIALOG
      * from the module's resources first (this is what PuTTY does). */
     if (((uintptr_t)tmpl >> 16) == 0) {
-        extern WN_API uint64_t k32_FindResourceA(uint64_t, const char *,
+        extern WN_API uint64_t k32_FindResourceA(wn_abiword, const char *,
                                                  const char *);
-        extern WN_API void *k32_LockResource(uint64_t);
+        extern WN_API void *k32_LockResource(wn_abiword);
         char rid[16];
         snprintf(rid, sizeof rid, "%u", (unsigned)(uintptr_t)tmpl);
         uint64_t hres = k32_FindResourceA(hinst, rid,

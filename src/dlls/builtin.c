@@ -89,6 +89,13 @@ const wn_builtin_dll wn_builtin_table[] = {
     /* DPI awareness (putty delay-loads at startup) + HTML help stub */
     { "shcore.dll",     wn_shcore_exports,    NULL },
     { "hhctrl.ocx",     wn_hhctrl_exports,    NULL },
+    /* presence-probe system DLLs (Inno Setup & friends feature-detect) */
+    { "apphelp.dll",    wn_apphelp_exports,   NULL },
+    { "propsys.dll",    wn_propsys_exports,   NULL },
+    { "oleacc.dll",     wn_oleacc_exports,    NULL },
+    { "profapi.dll",    wn_profapi_exports,   NULL },
+    { "comres.dll",     wn_comres_exports,    NULL },
+    { "clbcatq.dll",    wn_clbcatq_exports,   NULL },
     { NULL, NULL, NULL },
 };
 

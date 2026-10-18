@@ -1,4 +1,75 @@
 
+## Date: 2026-10-18 (session 9)
+
+### The i386 stack-smash: one uint64_t extern decl vs the whole ABI
+
+User report: LuaForWindows aborts with `*** stack smashing detected ***`
+right after six "DLL not found" warnings (apphelp, propsys, oleacc,
+profapi, comres, clbcatq). That glibc message is the HOST canary — a
+WinNux frame, not the guest.
+
+The repro gap (why we never saw it): our Debian gcc ships without
+default stack protector; the user's Arch gcc enables
+-fstack-protector-strong by default. Same overflow, only their build
+detects it. The Makefile now passes -fstack-protector-strong explicitly
+on every target — distro-independent and matches the field.
+
+The hunt (new dev tools committed): scripts/dev/canary32.c (LD_PRELOAD
+interposer for __stack_chk_fail that prints the smashing frame) and
+scripts/dev/gdb_canary.py (gdbstub watchpoint driver). Bisects with
+env-var early-returns isolated the write to the load_string_lookup ->
+k32_FindResourceA call sequence. Root cause: user32.c declared
+
+    extern WN_API uint64_t k32_FindResourceA(uint64_t, ...)
+
+while the definition takes wn_abiword. On i386 WN_API is stdcall, so
+the caller pushes 8 bytes for a 4-byte parameter: the callee pops 12
+(ret 12), the caller pushed 16, and every skewed push afterwards lands
+in the caller's own locals — `rid[16]` and its canary. Exactly the
+class wn_types.h warns about; the declarations now use wn_abiword
+(6 sites: FindResourceA/LockResource x2 call sites, g32_BeginPaint,
+g32_EndPaint). Identity on x64, so nothing 64-bit changed.
+
+Same class of fix: res_dir_base() walked the PE32+ optional-header
+layout on PE32 images (data dirs sit 16 bytes earlier in PE32); it now
+uses wn_pe_dirs(), which is arch-correct. 32-bit LoadString/resource
+walks read real directories now.
+
+### The six missing system DLLs
+
+They are presence probes (Inno Setup feature-detects them at startup;
+nothing was GetProcAddress'd from them at TRACE level). New
+src/dlls/sysdlls.c adds apphelp/propsys/oleacc/profapi/comres/clbcatq
+as builtins with honest failure stubs; wn_dll_sync_placeholders()
+creates their files in drive_c/windows/system32 like every other
+builtin (the prefix keeps the traditional Wine-style layout — the DLL
+search order is builtin -> app dir -> system32 -> windows -> cwd).
+Startup log is now clean of "not found" warnings for them.
+
+### PE loader hardening (fuzzer-found, backported honesty)
+
+The fuzzer (re-run after the canary work) found two real bugs:
+
+1. Preferred-ImageBase mapping accepted wild bases: a fuzzed ImageBase
+   above 2^47 is legal on LA57 kernels, mmap succeeds, and the mapping
+   lands where no address check (or ASan shadow) can see it. Bases are
+   now bounded to the arch's user range before MAP_FIXED_NOREPLACE.
+2. wn_pe_dirs() re-read e_lfanew from the MAPPED image — but a section
+   with VA 0 legally overwrites the mapped DOS header during the
+   section copy, handing pointer arithmetic to fuzzed bytes (wild
+   dirs pointer -> SEGV in apply_relocations). The validated optional-
+   header offset is now cached in wn_pe_image.opt_off at parse time.
+   Also: the full header blob must fit in SizeOfHeaders and in the
+   file (e_lfanew + PE + file header + optional header + section
+   table).
+
+Fuzz: 3000 iterations x 15 seeds, zero crashes, ASan/UBSan clean.
+Suite: 15/15. lua prints 7/WIN, sqlite computes, putty stays alive,
+7zr prints usage, LuaForWindows runs alive with zero DLL warnings and
+zero canary trips (qemu + interposer). Dev-box check32 now compiles
+all sources under -m32 again (root32 sysroot restored).
+
+
 ## Date: 2026-10-18 (session 8)
 
 ### 32-bit i386: the PE-loading chain that "old" 32-bit apps depend on

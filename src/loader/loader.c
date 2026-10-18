@@ -70,8 +70,12 @@ static wn_module *module_register(wn_module_kind kind, const char *name,
 
 void wn_module_init(void)
 {
-    for (const wn_builtin_dll *b = wn_builtin_table; b->name; b++)
-        wn_log(WN_LOG_DEBUG, "builtin: %s (%d exports)", b->name, 0);
+    for (const wn_builtin_dll *b = wn_builtin_table; b->name; b++) {
+        int n = 0;
+        for (const wn_export_entry *e = b->exports; e && e->name; e++)
+            n++;
+        wn_log(WN_LOG_DEBUG, "builtin: %s (%d exports)", b->name, n);
+    }
 }
 
 wn_module *wn_module_find(const char *name)

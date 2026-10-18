@@ -230,6 +230,10 @@ typedef struct wn_pe_image {
     uint32_t entry_rva;
     uint32_t size_of_image;
     uint32_t headers_size;          /* SizeOfHeaders (bytes copied from file) */
+    uint32_t opt_off;               /* offset of optional header, cached from
+                                     * the VALIDATED file header — section
+                                     * copies can clobber the mapped DOS
+                                     * header, so it must never be re-read */
     uint32_t stack_reserve, stack_commit;
     wn_image_section_header *sections; /* points into image headers */
     uint16_t num_sections;

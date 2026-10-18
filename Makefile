@@ -9,7 +9,8 @@ DEFS    := -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 OPT     ?= -O2 -g
 INC     := -Iinclude
 
-CFLAGS  := $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) -fno-pic -no-pie -MMD -MP
+CFLAGS  := $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) -fno-pic -no-pie \
+           -fstack-protector-strong -MMD -MP
 LDLIBS  := -lpthread -ldl -lm
 
 BIN     := bin
@@ -147,7 +148,8 @@ winnux32: $(TARGET32)
 
 $(TARGET32): $(OBJS32) | $(BIN)
 ifneq ($(M32_MODE),none)
-	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) $(M32FLAGS) -o $@ $(OBJS32) $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) $(M32FLAGS) \
+	      -fstack-protector-strong -o $@ $(OBJS32) $(LDLIBS)
 	@echo "built $(TARGET32) ($(M32_MODE) toolchain)"
 else
 	@echo "winnux32: SKIP - no -m32 toolchain (native or $(M32_SYSROOT))"
@@ -158,7 +160,8 @@ endif
 $(OBJ32)/%.o: src/%.c | $(OBJ32)
 ifneq ($(M32_MODE),none)
 	@mkdir -p $(dir $@)
-	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) $(M32FLAGS) -c -o $@ $<
+	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) $(M32FLAGS) \
+	      -fstack-protector-strong -c -o $@ $<
 endif
 check32:
 ifeq ($(M32_MODE),none)

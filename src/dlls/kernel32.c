@@ -2800,11 +2800,10 @@ static const uint8_t *res_dir_base(wn_module *m)
 {
     if (m->kind != WN_MOD_PE)
         return NULL;
-    const wn_image_dos_header *dos = (const void *)m->pe.base;
-    const wn_image_optional_header64 *oh =
-        (const void *)(m->pe.base + dos->e_lfanew + 4
-                      + sizeof(wn_image_file_header));
-    const wn_image_data_directory *d = &oh->dirs[WN_IMAGE_DIR_RESOURCE];
+    /* Arch-correct data directories: PE32 (i386) and PE32+ (x64) optional
+     * headers place the dirs array at different offsets — the old hardcoded
+     * optional_header64 overlay walked garbage on 32-bit images. */
+    const wn_image_data_directory *d = &wn_pe_dirs(&m->pe)[WN_IMAGE_DIR_RESOURCE];
     if (!d->virtual_address || !d->size)
         return NULL;
     return wn_pe_rva(&m->pe, d->virtual_address, 16);

@@ -18,11 +18,14 @@ localtime/qsort — all qemu-verified, 64-bit 15/15). Next:
    CPU-heavy under emulation; on real i386 it should reach the GUI. Watch
    for: window creation, Inno dialog rendering, /SILENT CLI mode.
 
-1. **User's Arch box validation**: `make winnux32 && ./bin/winnux run
-   LuaForWindows_v5.1.5-52.exe -e 'print(1+2*3, ("win"):upper())'` —
-   qemu passed hello32/heap32/torture32, but the user's box is the
-   ground truth (his kernel + real apps). 7zr.exe (console) is the
-   next-best candidate. NSIS installer GUI = P0.2 territory.
+1. **User's Arch box validation (NEXT)**: the session-9 canary crash
+   chain is fixed (wn_abiword extern decls + res_dir_base PE32 layout
+   + the six presence-probe DLLs now builtins). `make winnux32 &&
+   ./bin/winnux run LuaForWindows_v5.1.5-52.exe` should now get past
+   DLL probing into real startup — expect the next wall to be Inno's
+   decompression/GUI bring-up. 7zr.exe (console) is the next-best
+   candidate. NOTE: winnux32 builds now need -fstack-protector-strong
+   (Makefile passes it) — matches the user's Arch gcc defaults.
 2a. **i386 WinMain-CRT exit crash (NEXT, precise repro)**: `gui32.exe`
    (mingw i686, WinMain entry — scripts/gui32.c) crashes after WinMain
    returns: SIGSEGV si_addr=0xfffffffc (a [reg-4] deref, reg=0 — smells

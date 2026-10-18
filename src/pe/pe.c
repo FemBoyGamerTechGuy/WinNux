@@ -40,7 +40,13 @@ static size_t opt_off(const uint8_t *base_or_file)
 
 const wn_image_data_directory *wn_pe_dirs(const wn_pe_image *img)
 {
-    const uint8_t *p = img->base + opt_off(img->base);
+    /* Trust ONLY the offset cached at parse time: a section with VA 0 can
+     * legally overwrite the mapped DOS header during the section copy, so
+     * re-reading e_lfanew from the image hands pointer arithmetic to
+     * fuzzed bytes (PE fuzzer: wild dirs pointer above 2^47). The data
+     * directory CONTENTS may be clobbered too — but those flow through
+     * bounds-checked wn_pe_rva() paths, never into pointer math. */
+    const uint8_t *p = img->base + img->opt_off;
     if (img->is_64)
         return ((const wn_image_optional_header64 *)(const void *)p)->dirs;
     return ((const wn_image_optional_header32 *)(const void *)p)->dirs;
@@ -151,8 +157,31 @@ static uint32_t read_headers(const uint8_t *f, size_t fs, const char *path,
                path, size_of_headers, size_of_image);
         return WN_ERR_BAD_FORMAT;
     }
+    /* The full header blob (PE sig + file header + optional header + section
+     * table) must fit inside SizeOfHeaders — which is <= SizeOfImage, so
+     * every header / data-directory / section-table read from the MAPPED
+     * image stays inside the mapping. It must also be physically present in
+     * the file. (Found by the PE fuzzer: a small SizeOfImage with a large
+     * e_lfanew made wn_pe_dirs() read past the mapping in
+     * wn_pe_apply_relocations.) */
+    {
+        uint64_t opt_size = is_64 ? sizeof(wn_image_optional_header64)
+                                  : sizeof(wn_image_optional_header32);
+        uint64_t blob = (uint64_t)(uint32_t)dos->e_lfanew + 4
+                      + sizeof(wn_image_file_header) + opt_size
+                      + (uint64_t)fh->number_of_sections
+                            * sizeof(wn_image_section_header);
+        if (blob > size_of_headers || blob > fs) {
+            wn_log(WN_LOG_ERR, "pe: '%s': header blob 0x%llx exceeds "
+                   "SizeOfHeaders 0x%x (file 0x%zx)", path,
+                   (unsigned long long)blob, size_of_headers, fs);
+            return WN_ERR_BAD_FORMAT;
+        }
+    }
 
     img->machine = fh->machine;
+    img->opt_off = (uint32_t)((size_t)dos->e_lfanew + 4
+                             + sizeof(wn_image_file_header));
     img->is_64 = is_64;
     img->is_dll = (fh->characteristics & WN_IMAGE_FILE_DLL) != 0;
     img->entry_rva = entry_rva;
@@ -213,7 +242,19 @@ uint32_t wn_pe_map(const uint8_t *f, size_t fs, const char *path,
      * ignored, which degrades to a plain hint — safe, because the returned
      * address is verified below and dropped when it is not what we asked. */
     uintptr_t want = (uintptr_t)img->preferred_base;
-    if (want != 0 && (want & 0xFFFu) == 0) {
+    /* Reject impossible preferred bases before asking the kernel: Windows
+     * maps x64 images below 2^47 and i386 images below 4 GiB. A fuzzed
+     * header with a wild ImageBase otherwise succeeds on LA57 kernels
+     * (mmap above 2^47 is legal there) — producing a mapping our address
+     * checks and the sanitizer shadow cannot see. Found by the PE fuzzer. */
+    {
+        uint64_t want64 = img->preferred_base;
+        uint64_t want_hi = img->is_64 ? 0x00007FFFFFFF0000ULL
+                                      : 0x00000000FFFFF000ULL;
+        int want_ok = want64 >= 0x10000 &&
+                      (uint64_t)(uintptr_t)want64 == want64 &&
+                      want64 < want_hi && (want64 & 0xFFFu) == 0;
+        if (want_ok) {
         base = mmap((void *)want, map_size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
                         | MAP_FIXED_NOREPLACE,
@@ -232,6 +273,7 @@ uint32_t wn_pe_map(const uint8_t *f, size_t fs, const char *path,
                 munmap(base, map_size);
                 base = MAP_FAILED;
             }
+        }
         }
     }
 
