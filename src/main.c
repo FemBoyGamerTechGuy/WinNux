@@ -93,6 +93,39 @@ static WN_API uint64_t guest_entry_shim(uint64_t unused)
 
     typedef WN_API uint32_t (*entry_fn)(void *, uint32_t, void *);
     entry_fn entry = (entry_fn)(void *)(exe->base + exe->pe.entry_rva);
+
+    /* Windows loader contract, re-verified at the last moment: the EXE's
+     * static-TLS index slot must hold its assigned index and THIS thread's
+     * TLS array must carry the initialized block. Delphi RTLs read
+     * fs:[0x2C][*(DWORD*)index_va] directly (no TlsGetValue fallback until
+     * their slow path runs), so one missing link = NULL block = guest AV
+     * on the very first threadvar access. Found in the field: user's
+     * LuaForWindows crashed writing [block+4] at exe+0x4325. */
+    if (exe->tls_index && exe->tls_index_va) {
+        uint32_t *slot = (uint32_t *)(uintptr_t)exe->tls_index_va;
+        if (*slot != exe->tls_index) {
+            wn_log(WN_LOG_WARN, "loader: pre-entry repair: TLS index slot at "
+                   "0x%llx held %u, expected %u - rewriting",
+                   (unsigned long long)exe->tls_index_va, *slot,
+                   exe->tls_index);
+            *slot = exe->tls_index;
+        }
+        if (wn_tls_ensure_current(exe))
+            wn_log(WN_LOG_WARN, "loader: pre-entry repair: static-TLS block "
+                   "was missing for the entry thread (index %u) - allocated",
+                   exe->tls_index);
+        wn_teb *teb = wn_teb_current();
+        wn_log(WN_LOG_DEBUG, "loader: pre-entry TLS: index %u, teb %p, "
+               "array %p, block %p", exe->tls_index, (void *)teb,
+               teb ? (void *)teb->tls_array : NULL,
+               teb ? (void *)(uintptr_t)teb->tls_array[exe->tls_index]
+                   : NULL);
+    } else if (exe->kind == WN_MOD_PE &&
+               wn_pe_dirs(&exe->pe)[WN_IMAGE_DIR_TLS].virtual_address) {
+        wn_log(WN_LOG_ERR, "loader: exe has a TLS directory but no index was "
+               "assigned - static TLS is broken for this image");
+    }
+
     wn_log(WN_LOG_INFO, "loader: calling entry point at %s+0x%x",
            exe->name, exe->pe.entry_rva);
     /* Windows calls the EXE entry exactly like DllMain: (hInstance = image

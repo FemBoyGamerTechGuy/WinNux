@@ -125,6 +125,100 @@ int64_t wn_seh_call_unhandled_filter(void *exception_pointers)
     return r;
 }
 
+/* --- faulting-instruction classification ------------------------------------ */
+
+/* Linux tells us SEGV_MAPERR/SEGV_ACCERR but NOT read-vs-write: a store to
+ * an unmapped page arrives as SEGV_MAPERR, which we used to report as
+ * "read" — the LuaForWindows crash (mov [eax+4],edx at exe+0x4325) was a
+ * WRITE reported as a read. Decode the common memory opcode forms instead;
+ * return -1 when unknown (caller falls back to the si_code heuristic).
+ * Called with RIP already validated to live in a mapped guest module. */
+static int fault_is_write(const uint8_t *c, size_t n)
+{
+    size_t i = 0;
+#if defined(__x86_64__)
+    const int is64 = 1;
+#else
+    const int is64 = 0;
+#endif
+    /* prefixes: legacy segment/operand/address/rep/lock + REX on x64 */
+    while (i < n) {
+        uint8_t b = c[i];
+        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+            b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 ||
+            b == 0x64 || b == 0x65 || (is64 && (b & 0xF0) == 0x40)) {
+            i++;
+            continue;
+        }
+        break;
+    }
+    if (i >= n)
+        return -1;
+    uint8_t op = c[i];
+#define REG_FIELD() ((i + 1 < n) ? ((c[i + 1] >> 3) & 7) : 0xFFu)
+    switch (op) {
+    case 0x88: case 0x89: case 0xC6: case 0xC7:      /* mov r/m, r / imm */
+    case 0xA2: case 0xA3:                            /* moffs stores */
+    case 0xA4: case 0xA5: case 0xAA: case 0xAB:      /* movs/stos */
+    case 0x8C: case 0x86: case 0x87: case 0x8F:      /* mov sreg / xchg / pop */
+        return 1;
+    case 0x8A: case 0x8B: case 0xA0: case 0xA1:      /* loads */
+    case 0x8D: case 0x8E:                            /* lea / mov r, sreg */
+    case 0xA6: case 0xA7: case 0xAC: case 0xAD:      /* cmps/scas */
+    case 0xAE: case 0xAF:
+    case 0x84: case 0x85:                            /* test r/m, r */
+        return 0;
+    case 0x0F: {                                     /* two-byte forms */
+        if (i + 1 >= n)
+            return -1;
+        switch (c[i + 1]) {
+        case 0x11: case 0x13: case 0x15: case 0x17:  /* movups/h/lps stores */
+        case 0x29: case 0x2B: case 0x7E: case 0x7F:  /* movaps/movd/movdqa */
+        case 0xD6: case 0xE7:                        /* movq/movntdq */
+            return 1;
+        case 0x10: case 0x12: case 0x14: case 0x16:  /* loads */
+        case 0x28: case 0x2A: case 0x2C: case 0x2D:
+        case 0x2E: case 0x6E: case 0x6F:
+        case 0xB6: case 0xB7: case 0xBE: case 0xBF:  /* movzx/movsx */
+        case 0xAF:                                    /* imul r, r/m */
+            return 0;
+        default:
+            return -1;
+        }
+    }
+    case 0x80: case 0x81: case 0x82: case 0x83: {    /* ALU r/m, imm */
+        uint8_t reg = REG_FIELD();
+        return (reg == 6 || reg == 7) ? 0 : 1;      /* TEST/CMP read */
+    }
+    case 0xC0: case 0xC1:                            /* shift imm */
+    case 0xD0: case 0xD1: case 0xD2: case 0xD3:      /* shift cl / by 1 */
+        return 1;                                     /* rmw, dest = r/m */
+    case 0xF6: case 0xF7: {                          /* grp3 r/m, imm */
+        uint8_t reg = REG_FIELD();
+        return (reg == 0 || reg == 1 || reg >= 4) ? 0 : 1; /* not/neg rmw */
+    }
+    case 0xFE: case 0xFF: {                          /* inc/dec/call/push */
+        uint8_t reg = REG_FIELD();
+        if (reg == 0 || reg == 1)
+            return 1;                                 /* inc/dec [mem] */
+        return 0;                                     /* call/jmp/push read */
+    }
+    case 0xD9: case 0xDA: case 0xDB: case 0xDC:      /* x87 memory forms */
+    case 0xDD: case 0xDE: case 0xDF: {
+        uint8_t reg = REG_FIELD();
+        return (reg == 2 || reg == 3 || reg == 7) ? 1 : 0; /* fst/fstp */
+    }
+    default:
+        /* 0x00-0x3F ALU pairs: opcode bit 1 = direction (0: r/m <- r). */
+        if (op < 0x38)
+            return (op & 2) ? 0 : 1;
+        if (op == 0x38 || op == 0x39 || op == 0x3A || op == 0x3B)
+            return 0;                                 /* cmp */
+        return -1;
+    }
+#undef REG_FIELD
+}
+
 /* --- dispatch ------------------------------------------------------------------ */
 
 /* Returns 1 if a VEH handler continued execution (context patched). */
@@ -207,6 +301,11 @@ static void fill_context(wn_context64 *ctx, const ucontext_t *uc)
     ctx->rsi = uc->uc_mcontext.gregs[REG_ESI];
     ctx->rdi = uc->uc_mcontext.gregs[REG_EDI];
     ctx->rip = uc->uc_mcontext.gregs[REG_EIP];
+    /* greg_t is SIGNED 32-bit here: stack addresses >= 0x80000000 sign-
+     * extended into the kernel half of the u64 context copy — garbage in
+     * crash reports (RSP=0xfffffffff7b5a130). Zero-extend the half. */
+    ctx->rsp &= 0xFFFFFFFFu;
+    ctx->rbp &= 0xFFFFFFFFu;
 #endif
     if (uc->uc_mcontext.fpregs)
         memcpy(ctx->fltsave, uc->uc_mcontext.fpregs, 512);
@@ -229,16 +328,15 @@ static const char *exc_name(uint32_t c)
 static __attribute__((noreturn)) void
 crash_report(wn_exc_record *rec, wn_context64 *ctx)
 {
-    wn_log(WN_LOG_ERR, "seh: guest exception %s (0x%08X) at putty-ish rip "
-           "0x%llx -> app filter", exc_name(rec->exception_code),
-           rec->exception_code, (unsigned long long)ctx->rip);
+    char where[96];
+    wn_module_describe_addr((const void *)(uintptr_t)ctx->rip, where, sizeof where);
+    wn_log(WN_LOG_ERR, "seh: guest exception %s (0x%08X) at %s -> app filter",
+           exc_name(rec->exception_code), rec->exception_code, where);
     if (g_unhandled) {
         wn_exc_pointers ep = { rec, ctx };
         if (g_unhandled(&ep) == WN_EXC_EXECUTE_HANDLER)
             exit((int)rec->exception_code);
     }
-    char where[96];
-    wn_module_describe_addr((const void *)(uintptr_t)ctx->rip, where, sizeof where);
     wn_log(WN_LOG_ERR, "===== unhandled exception %s (0x%08X) at %s =====",
            exc_name(rec->exception_code), rec->exception_code, where);
     if (rec->exception_code == 0xC0000005 && rec->number_parameters >= 2)
@@ -368,13 +466,28 @@ static void signal_handler(int sig, siginfo_t *si, void *uc_)
     memset(&rec, 0, sizeof rec);
     switch (sig) {
     case SIGSEGV:
-    case SIGBUS:
+    case SIGBUS: {
         rec.exception_code = 0xC0000005;
-        rec.exception_information[0] = (si->si_code == SEGV_ACCERR ||
-                                        si->si_code == BUS_ADRERR) ? 1 : 0;
+        /* Read vs write: decode the faulting instruction (RIP is inside a
+         * mapped guest module here, so the opcode bytes are readable). */
+        int is_write = -1;
+        {
+            const uint8_t *code = (const uint8_t *)(uintptr_t)
+#if defined(__x86_64__)
+                uc->uc_mcontext.gregs[REG_RIP];
+#else
+                uc->uc_mcontext.gregs[REG_EIP];
+#endif
+            is_write = fault_is_write(code, 16);
+        }
+        if (is_write < 0)
+            is_write = (si->si_code == SEGV_ACCERR ||
+                        si->si_code == BUS_ADRERR) ? 1 : 0;
+        rec.exception_information[0] = (uint64_t)is_write;
         rec.exception_information[1] = (uint64_t)(uintptr_t)si->si_addr;
         rec.number_parameters = 2;
         break;
+    }
     case SIGFPE:
         rec.exception_code = si->si_code == FPE_INTDIV ? 0xC0000094 : 0xC0000095;
         rec.number_parameters = 0;

@@ -530,9 +530,12 @@ static uint64_t norm_va(const wn_pe_image *img, uint64_t va)
     return va;
 }
 
-uint32_t wn_pe_tls_setup(wn_pe_image *img, uint32_t *out_index)
+uint32_t wn_pe_tls_setup(wn_pe_image *img, uint32_t *out_index,
+                         uint64_t *out_index_va)
 {
     *out_index = 0;
+    if (out_index_va)
+        *out_index_va = 0;
     const wn_image_data_directory *dirs = wn_pe_dirs(img);
     const wn_image_data_directory *dir = &dirs[WN_IMAGE_DIR_TLS];
     if (dir->virtual_address == 0)
@@ -566,6 +569,8 @@ uint32_t wn_pe_tls_setup(wn_pe_image *img, uint32_t *out_index)
     uint32_t *slot = (uint32_t *)(uintptr_t)index_va;
     *slot = index;
     *out_index = index;
+    if (out_index_va)
+        *out_index_va = index_va;
     wn_log(WN_LOG_DEBUG, "pe: '%s' static TLS index %u (callbacks at 0x%llx)",
            img->path, index, (unsigned long long)callbacks_va);
     return 0;

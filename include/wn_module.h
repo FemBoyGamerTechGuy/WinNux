@@ -38,6 +38,7 @@ typedef struct wn_module {
     uint32_t          refcount;
     int               loading;       /* import cycle guard */
     uint32_t          tls_index;     /* static TLS index, 0 = none */
+    uint64_t          tls_index_va;  /* guest VA of the index slot (TLS dir AddrOfIndex) */
     struct wn_module *next;          /* global module list */
     void             *ldr_entry;     /* guest-visible LDR_DATA_TABLE_ENTRY */
     struct wn_module *next_ldr_load, *prev_ldr_load;

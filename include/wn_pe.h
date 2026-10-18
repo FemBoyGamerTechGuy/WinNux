@@ -272,6 +272,6 @@ void    *wn_pe_resolve_export(wn_pe_image *img, const char *name,
 
 /* Fill the per-thread static TLS block for this image; assign its TLS index.
  * Called once per image at load. Returns 0 on success. */
-uint32_t wn_pe_tls_setup(wn_pe_image *img, uint32_t *out_index);
+uint32_t wn_pe_tls_setup(wn_pe_image *img, uint32_t *out_index, uint64_t *out_index_va);
 
 #endif /* WN_PE_H */

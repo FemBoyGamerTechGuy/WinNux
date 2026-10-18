@@ -1,4 +1,91 @@
 
+## Date: 2026-10-18 (session 10)
+
+### The LuaForWindows entry crash: the first guest AV, root-caused to a NULL static-TLS block
+
+User report (native Artix box, one line of log):
+`EXCEPTION_ACCESS_VIOLATION at luaforwindows_v5.1.5-52.exe+0x4325, access READ at 0x4`.
+The failure point moved again — past PE mapping, past DLL probing, past the
+entry call, INTO Delphi's System-unit initialization. Three facts from static
+analysis of the exe (downloaded the identical release file):
+
+1. `exe+0x4325` is `mov [eax+4], edx` — a WRITE, not a read (the report was
+   lying: see the seh fix below). eax came back 0 from the preceding
+   `call 0x403154` — Inno's threadvar fast-path accessor:
+   `mov fs:[0x2C] -> TLS array; mov eax,[edx+eax*4]` with the index from
+   the PE TLS directory's AddressOfIndex (0x40d3d0). Register residue
+   (ESI=entry point, EDI=callbacks array — guest_entry_shim locals preserved
+   by the stdcall callee) proves the crash is inside the FIRST entry-chain
+   threadvar access of the process.
+2. The block in `fs:0x2C[index]` was NULL. qemu-i386 + a hand-rolled GDB
+   remote client (scripts/tls_probe.py — new dev tool) breaking at the entry
+   point and at the accessor proves the whole chain HEALTHY under emulation:
+   index=1 written by the loader, block allocated, accessor returns a real
+   pointer at the exact same call site (RA 0x404323) that kills the user's
+   box. The failure is native-only; by elimination (both TEBs registered
+   and backfilled, LDT entries unique, TlsAlloc far away at 256+, no
+   VirtualAlloc MAP_FIXED anywhere) the surviving explanations are
+   build/env-specific loss of the index-slot write or the per-thread block.
+3. Corrupting the index slot to 0 via the GDB stub reproduces the user's
+   crash byte-for-byte (same RIP, same write-to-0x4, same register shape) —
+   that is the failure signature on the user's machine.
+
+### Fix: the Windows loader contract, enforced at the last moment
+
+Windows guarantees before the EXE entry runs: the TLS dir's index slot holds
+the assigned index AND every thread's TLS array carries an initialized
+block. `guest_entry_shim` now re-verifies both immediately before calling
+the entry point (main.c): rewrites the index slot if it disagrees (WARN +
+log of both values), allocates the current thread's block if missing
+(wn_tls_ensure_current in thread.c — which also refuses to write through an
+fs:0x18 that does not resolve to a registered TEB, and says so at ERR
+level), and logs the full chain (index/TEB/array/block) at DEBUG. Proven by
+gdbstub fault injection: clobbering the slot inside guest_entry_shim before
+the check → the WARN fires ("held 0, expected 1 — rewriting") and the app
+keeps running instead of dying at exe+0x4325. Whatever link is broken on
+the user's box, the next run either heals silently or names the broken
+link in the log.
+
+Also hardened: wn_tls_register_module's early-returns (dir too small, RVA
+unmapped) were SILENT — now WARN with "static TLS NOT installed (expect
+guest crashes)". wn_pe_tls_setup gained an out_index_va (cached guest VA of
+the index slot, stored on wn_module) so the pre-entry check cannot drift
+from the load-time parse.
+
+### seh.c: the crash report was lying about reads
+
+Linux gives SEGV_MAPERR/SEGV_ACCERR — it does NOT say read vs write, and a
+store to unmapped memory arrives as SEGV_MAPERR, which the old code mapped
+to "read". The user's log said "access READ at 0x4" for a write, sending
+the whole hunt in the wrong direction initially. The signal handler now
+decodes the faulting instruction's opcode (prefix skip + the common
+memory forms: mov pairs 88/89/8A/8B, imm stores C6/C7, moffs A0-A3, string
+ops, x87 fst/fstp, SSE loads/stores, ALU/shift/group reg-field split,
+inc/dec vs call/push) and only falls back to the si_code guess when the
+form is unknown. Bonus fixes in the same report: the "putty-ish rip"
+leftover label now prints the real module+RVA; i386 gregs are zero-extended
+so RSP no longer prints as 0xfffffffff7b5a130 (greg_t is SIGNED 32-bit;
+stack addresses sign-extended into the kernel half).
+
+Verified end-to-end under qemu via fault injection: the report now says
+`access write at address 0x4` at `luaforwindows_v5.1.5-52.exe+0x4325`
+with clean registers — matching the disassembly exactly.
+
+### New regression test + restored 32-bit dev environment
+
+The sandbox reset wiped toolchain/root32 + qemu + the i686 mingw cross
+(again); rebuilt from debs (libc6-i386, libc6-dev-i386, lib32gcc-14-dev,
+lib32gcc-s1 — glibc dlopens libgcc_s.so.1 for pthread_exit — qemu-user,
+gcc/binutils/runtime for mingw i686, mingw-w64-i686-dev + common; the
+libc.so ld script needed absolute-path patching, root32/lib -> usr/lib32
+symlink for qemu -L). t16_tls32.c: __thread globals + CreateThread —
+locks the static-TLS chain on BOTH arches (index write, per-thread
+template copy, main/worker isolation: worker sees the template value, not
+main's mutation). 16/16 x64 suite; t01/t06/t09/t16 i386 + 7zr usage under
+qemu; LuaForWindows alive CPU-bound with zero repair lines (healthy chain,
+as designed); fuzz 3000 iterations clean.
+
+
 ## Date: 2026-10-18 (session 9)
 
 ### The i386 stack-smash: one uint64_t extern decl vs the whole ABI

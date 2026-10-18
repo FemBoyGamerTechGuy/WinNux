@@ -7,25 +7,29 @@ put it here. Never silently drop items; move them to STATUS.md when done.
 
 Console-class PE32 now runs end-to-end (session 7: modify_ldt check,
 wn_abiword width pass, FILE stride, MSG overlay, wsprintf/onexit/
-localtime/qsort — all qemu-verified, 64-bit 15/15). Next:
+localtime/qsort — all qemu-verified, 64-bit 16/16). Session 10 fixed the
+guest-AV crash class (NULL static-TLS block at the first threadvar access:
+pre-entry loader-contract guarantee + honest seh read/write reports).
+Next:
 
 0. MSVC C++ EH: _CxxThrowException unwinding (scope tables, catch matching,
    __CxxFrameHandler on i386 via fs:0 chain, x64 via .pdata) — 7zr.exe
    archive completion is blocked on it (currently a clean loud exit).
 0a. 7zr.exe i386 finish: after C++ EH, verify the full create+extract
    roundtrip; watch the 1GB mapping it takes (LZMA dictionary sizing?).
-0b. LuaForWindows on native hardware (user): the payload decompression is
-   CPU-heavy under emulation; on real i386 it should reach the GUI. Watch
-   for: window creation, Inno dialog rendering, /SILENT CLI mode.
+0b. LuaForWindows on native hardware (user): session 10's pre-entry TLS
+   guarantee heals (and NAMES — WARN/ERR log lines) the index-slot/block
+   loss that killed exe+0x4325. If it still crashes with no repair line,
+   the honest crash report + WINNUX_LOG=debug pre-entry state line is the
+   evidence to send back. Past that: window creation, Inno dialog
+   rendering, /SILENT CLI mode.
 
-1. **User's Arch box validation (NEXT)**: the session-9 canary crash
-   chain is fixed (wn_abiword extern decls + res_dir_base PE32 layout
-   + the six presence-probe DLLs now builtins). `make winnux32 &&
-   ./bin/winnux run LuaForWindows_v5.1.5-52.exe` should now get past
-   DLL probing into real startup — expect the next wall to be Inno's
-   decompression/GUI bring-up. 7zr.exe (console) is the next-best
-   candidate. NOTE: winnux32 builds now need -fstack-protector-strong
-   (Makefile passes it) — matches the user's Arch gcc defaults.
+1. **User's Arch box validation (NEXT)**: rebuild (`make winnux32`) and
+   rerun LuaForWindows. Two outcomes: (a) a "loader: pre-entry repair"
+   WARN line → send it back, it names the broken link for a real root
+   cause fix; (b) no repair line + still crashing → send the new report
+   (it now says read/write correctly and prints module+RVA twice).
+
 2a. **i386 WinMain-CRT exit crash (NEXT, precise repro)**: `gui32.exe`
    (mingw i686, WinMain entry — scripts/gui32.c) crashes after WinMain
    returns: SIGSEGV si_addr=0xfffffffc (a [reg-4] deref, reg=0 — smells

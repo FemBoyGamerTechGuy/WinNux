@@ -1,0 +1,4 @@
+0
+~main: counter=7 buf=thread tid=
+~worker: counter=7 buf=thread tid=
+~worker exit=107 main counter=8

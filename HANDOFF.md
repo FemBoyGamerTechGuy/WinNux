@@ -3,40 +3,46 @@
 Read this before continuing. Pair with STATUS.md (what works + proof) and
 TODO.md (prioritized backlog).
 
-## Last session (session 9) — what happened
+## Last session (session 10) — what happened
 
-The user reported LuaForWindows dying with glibc `*** stack smashing
-detected ***` right after six DLL-not-found warnings. Three-part fix:
+The user's next native report (LuaForWindows, one log line):
+`EXCEPTION_ACCESS_VIOLATION at luaforwindows+0x4325, access READ at 0x4`,
+registers mostly zero, RSP sign-extended garbage. Root-caused:
 
-1. The smash: user32.c's extern decls used uint64_t for parameters the
-   definitions type wn_abiword — on i386 that is 8 pushed vs 12 popped
-   bytes (stdcall ret 12) per call, and the skewed ESP pushed straight
-   through load_string_lookup's rid[16] and its canary. All 6 decls now
-   use wn_abiword. Why we never saw it: Debian gcc has no default stack
-   protector, Arch gcc does; the Makefile now passes
-   -fstack-protector-strong everywhere (use scripts/dev/canary32.c as
-   LD_PRELOAD under qemu to see any future canary trip with a frame dump).
-2. The DLLs: apphelp/propsys/oleacc/profapi/comres/clbcatq are Inno
-   presence probes — added as builtins in src/dlls/sysdlls.c (loads
-   succeed, functions fail honestly, placeholder files appear in
-   drive_c/windows/system32). Startup log is clean.
-3. Fuzzer-found (re-run exposed them): wild ImageBase above 2^47 now
-   rejected before MAP_FIXED_NOREPLACE (LA57 kernels would map it);
-   wn_pe_dirs() no longer re-reads e_lfanew from the mapped image (a
-   VA-0 section clobbers the mapped DOS header) — the validated offset
-   is cached in wn_pe_image.opt_off; the header blob must fit in
-   SizeOfHeaders and the file.
-
-Verified: 15/15 tests, fuzz 45k mutations clean, lua 7/WIN, sqlite,
-putty alive, 7zr usage, LuaForWindows alive with zero warnings and
-zero canary trips under qemu.
+- `exe+0x4325` is `mov [eax+4],edx` — Delphi System-unit init writing
+  threadvar[1] through the block returned by Inno's fast-path accessor
+  (`fs:[0x2C][*(DWORD*)0x40d3d0]`, the PE TLS dir's index slot). The
+  returned block was NULL on the user's box.
+- The old crash report MIS-CLASSIFIED the write as a read (Linux
+  SEGV_MAPERR carries no direction) and printed sign-extended i386 gregs.
+  Both fixed: fault_is_write() opcode decode in seh.c, gregs zero-extended,
+  "putty-ish rip" label replaced by real module+RVA.
+- The whole static-TLS chain is provably healthy under qemu-i386 (new
+  scripts/tls_probe.py — a GDB-remote client for qemu's -g stub; also the
+  tool that injected the fault). The native failure is index-slot-loss or
+  block-loss by elimination; gdbstub-injecting it reproduces the user's
+  crash byte-for-byte.
+- FIX: guest_entry_shim now enforces the Windows loader contract at the
+  last moment — index slot rewritten if wrong (WARN), entry thread's block
+  allocated if missing (WARN), full chain logged at DEBUG, refusal +
+  ERR if fs:0x18 does not resolve to a registered TEB. Injected fault is
+  healed and the app survives; the WARN/ERR text names the broken link
+  for the next native run.
+- New t16_tls32 test locks static TLS on both arches (16/16 suite);
+  i386 t01/t06/t09/t16 + 7zr verified under qemu; fuzz 3000 clean.
+- Sandbox reset had wiped toolchain/root32 + qemu + i686 mingw AGAIN —
+  rebuilt from debs (see run32.sh header + STATUS session 10; lib32gcc-s1
+  is now required: glibc dlopens libgcc_s.so.1 on pthread_exit).
 
 ## Next 3 steps
 
-1. User's native re-test of LuaForWindows (the whole point of session
-   9): past DLL probing, the Inno engine should decompress and raise
-   its wizard GUI — expect the next crash to be in that path; use
-   scripts/dev/canary32.so + WINNUX_LOG=trace first, gdbstub second.
+1. User's native re-test of LuaForWindows: `make winnux32 && ./bin/winnux
+   run .../LuaForWindows_v5.1.5-52.exe`. If the pre-entry repair fires,
+   the WARN/ERR line in the log names the exact broken link (slot value,
+   missing block, or unregistered TEB) — that pinpoints the native-only
+   root cause for a REAL fix rather than the guarantee. If no repair line
+   and it still crashes: grab the (now honest) crash report + WINNUX_LOG=debug
+   (adds "pre-entry TLS: index/teb/array/block").
 2. MSVC C++ EH (i386 fs:0 scope frames + __CxxFrameHandler, then x64
    .pdata): unlocks 7zr completion and modern MSVC 32-bit error paths.
 3. The putty follow-ups (message-queue overflow, EnableWindow+SEH scope

@@ -82,22 +82,36 @@ void wn_tls_register_module(struct wn_module *m)
     uint64_t ts = 0, te = 0;
     uint32_t zero = 0;
     if (m->pe.is_64) {
-        if (dir->size < sizeof(wn_image_tls_directory64))
+        if (dir->size < sizeof(wn_image_tls_directory64)) {
+            wn_log(WN_LOG_WARN, "tls: '%s' TLS dir size 0x%x < PE32+ minimum - "
+                   "static TLS NOT installed (expect guest crashes)",
+                   m->name, dir->size);
             return;
+        }
         const wn_image_tls_directory64 *tls =
             wn_pe_rva(&m->pe, dir->virtual_address, sizeof *tls);
-        if (!tls)
+        if (!tls) {
+            wn_log(WN_LOG_WARN, "tls: '%s' TLS dir RVA 0x%x unmapped - static "
+                   "TLS NOT installed", m->name, dir->virtual_address);
             return;
+        }
         ts = tls->start_address_of_raw_data;
         te = tls->end_address_of_raw_data;
         zero = tls->size_of_zero_fill;
     } else {
-        if (dir->size < sizeof(wn_image_tls_directory32))
+        if (dir->size < sizeof(wn_image_tls_directory32)) {
+            wn_log(WN_LOG_WARN, "tls: '%s' TLS dir size 0x%x < PE32 minimum - "
+                   "static TLS NOT installed (expect guest crashes)",
+                   m->name, dir->size);
             return;
+        }
         const wn_image_tls_directory32 *tls =
             wn_pe_rva(&m->pe, dir->virtual_address, sizeof *tls);
-        if (!tls)
+        if (!tls) {
+            wn_log(WN_LOG_WARN, "tls: '%s' TLS dir RVA 0x%x unmapped - static "
+                   "TLS NOT installed", m->name, dir->virtual_address);
             return;
+        }
         ts = tls->start_address_of_raw_data;
         te = tls->end_address_of_raw_data;
         zero = tls->size_of_zero_fill;
@@ -145,6 +159,36 @@ void wn_tls_thread_init(wn_teb *teb)
     for (wn_tls_mod *tm = g_tls_mods; tm; tm = tm->next)
         tls_alloc_block(teb, tm);
     pthread_mutex_unlock(&g_tls_lock);
+}
+
+int wn_tls_ensure_current(struct wn_module *m)
+{
+    if (!m || m->tls_index == 0 || m->tls_index >= 512)
+        return 0;
+    int repaired = 0;
+    pthread_mutex_lock(&g_tls_lock);
+    wn_tls_mod *tm = NULL;
+    for (wn_tls_mod *t = g_tls_mods; t; t = t->next)
+        if (t->mod == m) { tm = t; break; }
+    if (tm) {
+        wn_teb *teb = wn_teb_current();
+        int known = 0;
+        for (wn_tls_teb_node *n = g_tls_tebs; n; n = n->next)
+            if (n->teb == teb) { known = 1; break; }
+        if (!known) {
+            /* %fs:0x18 resolving to something other than a registered TEB
+             * would mean TEB hosting itself is broken on this machine -
+             * DO NOT write through it (unknown memory); say it loudly. */
+            wn_log(WN_LOG_ERR, "tls: %%fs:0x18 -> %p is not a registered "
+                   "TEB - guest TLS state broken, refusing blind repair",
+                   (void *)teb);
+        } else if (teb->tls_array[m->tls_index] == 0) {
+            tls_alloc_block(teb, tm);
+            repaired = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_tls_lock);
+    return repaired;
 }
 
 /* --- suspend/resume (SIGUSR1) ----------------------------------------------

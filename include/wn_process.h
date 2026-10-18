@@ -350,6 +350,10 @@ int  wn_process_atexit(void (*fn)(void));
 void     wn_tls_register_module(struct wn_module *m);
 void     wn_tls_thread_register(wn_teb *teb);
 void     wn_tls_thread_init(wn_teb *teb);
+/* Loader-contract guard: make sure the CURRENT thread's TLS array carries
+ * the block for module m. Returns 1 when it had to allocate (i.e. something
+ * in the install chain was missing - callers log that loudly). */
+int      wn_tls_ensure_current(struct wn_module *m);
 
 /* futex helper shared by sync + suspend. */
 int      wn_futex_wait(uint32_t *addr, uint32_t expected, const struct timespec *abs_ts);

@@ -307,7 +307,7 @@ static wn_module *load_pe(const char *host_path, const char *display_name,
         goto fail;
 
     if (!is_exe) {
-        rc = wn_pe_tls_setup(&m->pe, &m->tls_index);
+        rc = wn_pe_tls_setup(&m->pe, &m->tls_index, &m->tls_index_va);
         if (rc)
             goto fail;
         if (m->tls_index)
@@ -367,7 +367,7 @@ wn_module *wn_module_load_exe(const char *host_path)
     wn_module *m = load_pe(host_path, base, 1);
     if (!m)
         return NULL;
-    uint32_t rc2 = wn_pe_tls_setup(&m->pe, &m->tls_index);
+    uint32_t rc2 = wn_pe_tls_setup(&m->pe, &m->tls_index, &m->tls_index_va);
     if (rc2)
         return NULL;
     if (m->tls_index)
