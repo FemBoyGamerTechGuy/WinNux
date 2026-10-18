@@ -1,3 +1,94 @@
+## Date: 2026-10-18 (session 6)
+
+### The PuTTY config box is now the REAL dialog
+
+The category pane root cause was found by downloading putty 0.85's source
+(the config box is built around a **SysTreeView32** that putty creates
+dynamically — our unknown-class path returned 0 **silently**, so the pane
+was empty). Three fixes landed:
+
+1. **SysTreeView32 builtin control class** (user32): TVM_INSERTITEM/
+   GETITEM/SETITEM/GETNEXTITEM/SELECTITEM/EXPAND/GETCOUNT/GETITEMRECT,
+   TVN_SELCHANGED notifications (synchronous WM_NOTIFY, exactly how
+   Windows delivers them inside TreeView_SelectItem), painted tree with
+   +/− boxes and selection highlight, click + arrow-key navigation.
+2. **The Win64 TVI_* sign-extension trap**: putty passes TVI_ROOT as
+   0xFFFFFFFFFFFF0000 (it is `(HTREEITEM)(ULONG_PTR)-0x10000`); our
+   zero-extended 0xFFFF0000 constant rejected every ROOT insert, so the
+   walk degenerated and Session/Terminal/Window/Connection vanished.
+   Found by disassembling the TVI_ROOT immediate in putty.exe. With the
+   fix the tree is EXACTLY real putty's: Session->Logging,
+   Terminal->Keyboard/Bell/Features, Window->Appearance/Behaviour/
+   Translation->Copy/Selection/Colours, Connection->Data/Proxy/SSH->
+   Kex/Host keys/Cipher/Auth->Credentials/GSSAPI/TTY/X11/Tunnels/Bugs/
+   More bugs/Serial/Telnet/Rlogin/SUPDUP — and the initial selection is
+   **Session** (Host Name panel), like Windows.
+3. **BS_GROUPBOX is 0x7, not 0x5** (0x5 is BS_3STATE — our comment lied).
+   Group boxes now paint their frame+label directly onto the PARENT
+   canvas with a transparent interior (Windows composes them last, top
+   of the sibling z-order; blitting their opaque child surface covered
+   the fields — the "gray overlay boxes"). VLM-verified: Host Name,
+   Port, Connection-type radios and the Saved Sessions list are all
+   visible in the Session panel.
+
+Also fixed this session (user-reported): the **EMFILE registry failure**
+(ensure_gui never set state=1 on success — every CreateWindowEx re-ran
+wn_backend_init and LEAKED an eventfd; ~1 per dialog item, putty's fds
+were at 72 while idle → now 5), **& accelerator prefixes** (DrawText now
+parses '&x'/'&&' unless DT_NOPREFIX; "Cate&gory:" renders correctly),
+**ShellExecuteA/W/Ex** (URLs/files via xdg-open, .exe/.bat re-launch
+through our own loader; putty's About-box link previously failed with
+SE_ERR_NOASSOC), and **resize hardening** (XSetWMNormalHints min==max
+for windows without WS_THICKFRAME — X11 WMs resize anything, Windows
+dialogs are fixed; plus gdi32 window DCs re-bind their pixel buffer
+lazily in gdi_get() so a DC held across a resize cannot draw through
+freed memory).
+
+### 32-bit (i386): the loader, the build, and the re-exec — all landed
+
+`winnux run app.exe` on a PE32 (i386) image now re-execs **bin/winnux32**
+(a complete i386 build of the runtime). Everything statically verifiable
+is verified on this box; RUNTIME verification needs a machine whose
+kernel allows 32-bit syscalls (this container's seccomp kills ANY
+i386 code — even a static exit(42) — with SIGSYS; the user's Arch box
+runs it fine):
+
+- **PE32 parsing is real**: `winnux imports 7zr.exe` walks all 6
+  sections and classifies every import (previously rejected at the
+  machine check). A mingw-i686-built test exe parses with **50/50
+  imports OK, zero stubs**.
+- **make winnux32 links**: ELF 32-bit LSB executable. Verified IN THE
+  BINARY: stdcall `ret N` sequences in the exports (compile-time
+  convention dispatch — Wine's model), the i386 stub trampoline bytes
+  (push info/jmp; pop eax; 6 cdecl args; plain ret), `modify_ldt`
+  (push 0x7b) + `mov fs,eax` (TEB hosting via LDT — glibc owns %gs).
+- **i386 TEB/PEB/LDR/critsect layouts** with per-arch _Static_asserts
+  (fs:0x18 self, fs:0x2C TLS, fs:0x30 PEB, fs:0x34 last error).
+- **msvcrt is cdecl (WN_CRTAPI) + varargs decode is per-bitness**
+  (4-byte slots, 8-aligned doubles on i386); the __p__* mingw startup
+  family (__p__iob/__p__fmode/__p__commode/__p___initenv/
+  __p___mb_cur_max/__lc_codepage) is implemented — every i686 mingw
+  exe calls them at startup.
+- **Toolchain discovery in the Makefile**: native -m32 (Arch needs the
+  **[multilib] repo enabled in /etc/pacman.conf** first —
+  `sudo pacman -Ss gcc-multilib` finds nothing without it — then
+  `pacman -S gcc-multilib lib32-gcc-libs`), or a local sysroot
+  (WINNUX_M32_SYSROOT; this dev box uses extracted glibc32 debs).
+
+Honest limits: 32-bit GUI structures (MSG/TVITEM/DRAWITEMSTRUCT ...) are
+still x64-shaped — the i386 milestone is console-first (7zr.exe is the
+acceptance case). The stdcall STUB path (unimplemented imports only)
+cannot pop the guest's args without per-export arg-count metadata —
+real exports carry their convention at compile time, so only missing
+APIs leak a frame per call.
+
+### Regression status
+
+15/15 tests. putty: tree renders with all categories, Session panel
+selected, panels switch on click/keys (VLM-verified screenshots),
+zero queue overflows, 5 fds. x64 build zero warnings; the whole tree
+compiles -m32 with the same flags and links bin/winnux32.
+
 # STATUS.md — the honest ledger
 
 Updated every session. Format: what works (with the test that proves it),

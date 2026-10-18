@@ -74,6 +74,11 @@ static WN_CRTAPI wn_ms_file *ms___iob_func(void)
     return g_std_files;
 }
 
+static WN_CRTAPI wn_ms_file *ms___p___iob(void)
+{
+    return g_std_files;   /* __p__iob returns the ARRAY address, like __iob_func */
+}
+
 /* --- errno bridge ---------------------------------------------------------------- */
 
 static __thread int g_ms_errno;
@@ -306,8 +311,20 @@ static WN_CRTAPI uint32_t ms__control87(uint32_t a, uint32_t b)
 
 static WN_CRTAPI void ms__fpreset(void) {}
 
-static WN_CRTAPI uint32_t ms___lc_codepage_func(void) { return 1252; }
-static WN_CRTAPI uint32_t ms___mb_cur_max_func(void) { return 1; }
+static int g_mb_cur_max = 1;
+static uint32_t g_lc_codepage = 1252;
+
+static WN_CRTAPI uint32_t ms___lc_codepage_func(void) { return g_lc_codepage; }
+static WN_CRTAPI uint32_t ms___mb_cur_max_func(void) { return (uint32_t)g_mb_cur_max; }
+
+/* The __p__* family: mingw-built 32-bit CRT startup calls these to get the
+ * ADDRESS of a CRT global (cdecl, return void*). Without them every i686
+ * mingw exe dies on startup. */
+static WN_CRTAPI int   *ms___p___mb_cur_max(void) { return &g_mb_cur_max; }
+static WN_CRTAPI int   *ms___p__commode(void)     { return &g_commode; }
+static WN_CRTAPI int   *ms___p__fmode(void)       { return &g_fmode; }
+static WN_CRTAPI char ***ms___p___initenv(void)   { return &g_initenv_ptr; }
+static WN_CRTAPI uint32_t *ms___lc_codepage(void) { return &g_lc_codepage; }
 
 /* localeconv: minimal C-locale lconv. */
 struct ms_lconv {
@@ -1171,6 +1188,12 @@ const wn_export_entry wn_msvcrt_exports[] = {
     { "__C_specific_handler", ms___C_specific_handler },
     { "__getmainargs", ms___getmainargs },
     { "__iob_func", ms___iob_func },
+    { "__p__iob", ms___p___iob },
+    { "__p___mb_cur_max", ms___p___mb_cur_max },
+    { "__p__commode", ms___p__commode },
+    { "__p__fmode", ms___p__fmode },
+    { "__p___initenv", ms___p___initenv },
+    { "__lc_codepage", ms___lc_codepage },
     { "__set_app_type", ms___set_app_type },
     { "__setusermatherr", ms___setusermatherr },
     { "_amsg_exit", ms__amsg_exit },

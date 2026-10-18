@@ -3,73 +3,56 @@
 Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
-## P0 — make PuTTY OPEN an SSH session (next user-visible milestone)
+## P0 — 32-bit (i386) runtime bring-up (user priority, next session)
 
-1. **Open-button launch path**: WM_COMMAND(BN_CLICKED, id=1009) is PROVEN
-   to reach putty's PuTTYConfigBox dlgproc (ctl_notify trace) but nothing
-   launches. Disassemble the dlgproc WM_COMMAND handler (image base
-   0x140000000; the Open handler is the next thing to map), find the call
-   that fails silently (suspects: config save to registry, CreateThread
-   for the session, terminal window creation on the launch thread, socket
-   events), and drive it to a live terminal window. Hostname typing
-   already round-trips (EN_CHANGE + GetDlgItemText verified).
-2. **Terminal window**: putty's terminal class (W-flavored APIs — the W
-   message APIs now exist) + per-line text output; the FreeType mono path
-   (Courier New → DejaVu Sans Mono) is ready for the cell metrics.
-3. **SysLink control class** (About box web link) — render as blue
-   underlined static, NM_CLICK notify (even a no-op beat failing class
-   registration, which is what happens now: unknown-class WARN).
+1. **Run 7zr.exe on the user's Arch box**: `make winn32` — no:
+   `make winnux32 && ./bin/winnux run 7zr.exe`. The loader, build, and
+   re-exec are all in place (session 6); runtime debugging needs a kernel
+   that allows i386 syscalls (the dev container's seccomp does not).
+   Likely first bugs: mingw CRT startup edge cases, printf/heap details,
+   handle-table 32-bit truncation. Also test the mingw-built hello32.exe
+   (50/50 imports clean) and LuaForWindows_v5.1.5-52.exe (NSIS installer
+   — needs more DLL coverage: setupapi/RichEdit).
+2. **32-bit GUI structures**: MSG/TVITEM/DRAWITEMSTRUCT/NMTREEVIEW/
+   DLGTEMPLATE32 are still x64-shaped; guard or dual-layout them.
+   (i386 GUI = after 7zr/console-class apps work.)
+3. **Stub arg-count metadata for stdcall i386**: unimplemented imports
+   leak the caller's arg frame (real exports are fine — their convention
+   is compiled in). A per-export arity table for the top ~50 stubs
+   covers the rest.
 
-## P1 — next milestone (SEH dispatch: scope tables)
+## P1 — make PuTTY OPEN an SSH session
 
-5. **x64 SEH scope-table execution** (on top of the now-real
-   RtlVirtualUnwind/RtlLookupFunctionEntry): walk frames at
-   RaiseException/crash time, call __C_specific_handler filters and
-   handlers, guest `__try/__except` actually catching faults. The
-   Rtl* exports exist; the DISPATCH loop is what's missing.
-   Test: mingw exe with __try/__except catching a deliberate AV.
-6. **Resource loading** — DONE session 3 (moved to STATUS.md: FindResource/
-   Load/Lock/SizeofResource walk putty's .rsrc; dialog templates resolve).
+4. **Open-button launch path**: WM_COMMAND(BN_CLICKED, id=1009) reaches
+   putty's dlgproc (proven) and the config dialog now works end-to-end
+   (tree + Session panel). Drive it: type a hostname, click Open, trace
+   the session-thread creation to the terminal window.
+5. **Terminal window**: putty's terminal class + per-line text output;
+   the FreeType mono path is ready.
+6. **SysLink control class** (About box web link) — the ShellExecute side
+   now works (xdg-open); the control itself still falls back.
 
 ## P2 — major features
 
-7. **32-bit (WoW64-style) PE support** — user priority. GROUNDWORK DONE
-   (session 5): `make check32` compiles the tree -m32 on multilib boxes,
-   WN_API is arch-mapped (cdecl on i386 for now), all x64-only asm is
-   guarded (stub trampoline, RtlCaptureContext, _setjmp/_longjmp, gs-TEB
-   read has an fs:0x18 i386 path). Real 32-bit exes CANNOT run yet; what
-   remains, in order: (a) per-export stdcall/cdecl dispatch metadata —
-   Win32 i386 APIs clean the stack, varargs are cdecl (Wine's model:
-   __stdcall on fixed-arity exports); (b) i386 TEB/PEB layouts +
-   set_thread_area TLS (fs:0x18 self-pointer) replacing the x64 gs:0x30
-   scheme; (c) i386 CONTEXT/EXCEPTION_RECORD layouts for SEH; (d) the
-   separate 32-bit runtime build (Wine model: 32-bit process, 32-bit
-   libX11 dlopen'd, console-first so GUI deps stay optional). Acceptance:
-   7zr.exe (32-bit, apps/) runs, then a 32-bit GUI app.
-8. **Vulkan surface + swapchain** (Xlib WSI, dlopen'd), then D3D9-on-Vulkan
-   start: device/present/swapchain objects, DXBC sm1-sm3 bytecode → SPIR-V
-   translator (headless development possible via `winnux bench`).
+7. **SEH scope-table dispatch** (x64): RtlVirtualUnwind exists; the
+   DISPATCH loop (call __C_specific_handler filters/handlers from a
+   guest SIGSEGV) is what's missing. Test: mingw __try/__except.
+8. **Vulkan surface + swapchain** (Xlib WSI, dlopen'd), then D3D9-on-
+   Vulkan start.
 9. **OpenGL/WGL over EGL/GLX** (dlopen libGL/libEGL).
-10. **Wayland surface path**: xdg_shell + shm present + seat input; runtime
-    auto-detect Wayland vs X11 (X11 fallback proven).
-11. **Audio**: winmm waveOut + XAudio2 over PipeWire/Pulse/ALSA (dlopen);
-    t-winmm test with a sine generator.
-12. **Console improvements**: real console buffer + ReadConsoleW/WriteConsoleW
-    (putty terminal is not a console, but CLIs want line editing).
+10. **Wayland surface path**: xdg_shell + shm present + seat input.
+11. **Audio**: winmm waveOut + XAudio2 over PipeWire/Pulse/ALSA (dlopen).
+12. **Console improvements**: real console buffer + ReadConsoleW/
+    WriteConsoleW (line editing for CLIs).
 
 ## P3 — breadth
 
-13. msvcrt gaps observed in real apps: _beginthreadex (7zr), signal/raise,
-    _onexit/__dllonexit (7zr), _XcptFilter, _except_handler3 (32-bit),
-    qsort stability nuances, _itoa/_atoi family completeness.
+13. msvcrt gaps: _beginthreadex (7zr), signal/raise, _onexit/__dllonexit,
+    _XcptFilter, _except_handler3 (32-bit), qsort stability nuances.
 14. ws2_32: getaddrinfo/getnameinfo (AI), WSAAsyncSelect via window
-    messages once the message pump posts custom messages.
-15. wininet/winhttp REAL implementation over ws2_32 (curl.exe test app).
-16. Chocolate Doom + SDL2 (software renderer) + Freedoom: needs SDL2.dll
-    coverage (threads, timers, audio, surfaces, events) — plan a
-    sdl2-builtin shim layer over our backends.
+    messages.
+15. wininet/winhttp REAL over ws2_32 (curl.exe test app).
+16. Chocolate Doom + SDL2 (software renderer) + Freedoom: SDL2.dll shim.
 17. Registry: RegEnumKeyA/W, RegDeleteKey, RegQueryInfoKey completeness.
 18. Files: FindFirstFileExW, GetFileAttributesEx, FILE_FLAG_* semantics.
-19. Chocolatey/installer support: setupapi + msi (much later).
-20. Performance: PE map cache, futex batching, GDI present blits (DMA-BUF
-    when Wayland lands), shader/pipeline cache under ~/.WinNux.
+19. Performance: PE map cache, futex batching, GDI present blits.
