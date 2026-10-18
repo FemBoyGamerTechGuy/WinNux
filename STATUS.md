@@ -1,3 +1,107 @@
+
+## Date: 2026-10-18 (session 8)
+
+### 32-bit i386: the PE-loading chain that "old" 32-bit apps depend on
+
+The user's LuaForWindows (Inno Setup, Delphi 2-era, /FIXED, no .reloc)
+died at "needs relocation but has no .reloc directory" — the loader never
+tried the preferred ImageBase. Now wn_pe_map asks the kernel for the
+EXACT preferred base with MAP_FIXED_NOREPLACE (4.17+; gracefully degrades
+on ancient kernels, verified return address). /FIXED images load at
+0x400000 like on Windows; everything else keeps relocating.
+
+That opened a five-layer dig, each a real 32-bit-only bug (the 64-bit
+build masked or lucked past every one):
+
+1. **Static TLS** (Delphi threadvars via fs:0x2C): the module TLS
+   registry used the x64 data-directory offset on PE32 images (dirs sit
+   at optional-header +96, not +112) so 32-bit modules never registered;
+   and the MAIN thread's TLS block was never allocated (thread-init only
+   ran for future threads). Now: arch-correct dir walk, a live-TEB
+   registry, in-place backfill on module load, blocks for new threads.
+2. **VirtualAlloc reserve→commit-in-place** (the Delphi MM arena
+   pattern): committing a reserved range made a FRESH mmap which the
+   kernel displaced past the reservation; the caller kept writing to the
+   still-PROT_NONE reserve (crash at arena+0xffc). Now commit-in-place
+   mprotects inside the reservation; also correct MEM_COMMIT/MEM_RESERVE
+   constants (the old code tested 0x1000 twice), page-readwrite maps to
+   R|W (not W alone), and MEMORY_BASIC_INFORMATION is filled with the
+   i386 28-byte layout (was: 48-byte x64 overlay stomping 20 bytes of
+   guest stack) and VirtualQuery returns 28.
+3. **GetSystemInfo**: wrote the 48-byte x64 layout on i386 (36 bytes,
+   4-byte fields) — overwrote the caller's adjacent locals and left
+   dwNumberOfProcessors/dwAllocationGranularity reading 0; Delphi's
+   VirtualQuery region-walk then computed steps from zeroed fields and
+   jumped through wild pointers (the "call the GOT" crashes). Arch-split
+   layouts now; also fixed x64's dwPageSize offset while there.
+4. **sscanf("%lx", (unsigned long*)&uint64)** writes only 4 bytes on
+   i386: /proc/self/maps parsing in VirtualQuery/VirtualProtect matched
+   nothing (VirtualQuery of the EXE BASE returned failure), so every
+   map-walking guest saw garbage. Parse into unsigned long, then widen.
+5. **PIC codegen on a -no-pie link** (Debian default -fpic): every host
+   function kept EBX = GOT base; that value leaked across guest calls
+   and the guest eventually CALLED it (exec fault at _GLOBAL_OFFSET_TABLE_).
+   CFLAGS/M32FLAGS now -fno-pic -no-pie; the 64-bit link needed -no-pie
+   added for the new objects.
+
+Plus: the i386 stub trampoline now does **stdcall-aware returns**
+(curated per-export pop table + `add esp,imm` caller-disassembly
+heuristic; before, every stubbed stdcall call leaked its arg frame and
+shifted the guest stack), the stub impl takes 4-byte args (the old
+uint64_t params read slot pairs as garbage), and the EXE entry is called
+with (image base, reason, reserved) like Windows — Delphi's System unit
+STORES that hInstance and derives resource addresses from it (we used to
+pass the PEB pointer).
+
+### Real 32-bit apps under qemu-i386 (local loop)
+
+- **LuaForWindows_v5.1.5-52.exe** (the user's test case): loads at
+  0x400000, TEB/TLS live, Delphi MM arenas work, Inno's startup runs
+  (locale tables, string resources via LoadStringA/W — now real), stays
+  alive doing payload work (29MB installer overlay; CPU-bound for a long
+  time under emulation — fine on native hardware).
+- **7zr.exe 26.04 (i386, MSVC, unicode)**: banner, directory scan
+  ("2 files, 28 bytes" — needed FindFirstFileW + the LFS fix below),
+  archive creation starts. Full completion is blocked on MSVC C++ EH
+  (_CxxThrowException is now a clean loud exit, not corruption) — next
+  session's item.
+- **readdir EOVERFLOW**: 32-bit readdir fails on 64-bit-inode
+  filesystems (overlayfs/btrfs; errno 75) — FindFirstFile returned
+  nothing at all inside containers. Switched the find + CI-resolve paths
+  to readdir64/dirent64.
+
+### New API surface (32-bit world + unicode apps)
+
+FindFirstFileW/FindNextFileW (WIN32_FIND_DATAW), GetFullPathNameA/W
+(lexical .. and . cleanup, \?\ stripped by the path layer), LoadStringA/W
+(RT_STRING tables — Inno's whole UI), CharNext/CharPrev A+W, the locale
+family (GetUserDefaultLangID/LCID, GetThreadLocale, GetLocaleInfoA/W with
+the full mingw-verified constant table), FormatMessageA/W (FROM_SYSTEM
+table + ALLOCATE_MEMORY + FROM_STRING; NOTE: lpBuffer is arg 5, nSize
+arg 6 — the first cut had them swapped and 7-Zip crashed us for it),
+GetProcessAffinityMask/IsWow64Process/GetProcessTimes/GetSystemTimes
+(affinity 0 → 7-Zip sized a 0-thread pool and called NULL), the msvcrt
+wchar family (wcscmp/wcsncmp/wcsicmp/wcschr/wcsrchr/wcscpy/wcsncpy/
+wcscat/wcsncat/wcsstr/wcspbrk/wcsspn/wcscspn/wcstok/wmemcpy/wmemset),
+_CxxThrowException (honest abort), SetFileApisToOEM/ANSI (no-op).
+
+Also finished the missed tail of session 7's signature sweep: another
+9 exports still took uint64_t params where Windows passes pointer-width
+(SysStringLen/SysStringByteLen/SysFreeString/SysStringChar,
+GetDC/ReleaseDC, BeginPaint/EndPaint, RtlAllocateHeap/RtlFreeHeap/
+RtlSizeHeap, FindResourceA/LockResource, CertOpenSystemStoreA) — each
+one shifted every 32-bit caller's stack by 4 bytes per bad arg; 7-Zip's
+crash-by-NULL-vtable was SysStringByteLen's ret $8 for a 1-arg API.
+
+Dev tooling that made this possible: a minimal Python GDB-remote client
+(scripts/gdbstub_watch.py + measure/step/vtrace variants) driving
+qemu-i386's gdbstub — breakpoints, watchpoints, register/memory reads,
+single-step traces. This is how every crash above was root-caused
+without gdb on the box.
+
+64-bit suite 15/15 PASS; hello32/torture32 PASS; FindFirstFile A+W
+32-bit test PASS; LuaForWindows zero crash lines.
+
 ## Date: 2026-10-18 (session 7)
 
 ### 32-bit i386: FIRST REAL RUNS — qemu-i386 unlocked local execution

@@ -9,7 +9,7 @@ DEFS    := -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 OPT     ?= -O2 -g
 INC     := -Iinclude
 
-CFLAGS  := $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) -MMD -MP
+CFLAGS  := $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) -fno-pic -no-pie -MMD -MP
 LDLIBS  := -lpthread -ldl -lm
 
 BIN     := bin
@@ -114,7 +114,7 @@ endef
 
 M32_MODE := $(strip $(m32_probe))
 ifeq ($(M32_MODE),native)
-M32FLAGS := -m32 -no-pie -static-libgcc
+M32FLAGS := -m32 -no-pie -fno-pic -static-libgcc
 M32POST  :=
 else ifeq ($(M32_MODE),sysroot)
 # With -m32, gcc swaps the multiarch include dir (/usr/include/x86_64-linux-gnu
@@ -122,7 +122,7 @@ else ifeq ($(M32_MODE),sysroot)
 # amd64 dir (wordsize.h dispatches on __x86_64__), so re-add it to the chain.
 # GCC32DIR auto-detects the gcc version dir holding 32/crtbegin.o.
 GCC32DIR := $(patsubst %/32/,%,$(dir $(firstword $(wildcard $(M32_SYSROOT)/usr/lib/gcc/x86_64-linux-gnu/*/32/crtbegin.o))))
-M32FLAGS := -m32 -no-pie -static-libgcc \
+M32FLAGS := -m32 -no-pie -fno-pic -static-libgcc \
   -isystem $(M32_SYSROOT)/usr/include \
   -isystem $(M32_SYSROOT)/usr/include/i386-linux-gnu \
   -isystem /usr/include/x86_64-linux-gnu \

@@ -311,6 +311,48 @@ static void signal_handler(int sig, siginfo_t *si, void *uc_)
                uc->uc_mcontext.gregs[REG_EIP]
 #endif
                );
+#if !defined(__x86_64__)
+        /* i386 host-fault context: regs + stack words (ret candidates). */
+        wn_log(WN_LOG_ERR, "  EAX=%08x EBX=%08x ECX=%08x EDX=%08x",
+               (unsigned)uc->uc_mcontext.gregs[REG_EAX],
+               (unsigned)uc->uc_mcontext.gregs[REG_EBX],
+               (unsigned)uc->uc_mcontext.gregs[REG_ECX],
+               (unsigned)uc->uc_mcontext.gregs[REG_EDX]);
+        wn_log(WN_LOG_ERR, "  ESI=%08x EDI=%08x EBP=%08x ESP=%08x",
+               (unsigned)uc->uc_mcontext.gregs[REG_ESI],
+               (unsigned)uc->uc_mcontext.gregs[REG_EDI],
+               (unsigned)uc->uc_mcontext.gregs[REG_EBP],
+               (unsigned)uc->uc_mcontext.gregs[REG_ESP]);
+        {
+            uint32_t *sp = (uint32_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_ESP];
+            for (int i = 0; i < 12; i++) {
+                char w[96];
+                wn_module_describe_addr((const void *)(uintptr_t)sp[i], w, sizeof w);
+                wn_log(WN_LOG_ERR, "  [esp+%02d] %08x  %s", i * 4,
+                       (unsigned)sp[i], w);
+            }
+            /* Memory at the faulting address — an exec-fault target is a
+             * data page (readable); heap structures identify themselves. */
+            uint8_t *fa = (uint8_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_EIP];
+            if ((uintptr_t)fa > 0x10000) {
+                char hex[3 * 24 + 1];
+                size_t o = 0;
+                for (int i = 0; i < 24; i++)
+                    o += (size_t)snprintf(hex + o, sizeof hex - o, "%02x ",
+                                          fa[i]);
+                wn_log(WN_LOG_ERR, "  bytes at fault addr: %s", hex);
+            }
+            /* Full memory map: stack-region math is the crux of i386 faults. */
+            FILE *mf = fopen("/proc/self/maps", "re");
+            if (mf) {
+                char ml[512];
+                wn_log(WN_LOG_ERR, "  ---- /proc/self/maps ----");
+                while (fgets(ml, sizeof ml, mf))
+                    wn_log(WN_LOG_ERR, "  %s", ml);
+                fclose(mf);
+            }
+        }
+#endif
         void *bt[16];
         int n = backtrace(bt, 16);
         char **sym = backtrace_symbols(bt, n);

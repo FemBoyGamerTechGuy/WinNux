@@ -9,6 +9,15 @@ Console-class PE32 now runs end-to-end (session 7: modify_ldt check,
 wn_abiword width pass, FILE stride, MSG overlay, wsprintf/onexit/
 localtime/qsort — all qemu-verified, 64-bit 15/15). Next:
 
+0. MSVC C++ EH: _CxxThrowException unwinding (scope tables, catch matching,
+   __CxxFrameHandler on i386 via fs:0 chain, x64 via .pdata) — 7zr.exe
+   archive completion is blocked on it (currently a clean loud exit).
+0a. 7zr.exe i386 finish: after C++ EH, verify the full create+extract
+   roundtrip; watch the 1GB mapping it takes (LZMA dictionary sizing?).
+0b. LuaForWindows on native hardware (user): the payload decompression is
+   CPU-heavy under emulation; on real i386 it should reach the GUI. Watch
+   for: window creation, Inno dialog rendering, /SILENT CLI mode.
+
 1. **User's Arch box validation**: `make winnux32 && ./bin/winnux run
    LuaForWindows_v5.1.5-52.exe -e 'print(1+2*3, ("win"):upper())'` —
    qemu passed hello32/heap32/torture32, but the user's box is the

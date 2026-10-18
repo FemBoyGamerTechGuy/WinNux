@@ -12,11 +12,13 @@
 #include "wn_stub.h"
 #include "wn_log.h"
 #include "wn_util.h"
+#include "wn_types.h"
 #include "wn_module.h"
 #include "wn_process.h"
 
 #include <sys/mman.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <stdlib.h>
 
@@ -24,10 +26,16 @@
 #define WN_STUB_SLOT  32u
 
 typedef struct wn_stub_info {
+    uint32_t    hits;      /* offset 0                            */
+    uint16_t    pop;       /* offset 4: i386 trampoline reads it  */
+    uint8_t     pop_known; /* i386: pop from the curated table    */
     const char *dll;
     const char *name;
-    uint32_t    hits;
 } wn_stub_info;
+
+/* The i386 trampoline hardcodes the pop offset; keep it honest. */
+_Static_assert(__builtin_offsetof(wn_stub_info, pop) == 4,
+               "wn_stub_info.pop must sit at offset 4 for the asm bridge");
 
 static uint8_t *g_stub_region;
 extern void wn_stub_entry_trampoline(void);
@@ -38,15 +46,18 @@ static wn_stub_info **g_infos;     /* index i <-> stub i */
 static uint32_t g_info_count;
 
 /* The impl is called by the raw-asm trampoline: ms_abi on x64 (the asm
- * builds the MS register+shadow layout), plain cdecl on i386. */
+ * builds the MS register+shadow layout), plain cdecl on i386 — where the
+ * trampoline pushes 4-byte slots, so the impl MUST take 4-byte params
+ * (the old uint64_t params read adjacent slot pairs as garbage). wn_abiword
+ * is exactly the right width on both arches. */
 #if defined(__x86_64__)
-#define WN_STUBIMPL WN_API
+#define WN_STUBIMPL_DECL WN_API
 #else
-#define WN_STUBIMPL
+#define WN_STUBIMPL_DECL
 #endif
-
-WN_STUBIMPL void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
-                                    uint64_t a3, uint64_t a4, uint64_t guest_ret);
+WN_STUBIMPL_DECL void wn_stub_entry_impl(wn_abiword info_p, wn_abiword a1,
+                                         wn_abiword a2, wn_abiword a3,
+                                         wn_abiword a4, wn_abiword guest_ret);
 
 /* MS-ABI assembly bridge (see file comment). */
 #if defined(__x86_64__)
@@ -70,38 +81,156 @@ __asm__(
     ".size wn_stub_entry_trampoline, .-wn_stub_entry_trampoline\n"
 );
 #else
-/* i386 bridge. At entry: [esp]=ret-to-guest, [esp+4..+16]=a1..a4,
- * [esp+20]=info (pushed by the stub code). cdecl impl; returns 0 with a
- * PLAIN ret — cdecl guests clean their own args; stdcall guests leak the
- * arg frame per call (documented: only unimplemented imports hit this). */
+/* i386 bridge. At entry: [esp]=info (pushed by the stub code), [esp+4]=
+ * guest return address, [esp+8..+20]=a1..a4. The impl decides and caches
+ * the callee-pop byte count (Win32 i386 APIs are stdcall: the callee pops
+ * its own argument frame; CRT functions are cdecl and the caller cleans).
+ * The return sequence pops info->pop bytes after the return address, so
+ * stdcall guests keep a balanced stack instead of the old leak that
+ * shifted every subsequent pop/locals access. */
 __asm__(
     ".text\n"
     ".globl wn_stub_entry_trampoline\n"
     ".type wn_stub_entry_trampoline, @function\n"
     "wn_stub_entry_trampoline:\n"
-    "    popl  %eax\n"                 /* eax = info                     */
-    "    pushl 0(%esp)\n"              /* arg6: guest ret addr           */
-    "    pushl 20(%esp)\n"             /* arg5: a4 (orig +16, one push)  */
-    "    pushl 16(%esp)\n"             /* arg4: a3                       */
-    "    pushl 12(%esp)\n"             /* arg3: a2                       */
-    "    pushl 8(%esp)\n"              /* arg2: a1                       */
-    "    pushl %eax\n"                 /* arg1: info                     */
+    "    pushl %ebx\n"                /* save guest ebx               */
+    "    movl  4(%esp), %ebx\n"       /* ebx = info                   */
+    "    pushl 8(%esp)\n"             /* arg6: guest ret addr         */
+    "    pushl 28(%esp)\n"            /* arg5: a4                     */
+    "    pushl 28(%esp)\n"            /* arg4: a3                     */
+    "    pushl 28(%esp)\n"            /* arg3: a2                     */
+    "    pushl 28(%esp)\n"            /* arg2: a1                     */
+    "    pushl %ebx\n"                /* arg1: info                   */
     "    call  wn_stub_entry_impl\n"
-    "    addl  $24, %esp\n"
-    "    xorl  %eax, %eax\n"           /* return 0                      */
+    "    addl  $24, %esp\n"           /* drop the 6 arg pushes        */
+    "    movzwl 4(%ebx), %ecx\n"      /* ecx = info->pop (offset 4)   */
+    "    popl  %ebx\n"                /* restore guest ebx            */
+    "    addl  $4, %esp\n"            /* drop info slot               */
+    "    popl  %eax\n"                /* eax = return address         */
+    "    addl  %ecx, %esp\n"          /* stdcall: drop the arg frame  */
+    "    pushl %eax\n"
+    "    xorl  %eax, %eax\n"          /* return 0                     */
     "    ret\n"
     ".size wn_stub_entry_trampoline, .-wn_stub_entry_trampoline\n"
 );
 #endif
 
 
-WN_STUBIMPL void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
-                                    uint64_t a3, uint64_t a4, uint64_t guest_ret)
+/* --- i386 stdcall argument counts ----------------------------------------- */
+#if !defined(__x86_64__)
+/* Known stdcall parameter counts for frequently-missed exports. The i386
+ * trampoline pops nargs*4 bytes after the return address; CRT (cdecl)
+ * callers are recognized dynamically by the `add esp,imm` they emit right
+ * after the call. An unknown stdcall export pops 0 (leaks its frame) with
+ * a loud warning — never crashes the stack the other direction. */
+static const struct { const char *dll, *name; uint8_t nargs; } g_stub_pop_table[] = {
+    { "kernel32.dll", "SetDefaultDllDirectories", 1 },
+    { "kernel32.dll", "SetDllDirectoryA", 1 },
+    { "kernel32.dll", "SetDllDirectoryW", 1 },
+    { "kernel32.dll", "GetUserDefaultLangID", 0 },
+    { "kernel32.dll", "GetSystemDefaultLangID", 0 },
+    { "kernel32.dll", "GetUserDefaultLCID", 0 },
+    { "kernel32.dll", "GetSystemDefaultLCID", 0 },
+    { "kernel32.dll", "GetLocaleInfoA", 4 },
+    { "kernel32.dll", "GetLocaleInfoW", 4 },
+    { "kernel32.dll", "GetFullPathNameA", 4 },
+    { "kernel32.dll", "GetFullPathNameW", 4 },
+    { "kernel32.dll", "InterlockedExchange", 2 },
+    { "kernel32.dll", "InterlockedIncrement", 1 },
+    { "kernel32.dll", "InterlockedDecrement", 1 },
+    { "kernel32.dll", "InterlockedCompareExchange", 3 },
+    { "kernel32.dll", "FormatMessageA", 7 },
+    { "kernel32.dll", "FormatMessageW", 7 },
+    { "kernel32.dll", "CreateProcessA", 10 },
+    { "kernel32.dll", "CreateProcessW", 10 },
+    { "kernel32.dll", "IsWow64Process", 2 },
+    { "kernel32.dll", "QueryPerformanceCounter", 1 },
+    { "kernel32.dll", "QueryPerformanceFrequency", 1 },
+    { "kernel32.dll", "GetProcessAffinityMask", 3 },
+    { "kernel32.dll", "GetExitCodeProcess", 2 },
+    { "kernel32.dll", "SetThreadExecutionState", 1 },
+    { "user32.dll", "LoadStringA", 4 },
+    { "user32.dll", "LoadStringW", 4 },
+    { "user32.dll", "CharPrevA", 2 },
+    { "user32.dll", "CharNextA", 1 },
+    { "user32.dll", "CallWindowProcA", 5 },
+    { "user32.dll", "CallWindowProcW", 5 },
+    { "user32.dll", "ExitWindowsEx", 2 },
+    { "user32.dll", "MessageBeep", 1 },
+    { "user32.dll", "SetProcessDPIAware", 0 },
+    { "user32.dll", "IsProcessDPIAware", 0 },
+    { "user32.dll", "GetSystemMetricsForDpi", 2 },
+    { "oleaut32.dll", "VariantChangeTypeEx", 6 },
+    { "oleaut32.dll", "VariantCopyInd", 2 },
+    { "oleaut32.dll", "VariantInit", 1 },
+    { "oleaut32.dll", "VariantClear", 1 },
+    { "oleaut32.dll", "VariantCopy", 2 },
+    { "oleaut32.dll", "SysAllocStringLen", 2 },
+    { "oleaut32.dll", "SysStringLen", 1 },
+    { "oleaut32.dll", "SysFreeString", 1 },
+    { "advapi32.dll", "OpenProcessToken", 3 },
+    { "advapi32.dll", "LookupPrivilegeValueA", 4 },
+    { "advapi32.dll", "LookupPrivilegeValueW", 4 },
+    { "advapi32.dll", "AdjustTokenPrivileges", 6 },
+    { "advapi32.dll", "GetTokenInformation", 5 },
+};
+
+/* Case-insensitive dll compare ignoring an optional .dll suffix on either
+ * side (stubs are created with names like "user32.dll" but imports may
+ * arrive bare, like "user32"). */
+static int stub_dll_eq(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    if (la >= 4 && !strcasecmp(a + la - 4, ".dll")) la -= 4;
+    if (lb >= 4 && !strcasecmp(b + lb - 4, ".dll")) lb -= 4;
+    if (la != lb || la >= 64)
+        return 0;
+    char ea[64], eb[64];
+    memcpy(ea, a, la); ea[la] = 0;
+    memcpy(eb, b, lb); eb[lb] = 0;
+    return strcasecmp(ea, eb) == 0;
+}
+
+static uint16_t stub_table_pop(const char *dll, const char *name, int *known)
+{
+    for (size_t i = 0; i < sizeof g_stub_pop_table / sizeof g_stub_pop_table[0]; i++)
+        if (stub_dll_eq(g_stub_pop_table[i].dll, dll) &&
+            !strcasecmp(g_stub_pop_table[i].name, name)) {
+            if (known)
+                *known = 1;
+            return (uint16_t)(g_stub_pop_table[i].nargs * 4);
+        }
+    return 0;
+}
+#endif
+
+WN_STUBIMPL_DECL void wn_stub_entry_impl(wn_abiword info_p, wn_abiword a1,
+                                         wn_abiword a2, wn_abiword a3,
+                                         wn_abiword a4, wn_abiword guest_ret)
 {
     wn_stub_info *info = (wn_stub_info *)(uintptr_t)info_p;
     if (!info)
         return;
     info->hits++;
+#if !defined(__x86_64__)
+    /* Refine the pop decision on the first call: the curated table already
+     * set it at creation; for the rest, a cdecl caller (CRT) betrays itself
+     * by `add esp,imm` right after the call site. Unknown stdcall stays 0
+     * (frame leaks) with a loud warning — never over-pops. Only decode
+     * return addresses that live inside a mapped PE module (fault-safe). */
+    if (info->pop_known == 0 && info->hits == 1 && guest_ret) {
+        wn_module *m = wn_module_from_addr((const void *)(uintptr_t)guest_ret, NULL);
+        if (m) {
+            uint8_t code[6];
+            memcpy(code, (const void *)(uintptr_t)guest_ret, sizeof code);
+            int cdecl_caller = (code[0] == 0x83 && code[1] == 0xC4) ||
+                               (code[0] == 0x81 && code[1] == 0xC4);
+            if (!cdecl_caller)
+                wn_log(WN_LOG_WARN, "stub: unknown stdcall arg count for "
+                       "%s!%s (arg frame leaks on return)", info->dll, info->name);
+        }
+    }
+#endif
     /* Crash-proof first line: raw write, no stdio, no formatting. */
     if (info->hits == 1) {
         const char msg[] = "[stub-call] ";
@@ -156,6 +285,16 @@ void *wn_stub_for(const char *dll, const char *name)
     info->dll = wn_xstrdup(dll);
     info->name = wn_xstrdup(name);
     info->hits = 0;
+#if !defined(__x86_64__)
+    {
+        int known = 0;
+        info->pop = stub_table_pop(dll, name, &known);
+        info->pop_known = (uint8_t)known;
+    }
+#else
+    info->pop = 0;
+    info->pop_known = 0;
+#endif
     g_infos[idx] = info;
     g_info_count++;
 

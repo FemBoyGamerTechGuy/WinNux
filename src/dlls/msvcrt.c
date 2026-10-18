@@ -16,6 +16,7 @@
 #include <fcntl.h>
 
 #include <ctype.h>
+#include <wctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <math.h>
@@ -170,6 +171,227 @@ static WN_CRTAPI int64_t ms_wcslen(const uint16_t *s)
     while (s[n])
         n++;
     return n;
+}
+
+/* MSVC C++ exception throw: without full EH unwinding (scope tables,
+ * catch matching — documented TODO), the honest behavior is a clean,
+ * LOUD process abort instead of returning into a half-unwound guest. */
+static WN_API void ms_CxxThrowException(const void *object, const void *info)
+{
+    (void)info;
+    uint32_t first = 0;
+    if (object) {
+        memcpy(&first, object, 4);
+        wn_log(WN_LOG_ERR, "msvcrt: _CxxThrowException: unhandled C++ "
+               "exception (object %p, first dword 0x%x) — exiting",
+               object, first);
+    } else {
+        wn_log(WN_LOG_ERR, "msvcrt: _CxxThrowException: unhandled C++ "
+               "exception — exiting");
+    }
+    wn_process_exit(1);
+}
+
+/* --- wchar CRT family (cdecl; 7-Zip i386 and every unicode app needs these) */
+static WN_CRTAPI int32_t ms_wcscmp(const uint16_t *a, const uint16_t *b)
+{
+    if (!a || !b)
+        return (a ? 1 : 0) - (b ? 1 : 0);
+    while (*a && *a == *b) { a++; b++; }
+    return (int32_t)*a - (int32_t)*b;
+}
+
+static WN_CRTAPI int32_t ms_wcsncmp(const uint16_t *a, const uint16_t *b, wn_abiword n)
+{
+    if (!a || !b || n == 0)
+        return (a ? 1 : 0) - (b ? 1 : 0);
+    size_t i = 0;
+    while (i + 1 < (size_t)n && a[i] && a[i] == b[i])
+        i++;
+    return (int32_t)a[i] - (int32_t)b[i];
+}
+
+static WN_CRTAPI int32_t ms_wcsicmp(const uint16_t *a, const uint16_t *b)
+{
+    if (!a || !b)
+        return (a ? 1 : 0) - (b ? 1 : 0);
+    while (*a && towlower(*a) == towlower(*b)) { a++; b++; }
+    return (int32_t)towlower(*a) - (int32_t)towlower(*b);
+}
+
+static WN_CRTAPI int32_t ms_wcsnicmp(const uint16_t *a, const uint16_t *b, wn_abiword n)
+{
+    if (!a || !b || n == 0)
+        return (a ? 1 : 0) - (b ? 1 : 0);
+    size_t i = 0;
+    while (i + 1 < (size_t)n && a[i] && towlower(a[i]) == towlower(b[i]))
+        i++;
+    return (int32_t)towlower(a[i]) - (int32_t)towlower(b[i]);
+}
+
+static WN_CRTAPI uint16_t *ms_wcschr(const uint16_t *s, uint16_t c)
+{
+    if (!s)
+        return NULL;
+    while (*s) {
+        if (*s == c)
+            return (uint16_t *)s;
+        s++;
+    }
+    return c == 0 ? (uint16_t *)s : NULL;
+}
+
+static WN_CRTAPI uint16_t *ms_wcsrchr(const uint16_t *s, uint16_t c)
+{
+    if (!s)
+        return NULL;
+    const uint16_t *last = NULL;
+    while (*s) {
+        if (*s == c)
+            last = s;
+        s++;
+    }
+    if (c == 0)
+        return (uint16_t *)s;
+    return (uint16_t *)last;
+}
+
+static WN_CRTAPI uint16_t *ms_wcscpy(uint16_t *d, const uint16_t *s)
+{
+    if (!d || !s)
+        return d;
+    uint16_t *o = d;
+    while ((*d++ = *s++) != 0)
+        ;
+    return o;
+}
+
+static WN_CRTAPI uint16_t *ms_wcsncpy(uint16_t *d, const uint16_t *s, wn_abiword n)
+{
+    if (!d || !s || n == 0)
+        return d;
+    size_t i = 0;
+    while (i < (size_t)n && s[i]) {
+        d[i] = s[i];
+        i++;
+    }
+    while (i < (size_t)n)
+        d[i++] = 0;
+    return d;
+}
+
+static WN_CRTAPI uint16_t *ms_wcscat(uint16_t *d, const uint16_t *s)
+{
+    if (!d || !s)
+        return d;
+    uint16_t *o = d;
+    while (*d)
+        d++;
+    while ((*d++ = *s++) != 0)
+        ;
+    return o;
+}
+
+static WN_CRTAPI uint16_t *ms_wcsncat(uint16_t *d, const uint16_t *s, wn_abiword n)
+{
+    if (!d || !s || n == 0)
+        return d;
+    uint16_t *o = d;
+    while (*d)
+        d++;
+    size_t i = 0;
+    while (i < (size_t)n && s[i])
+        d[i] = s[i], i++, d++;
+    *d = 0;
+    return o;
+}
+
+static WN_CRTAPI uint16_t *ms_wcsstr(const uint16_t *h, const uint16_t *n)
+{
+    if (!h || !n)
+        return NULL;
+    if (!*n)
+        return (uint16_t *)h;
+    for (const uint16_t *p = h; *p; p++) {
+        const uint16_t *a = p, *b = n;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b)
+            return (uint16_t *)p;
+    }
+    return NULL;
+}
+
+static WN_CRTAPI uint16_t *ms_wcspbrk(const uint16_t *s, const uint16_t *set)
+{
+    if (!s || !set)
+        return NULL;
+    for (const uint16_t *p = s; *p; p++)
+        for (const uint16_t *q = set; *q; q++)
+            if (*p == *q)
+                return (uint16_t *)p;
+    return NULL;
+}
+
+static WN_CRTAPI wn_abiword ms_wcsspn(const uint16_t *s, const uint16_t *set)
+{
+    if (!s || !set)
+        return 0;
+    wn_abiword n = 0;
+    while (s[n]) {
+        int found = 0;
+        for (const uint16_t *q = set; *q; q++)
+            if (s[n] == *q) { found = 1; break; }
+        if (!found)
+            break;
+        n++;
+    }
+    return n;
+}
+
+static WN_CRTAPI wn_abiword ms_wcscspn(const uint16_t *s, const uint16_t *set)
+{
+    if (!s || !set)
+        return s ? ms_wcslen(s) : 0;
+    wn_abiword n = 0;
+    while (s[n]) {
+        for (const uint16_t *q = set; *q; q++)
+            if (s[n] == *q)
+                return n;
+        n++;
+    }
+    return n;
+}
+
+static WN_CRTAPI uint16_t *ms_wcstok(uint16_t *s, const uint16_t *delim, uint16_t **ctx)
+{
+    if (ctx)
+        *ctx = NULL;   /* simplified: no continuation state (rarely used) */
+    if (!s || !delim)
+        return NULL;
+    /* skip leading delims */
+    uint16_t *p = s;
+    while (*p && ms_wcschr(delim, *p))
+        p++;
+    if (!*p)
+        return NULL;
+    uint16_t *tok = p;
+    while (*p && !ms_wcschr(delim, *p))
+        p++;
+    if (*p)
+        *p++ = 0;
+    return tok;
+}
+
+static WN_CRTAPI uint16_t *ms_wmemcpy(uint16_t *d, const uint16_t *s, wn_abiword n)
+{
+    return (uint16_t *)memcpy(d, s, (size_t)n * 2);
+}
+
+static WN_CRTAPI uint16_t *ms_wmemset(uint16_t *d, uint16_t c, wn_abiword n)
+{
+    for (wn_abiword i = 0; i < n; i++)
+        d[i] = c;
+    return d;
 }
 
 static WN_CRTAPI int32_t ms_setvbuf(wn_ms_file *f, char *buf, int32_t mode, wn_abiword size)
@@ -1547,6 +1769,26 @@ const wn_export_entry wn_msvcrt_exports[] = {
     { "strtol", ms_strtol },
     { "strtoul", ms_strtoul },
     { "wcslen", ms_wcslen },
+    { "_CxxThrowException", ms_CxxThrowException },
+    { "wcscmp", ms_wcscmp },
+    { "wcsncmp", ms_wcsncmp },
+    { "_wcsicmp", ms_wcsicmp },
+    { "wcsicmp", ms_wcsicmp },
+    { "_wcsnicmp", ms_wcsnicmp },
+    { "wcsnicmp", ms_wcsnicmp },
+    { "wcschr", ms_wcschr },
+    { "wcsrchr", ms_wcsrchr },
+    { "wcscpy", ms_wcscpy },
+    { "wcsncpy", ms_wcsncpy },
+    { "wcscat", ms_wcscat },
+    { "wcsncat", ms_wcsncat },
+    { "wcsstr", ms_wcsstr },
+    { "wcspbrk", ms_wcspbrk },
+    { "wcsspn", ms_wcsspn },
+    { "wcscspn", ms_wcscspn },
+    { "wcstok", ms_wcstok },
+    { "wmemcpy", ms_wmemcpy },
+    { "wmemset", ms_wmemset },
     { "strupr", ms_strupr },
     { "time", ms_time },
     { "vfprintf", ms_vfprintf },

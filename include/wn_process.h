@@ -348,6 +348,7 @@ int  wn_process_atexit(void (*fn)(void));
 /* Static TLS: register a module's TLS block factory. Called by loader when a
  * module with a TLS directory loads; new threads copy the template. */
 void     wn_tls_register_module(struct wn_module *m);
+void     wn_tls_thread_register(wn_teb *teb);
 void     wn_tls_thread_init(wn_teb *teb);
 
 /* futex helper shared by sync + suspend. */

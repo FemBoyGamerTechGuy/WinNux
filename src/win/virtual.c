@@ -16,6 +16,7 @@
 typedef struct vregion {
     uint64_t start, end;
     uint32_t prot;       /* Win32 page protection value */
+    uint32_t state;      /* 0x1000 MEM_COMMIT or 0x2000 MEM_RESERVE */
     struct vregion *next;
 } vregion;
 
@@ -27,24 +28,36 @@ static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
 #define PAGE_NOACCESS          0x01
 #define PAGE_READONLY          0x02
 #define PAGE_READWRITE         0x04
+#define PAGE_WRITECOPY         0x08
 #define PAGE_EXECUTE           0x10
 #define PAGE_EXECUTE_READ      0x20
 #define PAGE_EXECUTE_READWRITE 0x40
+#define PAGE_EXECUTE_WRITECOPY 0x80
+#define WN_MEM_COMMIT  0x1000
+#define WN_MEM_RESERVE 0x2000
 
 static int win_to_prot(uint32_t wp)
 {
-    int p = 0;
-    if (wp & 0x02) p |= PROT_READ;
-    if (wp & 0x04) p |= PROT_WRITE;
-    if (wp & 0x10) p |= PROT_EXEC;
-    return p;
+    switch (wp & 0xFF) {   /* modifiers (GUARD/NOCACHE/WRITECOMBINE) masked */
+    case PAGE_NOACCESS:      return PROT_NONE;
+    case PAGE_READONLY:      return PROT_READ;
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:     return PROT_READ | PROT_WRITE;
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:  return PROT_READ | PROT_EXEC;
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    }
+    wn_log(WN_LOG_WARN, "virtual: unknown page protection 0x%x "
+           "(read-write assumed)", wp);
+    return PROT_READ | PROT_WRITE;
 }
 
-static void region_add(uint64_t s, uint64_t e, uint32_t prot)
+static void region_add(uint64_t s, uint64_t e, uint32_t prot, uint32_t state)
 {
     pthread_mutex_lock(&g_reg_lock);
     vregion *r = wn_xmalloc(sizeof *r);
-    r->start = s; r->end = e; r->prot = prot;
+    r->start = s; r->end = e; r->prot = prot; r->state = state;
     r->next = g_regions;
     g_regions = r;
     pthread_mutex_unlock(&g_reg_lock);
@@ -70,17 +83,90 @@ static void region_remove(uint64_t s, uint64_t e)
 
 void *wn_virtual_alloc(void *hint, uint64_t size, uint32_t type, uint32_t prot)
 {
-    size = (size + 0xFFFF) & ~0xFFFFULL;   /* 64K granularity like Windows */
-    int p = win_to_prot(prot);
-    if (type & 0x1000 /* MEM_RESERVE */) {
-        if (!(type & 0x1000 /* MEM_COMMIT */))
-            p = PROT_NONE;
-    }
-    void *base = mmap(hint, size, p, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                      -1, 0);
-    if (base == MAP_FAILED)
+    if (size == 0 || size > 0x100000000ULL) {
+        wn_log(WN_LOG_WARN, "virtual: VirtualAlloc size 0x%llx rejected",
+               (unsigned long long)size);
         return NULL;
-    region_add((uint64_t)(uintptr_t)base, (uint64_t)(uintptr_t)base + size, prot);
+    }
+    int commit  = (type & WN_MEM_COMMIT) != 0;
+    int reserve = (type & WN_MEM_RESERVE) != 0;
+    if (!commit && !reserve) {
+        wn_log(WN_LOG_WARN, "virtual: VirtualAlloc type 0x%x lacks "
+               "MEM_COMMIT/MEM_RESERVE", type);
+        return NULL;
+    }
+    int p = win_to_prot(prot);
+    uint64_t a = (uint64_t)(uintptr_t)hint;
+
+    if (commit && !reserve && a != 0) {
+        /* Windows: committing a range the process already reserved commits
+         * IN PLACE — the address is not negotiable and the reservation
+         * survives. The old code always made a fresh mmap, which the kernel
+         * displaced whenever the reservation covered the address; callers
+         * that keep using their original base (the Delphi/Inno allocator)
+         * then faulted on the still-PROT_NONE reserve. */
+        uint64_t page_a = a & ~0xFFFULL;
+        uint64_t usize = (size + 0xFFF) & ~0xFFFULL;
+        pthread_mutex_lock(&g_reg_lock);
+        vregion *r = g_regions;
+        while (r && !(r->start <= page_a && r->end > page_a))
+            r = r->next;
+        if (r && r->end - page_a >= usize &&
+            mprotect((void *)(uintptr_t)page_a, usize, p) == 0) {
+            r->state = WN_MEM_COMMIT;
+            if (r->prot == 0 || r->prot == PAGE_NOACCESS)
+                r->prot = prot;
+            pthread_mutex_unlock(&g_reg_lock);
+            return (void *)(uintptr_t)page_a;
+        }
+        pthread_mutex_unlock(&g_reg_lock);
+        /* Not one of our reservations (or overruns it): Windows fails for
+         * an unreserved/unaligned address. Ask for exactly that range,
+         * refusing to clobber anything that already lives there. */
+        if ((a & 0xFFF) == 0) {
+            void *base = mmap(hint, usize, p,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+                                  | MAP_FIXED_NOREPLACE,
+                              -1, 0);
+            if (base == MAP_FAILED) {
+                wn_log(WN_LOG_WARN, "virtual: MEM_COMMIT at %p (size 0x%llx) "
+                       "failed", hint, (unsigned long long)size);
+                return NULL;
+            }
+            if ((uint64_t)(uintptr_t)base != a) {
+                /* Pre-4.17 kernel ignored MAP_FIXED_NOREPLACE. */
+                munmap(base, usize);
+                return NULL;
+            }
+            region_add(a, a + usize, prot, WN_MEM_COMMIT);
+            return (void *)(uintptr_t)a;
+        }
+        wn_log(WN_LOG_WARN, "virtual: MEM_COMMIT of unaligned %p", hint);
+        return NULL;
+    }
+
+    /* Reserve (+ same-call commit): 64K granularity like Windows. */
+    uint64_t usize = (size + 0xFFFF) & ~0xFFFFULL;
+    if (usize == 0)
+        usize = 0x10000;
+    int want = (commit && reserve) ? p : PROT_NONE;
+    void *base = mmap(hint, usize, want,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+                          | ((a != 0) ? MAP_FIXED_NOREPLACE : 0),
+                      -1, 0);
+    if (base == MAP_FAILED) {
+        wn_log(WN_LOG_WARN, "virtual: reserve of 0x%llx bytes at %p failed",
+               (unsigned long long)usize, hint);
+        return NULL;
+    }
+    if (a != 0 && (uint64_t)(uintptr_t)base != a) {
+        /* Windows never relocates an explicitly requested address. */
+        munmap(base, usize);
+        return NULL;
+    }
+    region_add((uint64_t)(uintptr_t)base,
+               (uint64_t)(uintptr_t)base + usize, prot,
+               commit ? WN_MEM_COMMIT : WN_MEM_RESERVE);
     return base;
 }
 
@@ -143,17 +229,19 @@ int wn_virtual_protect(void *addr, uint64_t size, uint32_t newprot,
             char line[512];
             uint64_t a = (uint64_t)(uintptr_t)addr;
             while (fgets(line, sizeof line, f)) {
-                uint64_t s, e;
+                unsigned long ls, le;   /* %lx width: 4 bytes on i386! */
                 char perms[8];
-                if (sscanf(line, "%lx-%lx %4s", (unsigned long *)&s,
-                       (unsigned long *)&e, perms) == 3 && s <= a && e > a) {
-                    old = 0;
-                    if (perms[0] == 'r') old |= 0x02;
-                    if (perms[1] == 'w') old |= 0x04;
-                    if (perms[2] == 'x') old |= 0x10;
-                    if (!old) old = 0x01;
-                    found = 1;
-                    break;
+                if (sscanf(line, "%lx-%lx %4s", &ls, &le, perms) == 3) {
+                    uint64_t s = ls, e = le;
+                    if (s <= a && e > a) {
+                        old = 0;
+                        if (perms[0] == 'r') old |= 0x02;
+                        if (perms[1] == 'w') old |= 0x04;
+                        if (perms[2] == 'x') old |= 0x10;
+                        if (!old) old = 0x01;
+                        found = 1;
+                        break;
+                    }
                 }
             }
             fclose(f);
@@ -167,28 +255,62 @@ int wn_virtual_protect(void *addr, uint64_t size, uint32_t newprot,
         *oldprot_out = old ? old : 0x02;
     if (found)
         region_add((uint64_t)(uintptr_t)addr,
-                   (uint64_t)(uintptr_t)addr + size, newprot);
+                   (uint64_t)(uintptr_t)addr + size, newprot, WN_MEM_COMMIT);
     return 1;
 }
 
-/* Fill MEMORY_BASIC_INFORMATION (x64 layout, 48 bytes):
- * Base@0, AllocationBase@8, AllocationProtect@16, RegionSize@24,
- * State@32, Protect@36, Type@40. */
+/* Fill MEMORY_BASIC_INFORMATION. Layouts differ by arch — i386 MBI is 28
+ * bytes of 4-byte fields, x64 is 48 bytes with 8-byte pointers:
+ * Base@0, AllocationBase@+1, AllocationProtect@+2, RegionSize@+3,
+ * State@+4, Protect@+4b, Type@+5. */
+#define WN_MBI_FIELD(m, idx, val) do { \
+    wn_abiword *_q = (wn_abiword *)(m); _q[(idx)] = (wn_abiword)(val); \
+} while (0)
+
+static void mbi_fill(void *mbi, uint64_t base, uint64_t alloc_base,
+                     uint32_t alloc_prot, uint64_t region_size,
+                     uint32_t state, uint32_t protect)
+{
+    uint8_t *m = mbi;
+#if defined(__x86_64__)
+    memset(m, 0, 48);
+    WN_MBI_FIELD(m, 0, base);
+    WN_MBI_FIELD(m, 1, alloc_base);
+    *(uint32_t *)(m + 16) = alloc_prot;
+    WN_MBI_FIELD(m, 3, region_size);
+    *(uint32_t *)(m + 32) = state;
+    *(uint32_t *)(m + 36) = protect;
+    *(uint32_t *)(m + 40) = 0x20000 /* MEM_PRIVATE */;
+#else
+    memset(m, 0, 28);
+    *(uint32_t *)(m + 0)  = (uint32_t)base;
+    *(uint32_t *)(m + 4)  = (uint32_t)alloc_base;
+    *(uint32_t *)(m + 8)  = alloc_prot;
+    *(uint32_t *)(m + 12) = (uint32_t)region_size;
+    *(uint32_t *)(m + 16) = state;
+    *(uint32_t *)(m + 20) = protect;
+    *(uint32_t *)(m + 24) = 0x20000 /* MEM_PRIVATE */;
+#endif
+}
+
+static int wn_virtual_query_inner(void *addr, void *mbi);
+
 int wn_virtual_query(void *addr, void *mbi)
 {
-    uint64_t *q = mbi;
-    memset(q, 0, 48);
+    int rc = wn_virtual_query_inner(addr, mbi);
+    if (!rc)
+        wn_log(WN_LOG_DEBUG, "virtual: VirtualQuery(%p) FAILED", addr);
+    return rc;
+}
+
+static int wn_virtual_query_inner(void *addr, void *mbi)
+{
     uint64_t a = (uint64_t)(uintptr_t)addr;
     pthread_mutex_lock(&g_reg_lock);
     for (vregion *r = g_regions; r; r = r->next) {
         if (r->start <= a && r->end > a) {
-            q[0] = r->start;                    /* BaseAddress */
-            q[1] = r->start;                    /* AllocationBase */
-            *(uint32_t *)&q[2] = r->prot;       /* AllocationProtect @16 */
-            q[3] = r->end - r->start;           /* RegionSize @24 */
-            *(uint32_t *)&q[4] = 0x1000;        /* State: MEM_COMMIT @32 */
-            *(uint32_t *)((uint8_t *)&q[4] + 4) = r->prot;  /* Protect @36 */
-            *(uint32_t *)&q[5] = 0x20000;       /* Type: MEM_PRIVATE @40 */
+            mbi_fill(mbi, r->start, r->start, r->prot, r->end - r->start,
+                     r->state ? r->state : 0x1000, r->prot);
             pthread_mutex_unlock(&g_reg_lock);
             return 1;
         }
@@ -202,24 +324,20 @@ int wn_virtual_query(void *addr, void *mbi)
     char line[512];
     int ok = 0;
     while (fgets(line, sizeof line, f)) {
-        uint64_t s, e;
+        unsigned long ls, le;   /* %lx width: 4 bytes on i386! */
         char perms[8];
-        if (sscanf(line, "%lx-%lx %4s", (unsigned long *)&s,
-                       (unsigned long *)&e, perms) != 3)
+        if (sscanf(line, "%lx-%lx %4s", &ls, &le, perms) != 3)
             continue;
+        uint64_t s = ls, e = le;
         if (s <= a && e > a) {
             uint32_t p = 0;
             if (perms[0] == 'r') p |= 0x02;
             if (perms[1] == 'w') p |= 0x04;
             if (perms[2] == 'x') p |= 0x10;
             if (!p) p = 0x01;
-            q[0] = s;
-            q[1] = s;
-            *(uint32_t *)&q[2] = p;
-            q[3] = e - s;
-            *(uint32_t *)&q[4] = (perms[0] == '-' && perms[1] == '-') ? 0x10000 /* MEM_FREE */ : 0x1000;
-            *(uint32_t *)((uint8_t *)&q[4] + 4) = p;
-            *(uint32_t *)&q[5] = 0x20000;
+            uint32_t state = (perms[0] == '-' && perms[1] == '-')
+                                 ? 0x10000 /* MEM_FREE */ : 0x1000;
+            mbi_fill(mbi, s, s, p, e - s, state, p);
             ok = 1;
             break;
         }

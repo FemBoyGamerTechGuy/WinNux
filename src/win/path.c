@@ -253,9 +253,9 @@ int wn_path_lookup_ci(const char *dir, const char *name, char *out, size_t cap)
     DIR *d = opendir(dir);
     if (!d)
         return 0;
-    struct dirent *e;
+    struct dirent64 *e;   /* LFS: 32-bit readdir EOVERFLOWs on 64-bit inodes */
     int found = 0;
-    while ((e = readdir(d))) {
+    while ((e = readdir64(d))) {
         if (wn_strcaseeq(e->d_name, name)) {
             snprintf(out, cap, "%s/%s", dir, e->d_name);
             found = 1;

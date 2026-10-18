@@ -53,6 +53,7 @@ wn_teb *wn_teb_attach(void)
         wn_log(WN_LOG_ERR, "teb: ARCH_SET_GS failed: %s", strerror(errno));
         abort();
     }
+    wn_tls_thread_register(teb);
     return teb;
 }
 
@@ -126,6 +127,7 @@ wn_teb *wn_teb_attach(void)
         wn_log(WN_LOG_ERR, "teb: cannot load %%fs (32-bit TEB unavailable)");
         abort();
     }
+    wn_tls_thread_register(teb);
     return teb;
 }
 

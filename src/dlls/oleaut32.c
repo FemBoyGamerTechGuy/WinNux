@@ -92,13 +92,13 @@ static WN_API int32_t oa_SysReAllocStringLen(uint64_t *pbstr,
     return 1;
 }
 
-static WN_API void oa_SysFreeString(uint64_t bstr)
+static WN_API void oa_SysFreeString(wn_abiword bstr)
 {
     if (bstr)
         free((uint8_t *)(uintptr_t)bstr - 4);
 }
 
-static WN_API uint32_t oa_SysStringLen(uint64_t bstr)
+static WN_API uint32_t oa_SysStringLen(wn_abiword bstr)
 {
     if (!bstr)
         return 0;
@@ -107,7 +107,7 @@ static WN_API uint32_t oa_SysStringLen(uint64_t bstr)
     return bytelen / 2;
 }
 
-static WN_API uint32_t oa_SysStringByteLen(uint64_t bstr)
+static WN_API uint32_t oa_SysStringByteLen(wn_abiword bstr)
 {
     if (!bstr)
         return 0;
@@ -130,8 +130,8 @@ static WN_API int32_t oa_VariantClear(void *pv)
     uint16_t vt;
     memcpy(&vt, pv, 2);
     if (vt == 8 /*VT_BSTR*/) {
-        uint64_t b;
-        memcpy(&b, (uint8_t *)pv + 8, 8);
+        wn_abiptr b = 0;
+        memcpy(&b, (uint8_t *)pv + 8, sizeof b);
         if (b)
             free((uint8_t *)(uintptr_t)b - 4);
     }
@@ -139,7 +139,7 @@ static WN_API int32_t oa_VariantClear(void *pv)
     return 0;
 }
 
-static WN_API uint32_t oa_SysStringChar(uint64_t bstr, uint32_t idx)
+static WN_API uint32_t oa_SysStringChar(wn_abiword bstr, uint32_t idx)
 {
     const uint16_t *b = (const uint16_t *)(uintptr_t)bstr;
     if (!b || idx >= oa_SysStringLen(bstr))

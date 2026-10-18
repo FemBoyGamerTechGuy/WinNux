@@ -95,7 +95,11 @@ static WN_API uint64_t guest_entry_shim(uint64_t unused)
     entry_fn entry = (entry_fn)(void *)(exe->base + exe->pe.entry_rva);
     wn_log(WN_LOG_INFO, "loader: calling entry point at %s+0x%x",
            exe->name, exe->pe.entry_rva);
-    uint32_t rv = entry ? entry((void *)(uintptr_t)g_proc.peb, 1, 0) : 0;
+    /* Windows calls the EXE entry exactly like DllMain: (hInstance = image
+     * base, reason, reserved). Delphi's System unit STORES hInstance and
+     * derives module-resource addresses from it — passing the PEB pointer
+     * here poisoned every downstream computation. */
+    uint32_t rv = entry ? entry((void *)(uintptr_t)exe->base, 1, 0) : 0;
     /* EXE entry returned without ExitProcess: treat retval as exit code. */
     wn_process_exit((int)(int32_t)rv);
     return rv;

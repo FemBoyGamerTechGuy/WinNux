@@ -220,7 +220,7 @@ static WN_API int32_t c32_CryptStringToBinaryA(const char *str, uint32_t len,
     return 1;
 }
 
-static WN_API void *c32_CertOpenSystemStoreA(uint64_t prov, const char *name)
+static WN_API void *c32_CertOpenSystemStoreA(wn_abiword prov, const char *name)
 {
     (void)prov;
     (void)name;

@@ -650,6 +650,55 @@ static WN_API wn_handle k32_GetCurrentProcess(void)
     return WN_CURRENT_PROCESS;
 }
 
+/* Affinity: report a single CPU. 7-Zip sizes its compression thread pool
+ * from this; the old stub returned 0 + ERROR_CALL_NOT_IMPLEMENTED and the
+ * pool logic then dereferenced a NULL thread entry. */
+static WN_API int32_t k32_GetProcessAffinityMask(wn_handle h,
+                                                 wn_abiword *pmask,
+                                                 wn_abiword *smask)
+{
+    (void)h;
+    if (pmask)
+        *pmask = 1;
+    if (smask)
+        *smask = 1;
+    return 1;
+}
+
+static WN_API int32_t k32_IsWow64Process(wn_handle h, int32_t *wow64)
+{
+    (void)h;
+    if (wow64)
+        *wow64 = 0;   /* winnux32 IS a 32-bit process: not WOW64 */
+    return 1;
+}
+
+static WN_API int32_t k32_GetProcessTimes(wn_handle h, void *creation,
+                                          void *exit_, void *kernel,
+                                          void *user)
+{
+    (void)h;
+    uint64_t ft = g_proc.start_time_ft;
+    if (creation)
+        memcpy(creation, &ft, 8);
+    if (exit_)
+        memset(exit_, 0, 8);
+    if (kernel)
+        memset(kernel, 0, 8);
+    if (user)
+        memset(user, 0, 8);
+    return 1;
+}
+
+static WN_API int32_t k32_GetSystemTimes(void *idle, void *kernel, void *user)
+{
+    uint64_t z = 0;
+    if (idle) memcpy(idle, &z, 8);
+    if (kernel) memcpy(kernel, &z, 8);
+    if (user) memcpy(user, &z, 8);
+    return 1;
+}
+
 static WN_API wn_handle k32_GetCurrentThread(void)
 {
     return WN_CURRENT_THREAD;
@@ -861,7 +910,15 @@ static WN_API int32_t k32_VirtualProtect(void *addr, wn_abiword size, uint32_t p
 
 static WN_API uint32_t k32_VirtualQuery(void *addr, void *mbi)
 {
-    return wn_virtual_query(addr, mbi) ? (uint32_t)sizeof(void *) * 6 : 0;
+    /* MEMORY_BASIC_INFORMATION: 48 bytes on x64, 28 on i386 (4-byte fields,
+     * 7 of them — NOT sizeof(void*)*6 which gives 24 on i386). */
+    if (!wn_virtual_query(addr, mbi))
+        return 0;
+#if defined(__x86_64__)
+    return 48;
+#else
+    return 28;
+#endif
 }
 
 static WN_API wn_handle k32_GetProcessHeap(void)
@@ -1493,6 +1550,136 @@ static WN_API int32_t k32_SetCurrentDirectoryA(const char *dir)
     return 1;
 }
 
+/* GetFullPathName: caller-side path normalization (NO filesystem access on
+ * Windows — but we resolve case-insensitively when possible so lookups
+ * succeed). Unicode apps (7-Zip!) build every open path through this. */
+static uint32_t full_path_name(const char *name, uint32_t cap, char *buf,
+                               char **part)
+{
+    if (!name || !*name) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    char out[2048];
+    if ((name[0] >= 'A' && name[0] <= 'Z' && name[1] == ':') ||
+        (name[0] >= 'a' && name[0] <= 'z' && name[1] == ':') ||
+        name[0] == '\\' || name[0] == '/') {
+        snprintf(out, sizeof out, "%s", name);
+    } else {
+        char cwd[1024];
+        wn_path_get_cwd_win(cwd, sizeof cwd);
+        size_t cl = strlen(cwd);
+        if (cl && cwd[cl - 1] != '\\')
+            snprintf(out, sizeof out, "%s\\%s", cwd, name);
+        else
+            snprintf(out, sizeof out, "%s%s", cwd, name);
+    }
+    /* slashes -> backslashes */
+    for (char *p = out; *p; p++)
+        if (*p == '/')
+            *p = '\\';
+    /* strip .\ and resolve .\ ..\ lexically */
+    char clean[2048];
+    size_t oi = 0;
+    const char *p = out;
+    if (p[0] && p[1] == ':') {
+        clean[oi++] = p[0];
+        clean[oi++] = ':';
+        p += 2;
+        if (*p == '\\')
+            p++;
+        clean[oi++] = '\\';
+    } else if (p[0] == '\\') {
+        clean[oi++] = '\\';
+        p++;
+    }
+    while (*p) {
+        if (p[0] == '.' && (p[1] == '\\' || !p[1])) {
+            p += p[1] ? 2 : 1;
+            continue;
+        }
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '\\' || !p[2])) {
+            /* pop last component from clean */
+            while (oi > 1 && clean[oi - 1] != '\\')
+                oi--;
+            if (oi > 1)
+                oi--;          /* drop the backslash too */
+            p += p[2] ? 3 : 2;
+            continue;
+        }
+        while (*p && *p != '\\')
+            clean[oi++] = *p++;
+        if (*p == '\\') {
+            if (oi && clean[oi - 1] != '\\')
+                clean[oi++] = '\\';
+            p++;
+        }
+    }
+    if (oi && clean[oi - 1] == '\\' && oi > 3)
+        oi--;      /* no trailing slash (keep X:\ root form) */
+    clean[oi] = 0;
+
+    /* The Windows contract: if the buffer is too small, return the needed
+     * size WITHOUT writing. */
+    size_t need = oi + 1;
+    if (!buf || cap < need) {
+        wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+        return (uint32_t)need - 1;
+    }
+    memcpy(buf, clean, need);
+    if (part) {
+        char *last = strrchr(buf, '\\');
+        *part = last ? last + 1 : buf;
+    }
+    return (uint32_t)oi;
+}
+
+static WN_API uint32_t k32_GetFullPathNameA(const char *name, uint32_t cap,
+                                            char *buf, char **part)
+{
+    return full_path_name(name, cap, buf, part);
+}
+
+static WN_API uint32_t k32_GetFullPathNameW(const uint16_t *name, uint32_t cap,
+                                            uint16_t *buf, uint16_t **part)
+{
+    if (!name) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    char *a = wn_utf16_to_utf8(name, 4096);
+    if (!a) {
+        wn_last_error_set(WN_ERR_INVALID_NAME);
+        return 0;
+    }
+    char abuf[2048];
+    uint32_t r = full_path_name(a, sizeof abuf, abuf, NULL);
+    free(a);
+    if (r == 0)
+        return 0;
+    uint16_t *w = wn_utf8_to_utf16(abuf, NULL);
+    if (!w)
+        return 0;
+    size_t units = 0;
+    while (w[units])
+        units++;
+    if (!buf || cap < units + 1) {
+        free(w);
+        wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+        return (uint32_t)units;
+    }
+    memcpy(buf, w, (units + 1) * 2);
+    free(w);
+    if (part) {
+        uint16_t *last = buf;
+        for (uint16_t *q = buf; *q; q++)
+            if (*q == '\\')
+                last = q + 1;
+        *part = last;
+    }
+    return (uint32_t)units;
+}
+
 static WN_API uint32_t k32_GetTempPathA(uint32_t cap, char *buf)
 {
     const char *t = "C:\\windows\\temp\\";
@@ -1619,9 +1806,196 @@ static WN_API int32_t k32_FindNextFileA(wn_handle h, void *data)
     return 1;
 }
 
+/* WIN32_FIND_DATAW layout: same header offsets as A, but cFileName@44 is
+ * 260 UTF-16 units and cAlternateFileName@304 is 14 units (592 bytes total).
+ * 7-Zip i386 and every unicode-aware 32-bit app walks directories via W. */
+static int fill_find_data_w(k32_find *k, void *data)
+{
+    uint8_t *d = data;
+    char name[256];
+    uint32_t attrs;
+    uint64_t size;
+    if (!wn_find_next(&k->f, name, sizeof name, &attrs, &size))
+        return 0;
+    memset(d, 0, 592);
+    *(uint32_t *)(d + 0) = attrs;
+    *(uint32_t *)(d + 28) = (uint32_t)(size >> 32);
+    *(uint32_t *)(d + 32) = (uint32_t)size;
+    uint16_t *w = wn_utf8_to_utf16(name, NULL);
+    if (w) {
+        for (int i = 0; w[i] && i < 259; i++)
+            *(uint16_t *)(d + 44 + 2 * i) = w[i];
+        free(w);
+    }
+    return 1;
+}
+
+static WN_API wn_handle k32_FindFirstFileW(const uint16_t *pattern, void *data)
+{
+    if (!pattern || !data) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return WN_INVALID_HANDLE_VALUE;
+    }
+    char *a = wn_utf16_to_utf8(pattern, 4096);
+    if (!a) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return WN_INVALID_HANDLE_VALUE;
+    }
+    k32_find *k = wn_xcalloc(1, sizeof *k);
+    if (!wn_find_open(a, &k->f)) {
+        free(a);
+        free(k);
+        wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
+        return WN_INVALID_HANDLE_VALUE;
+    }
+    free(a);
+    if (!fill_find_data_w(k, data)) {
+        wn_find_close(&k->f);
+        free(k);
+        wn_last_error_set(WN_ERR_NO_MORE_FILES);
+        return WN_INVALID_HANDLE_VALUE;
+    }
+    wn_handle_set_dtor(WN_HTYPE_FIND, find_dtor);
+    return wn_handle_alloc(WN_HTYPE_FIND, k);
+}
+
+static WN_API int32_t k32_FindNextFileW(wn_handle h, void *data)
+{
+    wn_object *o = wn_handle_get(h, WN_HTYPE_FIND);
+    if (!o)
+        return 0;
+    if (!fill_find_data_w(o->ptr, data)) {
+        wn_last_error_set(WN_ERR_NO_MORE_FILES);
+        return 0;
+    }
+    return 1;
+}
+
 static WN_API int32_t k32_FindClose(wn_handle h)
 {
     return wn_handle_close(h);
+}
+
+/* --- FormatMessage ---------------------------------------------------------- */
+/* Subset that covers the error-display paths real apps take:
+ * FROM_SYSTEM (table of common Win32 errors), FROM_STRING (verbatim format
+ * copy — insert sequences are passed through when IGNORE_INSERTS is set,
+ * which is the combination Inno Setup uses), and ALLOCATE_MEMORY. */
+
+static const char *system_message_for(uint32_t id)
+{
+    switch (id) {
+    case 0:    return "The operation completed successfully.";
+    case 2:    return "The system cannot find the file specified.";
+    case 3:    return "The system cannot find the path specified.";
+    case 5:    return "Access is denied.";
+    case 6:    return "The handle is invalid.";
+    case 8:    return "Not enough memory resources are available to process this command.";
+    case 14:   return "Not enough storage is available to complete this operation.";
+    case 15:   return "The system cannot find the drive specified.";
+    case 32:   return "The process cannot access the file because it is being used by another process.";
+    case 87:   return "The parameter is incorrect.";
+    case 112:  return "There is not enough space on the disk.";
+    case 120:  return "This function is not supported on this system.";
+    case 122:  return "The data area passed to a system call is too small.";
+    case 123:  return "The filename, directory name, or volume label syntax is incorrect.";
+    case 126:  return "The specified module could not be found.";
+    case 127:  return "The specified procedure could not be found.";
+    case 145:  return "The directory is not empty.";
+    case 183:  return "Cannot create a file when that file already exists.";
+    case 1814: return "The specified resource type cannot be found in the image file.";
+    case 1816: return "Not enough quota is available to process this command.";
+    default:   return NULL;
+    }
+}
+
+static WN_API wn_abiword k32_FormatMessageA(uint32_t flags, const char *source,
+                                            uint32_t msg_id, uint32_t lang,
+                                            char *buf, wn_abiword size,
+                                            const void *args)
+{
+    (void)lang;
+    (void)args;   /* inserts unprocessed: callers here use IGNORE_INSERTS */
+    const char *msg = NULL;
+    if (flags & 0x400 /* FORMAT_MESSAGE_FROM_STRING */) {
+        msg = source ? source : "";
+    } else if (flags & 0x1000 /* FROM_SYSTEM */) {
+        msg = system_message_for(msg_id);
+        if (!msg) {
+            wn_last_error_set(317 /* ERROR_MR_MID_NOT_FOUND */);
+            return 0;
+        }
+    } else {
+        wn_log(WN_LOG_WARN, "kernel32: FormatMessageA flags 0x%x unsupported",
+               flags);
+        wn_last_error_set(WN_ERR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+    size_t need = strlen(msg) + 1;
+    if (flags & 0x100 /* ALLOCATE_MEMORY */) {
+        char *m = wn_xmalloc(need);
+        memcpy(m, msg, need);
+        *(char **)buf = m;      /* caller frees with LocalFree */
+        return (wn_abiword)(need - 1);
+    }
+    if (!buf || (wn_abiword)size < need) {
+        wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    memcpy(buf, msg, need);
+    return (wn_abiword)(need - 1);
+}
+
+static WN_API wn_abiword k32_FormatMessageW(uint32_t flags, const uint16_t *source,
+                                            uint32_t msg_id, uint32_t lang,
+                                            uint16_t *buf, wn_abiword size,
+                                            const void *args)
+{
+    (void)lang;
+    (void)args;
+    const char *msg = NULL;
+    if (flags & 0x400) {
+        char *a = source ? wn_utf16_to_utf8(source, 4096) : NULL;
+        msg = a ? a : "";
+    } else if (flags & 0x1000) {
+        msg = system_message_for(msg_id);
+        if (!msg) {
+            wn_last_error_set(317);
+            return 0;
+        }
+    } else {
+        wn_log(WN_LOG_WARN, "kernel32: FormatMessageW flags 0x%x unsupported",
+               flags);
+        wn_last_error_set(WN_ERR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+    uint16_t *w = wn_utf8_to_utf16(msg, NULL);
+    if (flags & 0x400)
+        free((void *)(uintptr_t)msg);
+    if (!w)
+        return 0;
+    size_t units = 0;
+    while (w[units])
+        units++;
+    size_t need = units + 1;
+    if (flags & 0x100) {
+        *(uint16_t **)buf = w;
+        return units;
+    }
+    if (!buf || (wn_abiword)size < need) {
+        free(w);
+        wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    memcpy(buf, w, need * 2);
+    free(w);
+    return units;
+}
+
+static WN_API void k32_SetFileApisToOEM(void)
+{
+    /* ANSI/OEM codepage selection: we present a single UTF-8-flavored
+     * ANSI codepage; nothing to switch. */
 }
 
 /* --- sync objects ------------------------------------------------------------------ */
@@ -2313,16 +2687,40 @@ static WN_API uint32_t k32_SetThreadAffinityMask(wn_handle h, wn_abiword mask)
 
 static WN_API void k32_GetSystemInfo(void *si)
 {
-    /* SYSTEM_INFO x64: 48 bytes. */
+#if defined(__x86_64__)
+    /* SYSTEM_INFO x64: 48 bytes, pointers 8.
+     * arch@0, pageSize@4, lpMin@8, lpMax@16, mask@24, nprocs@32,
+     * procType@36, granularity@40, level@44, rev@46. */
     memset(si, 0, 48);
     uint8_t *p = si;
-    *(uint32_t *)(p + 0) = 4096;
-    *(uint64_t *)(p + 8) = 0x10000;
-    *(uint64_t *)(p + 16) = 0x7FFFFFFEFFFFULL;
+    *(uint16_t *)(p + 0) = 9;                 /* PROCESSOR_ARCHITECTURE_AMD64 */
+    *(uint32_t *)(p + 4) = 4096;              /* dwPageSize                   */
+    *(uint64_t *)(p + 8) = 0x10000;           /* lpMinimumApplicationAddress  */
+    *(uint64_t *)(p + 16) = 0x7FFFFFFEFFFFULL;/* lpMaximumApplicationAddress  */
     *(uint64_t *)(p + 24) = (1ULL << g_proc.peb->number_of_processors) - 1;
     *(uint32_t *)(p + 32) = g_proc.peb->number_of_processors;
-    *(uint32_t *)(p + 36) = 8664;      /* PROCESSOR_AMD_X8664 */
-    *(uint32_t *)(p + 40) = 0x10000;   /* allocation granularity */
+    *(uint32_t *)(p + 36) = 8664;             /* PROCESSOR_AMD_X8664         */
+    *(uint32_t *)(p + 40) = 0x10000;          /* allocation granularity      */
+#else
+    /* SYSTEM_INFO i386: 36 bytes, pointers 4.
+     * oemId@0, pageSize@4, lpMin@8, lpMax@12, mask@16, nprocs@20,
+     * procType@24, granularity@28, level@32, rev@34. The old code wrote the
+     * 48-byte x64 layout here, overflowing guest locals and putting
+     * dwNumberOfProcessors/dwAllocationGranularity at offsets the 32-bit
+     * struct doesn't have — Delphi's VirtualQuery walker then computed
+     * its region steps from zeroed fields and walked off the map. */
+    memset(si, 0, 36);
+    uint8_t *p = si;
+    *(uint32_t *)(p + 4) = 4096;              /* dwPageSize                   */
+    *(uint32_t *)(p + 8) = 0x10000;           /* lpMinimumApplicationAddress  */
+    *(uint32_t *)(p + 12) = 0x7FFEFFFF;       /* lpMaximumApplicationAddress  */
+    *(uint32_t *)(p + 16) = 1;                /* dwActiveProcessorMask        */
+    *(uint32_t *)(p + 20) = 1;                /* dwNumberOfProcessors         */
+    *(uint32_t *)(p + 24) = 586;              /* PROCESSOR_INTEL_PENTIUM      */
+    *(uint32_t *)(p + 28) = 0x10000;          /* dwAllocationGranularity      */
+    *(uint16_t *)(p + 32) = 6;                /* wProcessorLevel              */
+    *(uint16_t *)(p + 34) = 0;                /* wProcessorRevision           */
+#endif
 }
 
 static WN_API uint32_t k32_GetVersion(void)
@@ -2494,7 +2892,7 @@ static wn_module *mod_or_exe(uint64_t hmod)
     return wn_module_from_addr((const void *)(uintptr_t)hmod, NULL);
 }
 
-WN_API uint64_t k32_FindResourceA(uint64_t hmod, const char *name,
+WN_API uint64_t k32_FindResourceA(wn_abiword hmod, const char *name,
                                          const char *type)
 {
     wn_module *m = mod_or_exe(hmod);
@@ -2555,7 +2953,7 @@ static WN_API uint64_t k32_LoadResource(wn_abiword hmod, wn_abiword hres)
     return hres;
 }
 
-WN_API void *k32_LockResource(uint64_t hres)
+WN_API void *k32_LockResource(wn_abiword hres)
 {
     wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
     if (!h || h->magic != WN_RES_MAGIC)
@@ -2582,6 +2980,165 @@ static WN_API int32_t k32_Beep(uint32_t freq, uint32_t dur)
     (void)freq;
     (void)dur;
     return 1;
+}
+
+/* --- locale ----------------------------------------------------------------- */
+/* en-US defaults: the guest's world is Windows-shaped, and Inno/Delphi
+ * query these constantly for number/date formatting (0x44 = abbreviated
+ * month name "Jan" was the first one Inno Setup asked for). */
+
+static WN_API uint16_t k32_GetUserDefaultLangID(void)  { return 0x0409; }
+static WN_API uint16_t k32_GetSystemDefaultLangID(void) { return 0x0409; }
+static WN_API uint32_t k32_GetUserDefaultLCID(void)    { return 0x0409; }
+static WN_API uint32_t k32_GetSystemDefaultLCID(void)  { return 0x0409; }
+static WN_API uint32_t k32_GetThreadLocale(void)       { return 0x0409; }
+
+static const char *locale_day_name(uint32_t t)
+{
+    static const char *days[7] = { "Monday","Tuesday","Wednesday","Thursday",
+                                   "Friday","Saturday","Sunday" };
+    static const char *abbr[7] = { "Mon","Tue","Wed","Thu","Fri","Sat","Sun" };
+    if (t >= 0x2A && t <= 0x30) return days[t - 0x2A];   /* SDAYNAME1..7    */
+    if (t >= 0x31 && t <= 0x37) return abbr[t - 0x31];   /* SABBREVDAY1..7  */
+    return NULL;
+}
+
+static const char *locale_month_name(uint32_t t)
+{
+    static const char *mon[12] = { "January","February","March","April",
+                                   "May","June","July","August",
+                                   "September","October","November","December" };
+    static const char *abbr[12] = { "Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec" };
+    if (t >= 0x38 && t <= 0x43) return mon[t - 0x38];
+    if (t >= 0x44 && t <= 0x4F) return abbr[t - 0x44];
+    return NULL;
+}
+
+static const char *locale_str_for(uint32_t t)
+{
+    switch (t) {
+    case 0x01: return "9";                   /* LOCALE_ILANGUAGE      */
+    case 0x02: return "English (United States)"; /* LOCALE_SLANGUAGE   */
+    case 0x04: return "English";             /* LOCALE_SNATIVELANGNAME*/
+    case 0x05: return "1";                   /* LOCALE_ICOUNTRY        */
+    case 0x06: return "United States";       /* LOCALE_SCOUNTRY        */
+    case 0x08: return "United States";       /* LOCALE_SNATIVECTRYNAME */
+    case 0x0C: return ";";                   /* LOCALE_SLIST           */
+    case 0x0D: return "0";                   /* LOCALE_IMEASURE        */
+    case 0x0E: return ".";                   /* LOCALE_SDECIMAL        */
+    case 0x0F: return ",";                   /* LOCALE_STHOUSAND       */
+    case 0x10: return "3;0";                 /* LOCALE_SGROUPING       */
+    case 0x11: return "2";                   /* LOCALE_IDIGITS         */
+    case 0x12: return "1";                   /* LOCALE_ILZERO          */
+    case 0x1010: return "1";                 /* LOCALE_INEGNUMBER      */
+    case 0x13: return "0123456789";          /* LOCALE_SNATIVEDIGITS   */
+    case 0x14: return "$";                   /* LOCALE_SCURRENCY       */
+    case 0x15: return "USD";                 /* LOCALE_SINTLSYMBOL     */
+    case 0x16: return ".";                   /* LOCALE_SMONDECIMALSEP  */
+    case 0x17: return ",";                   /* LOCALE_SMONTHOUSANDSEP */
+    case 0x18: return "3;0";                 /* LOCALE_SMONGROUPING    */
+    case 0x19: return "2";                   /* LOCALE_ICURRDIGITS     */
+    case 0x1A: return "2";                   /* LOCALE_IINTLCURRDIGITS */
+    case 0x1B: return "0";                   /* LOCALE_ICURRENCY       */
+    case 0x1C: return "1";                   /* LOCALE_INEGCURR        */
+    case 0x1D: return "/";                   /* LOCALE_SDATE           */
+    case 0x1E: return ":";                   /* LOCALE_STIME           */
+    case 0x1F: return "M/d/yyyy";            /* LOCALE_SSHORTDATE      */
+    case 0x20: return "dddd, MMMM d, yyyy";  /* LOCALE_SLONGDATE       */
+    case 0x21: return "0";                   /* LOCALE_IDATE           */
+    case 0x22: return "0";                   /* LOCALE_ILDATE          */
+    case 0x23: return "0";                   /* LOCALE_ITIME (12h)     */
+    case 0x24: return "0";                   /* LOCALE_ICENTURY        */
+    case 0x25: return "1";                   /* LOCALE_ITLZERO         */
+    case 0x26: return "0";                   /* LOCALE_IDAYLZERO       */
+    case 0x27: return "0";                   /* LOCALE_IMONLZERO       */
+    case 0x28: return "AM";                  /* LOCALE_S1159           */
+    case 0x29: return "PM";                  /* LOCALE_S2359           */
+    case 0x50: return "";                    /* LOCALE_SPOSITIVESIGN   */
+    case 0x51: return "-";                   /* LOCALE_SNEGATIVESIGN   */
+    case 0x1001: return "English";           /* LOCALE_SENGLANGUAGE    */
+    case 0x1002: return "United States";     /* LOCALE_SENGCOUNTRY     */
+    case 0x1003: return "h:mm:ss tt";        /* LOCALE_STIMEFORMAT     */
+    case 0x1004: return "1252";              /* LOCALE_IDEFAULTANSICODEPAGE */
+    case 0x1005: return "0";                 /* LOCALE_ITIMEMARKPOSN   */
+    case 0x1006: return "MMMM yyyy";         /* LOCALE_SYEARMONTH      */
+    default: {
+        const char *s = locale_day_name(t);
+        if (s) return s;
+        return locale_month_name(t);
+    }
+    }
+}
+
+static WN_API int32_t k32_GetLocaleInfoA(uint32_t lcid, uint32_t lctype,
+                                         char *buf, int32_t cch)
+{
+    (void)lcid;
+    uint32_t t = lctype & 0xFFFF;             /* strip NOUSEROVERRIDE etc. */
+    if (lctype & 0x20000000u /* LOCALE_RETURN_NUMBER */) {
+        if (!buf)
+            return 4;
+        if (cch < 4) {
+            wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+            return 0;
+        }
+        const char *s = locale_str_for(t);
+        uint32_t v = s ? (uint32_t)strtoul(s, NULL, 10) : 0;
+        memcpy(buf, &v, 4);
+        return 4;
+    }
+    const char *s = locale_str_for(t);
+    if (!s) {
+        wn_log(WN_LOG_WARN, "kernel32: GetLocaleInfoA: lctype 0x%x "
+               "unsupported", lctype);
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    int32_t need = (int32_t)strlen(s) + 1;
+    if (!buf || cch == 0)
+        return need;
+    int32_t copy = need < cch ? need : cch;
+    memcpy(buf, s, (size_t)copy);
+    buf[copy - 1] = 0;
+    return copy;
+}
+
+static WN_API int32_t k32_GetLocaleInfoW(uint32_t lcid, uint32_t lctype,
+                                         uint16_t *buf, int32_t cch)
+{
+    (void)lcid;
+    uint32_t t = lctype & 0xFFFF;
+    const char *s = locale_str_for(t);
+    if (lctype & 0x20000000u) {
+        if (!buf)
+            return 4;
+        if (cch < 2) {
+            wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
+            return 0;
+        }
+        uint32_t v = s ? (uint32_t)strtoul(s, NULL, 10) : 0;
+        memcpy(buf, &v, 4);
+        return 4;
+    }
+    if (!s) {
+        wn_log(WN_LOG_WARN, "kernel32: GetLocaleInfoW: lctype 0x%x "
+               "unsupported", lctype);
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    int32_t need = (int32_t)strlen(s) + 1;
+    if (!buf || cch == 0)
+        return need;
+    uint16_t *w = wn_utf8_to_utf16(s, NULL);
+    if (!w)
+        return 0;
+    int32_t copy = need < cch ? need : cch;
+    for (int32_t i = 0; i < copy - 1; i++)
+        buf[i] = w[i];
+    buf[copy - 1] = 0;
+    free(w);
+    return copy;
 }
 
 static WN_API void k32_RaiseException(uint32_t code, uint32_t flags,
@@ -2655,6 +3212,19 @@ static WN_API int32_t k32_SetConsoleCtrlHandler(wn_abiword handler, int32_t add)
 
 const wn_export_entry wn_kernel32_exports[] = {
     { "Beep", k32_Beep },
+    { "GetFullPathNameA", k32_GetFullPathNameA },
+    { "GetFullPathNameW", k32_GetFullPathNameW },
+    { "FormatMessageA", k32_FormatMessageA },
+    { "FormatMessageW", k32_FormatMessageW },
+    { "SetFileApisToOEM", k32_SetFileApisToOEM },
+    { "SetFileApisToANSI", k32_SetFileApisToOEM },
+    { "GetUserDefaultLangID", k32_GetUserDefaultLangID },
+    { "GetSystemDefaultLangID", k32_GetSystemDefaultLangID },
+    { "GetUserDefaultLCID", k32_GetUserDefaultLCID },
+    { "GetSystemDefaultLCID", k32_GetSystemDefaultLCID },
+    { "GetThreadLocale", k32_GetThreadLocale },
+    { "GetLocaleInfoA", k32_GetLocaleInfoA },
+    { "GetLocaleInfoW", k32_GetLocaleInfoW },
     { "CloseHandle", k32_CloseHandle },
     { "CopyFileA", k32_CopyFileA },
     { "CreateDirectoryA", k32_CreateDirectoryA },
@@ -2678,7 +3248,9 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "ExitThread", k32_ExitThread },
     { "FindClose", k32_FindClose },
     { "FindFirstFileA", k32_FindFirstFileA },
+    { "FindFirstFileW", k32_FindFirstFileW },
     { "FindNextFileA", k32_FindNextFileA },
+    { "FindNextFileW", k32_FindNextFileW },
     { "FlushFileBuffers", k32_FlushFileBuffers },
     { "FreeLibrary", k32_FreeLibrary },
     { "GetACP", k32_GetACP },
@@ -2690,6 +3262,10 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "GetConsoleOutputCP", k32_GetConsoleOutputCP },
     { "GetCurrentDirectoryA", k32_GetCurrentDirectoryA },
     { "GetCurrentProcess", k32_GetCurrentProcess },
+    { "GetProcessAffinityMask", k32_GetProcessAffinityMask },
+    { "IsWow64Process", k32_IsWow64Process },
+    { "GetProcessTimes", k32_GetProcessTimes },
+    { "GetSystemTimes", k32_GetSystemTimes },
     { "GetCurrentProcessId", k32_GetCurrentProcessId },
     { "GetCurrentThread", k32_GetCurrentThread },
     { "GetCurrentThreadId", k32_GetCurrentThreadId },

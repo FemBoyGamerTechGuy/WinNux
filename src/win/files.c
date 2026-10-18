@@ -238,8 +238,10 @@ int wn_find_next(wn_find *f, char *name_out, size_t cap, uint32_t *attrs,
         if (size_out) *size_out = 0;
         return 1;
     }
-    struct dirent *e;
-    while ((e = readdir(d))) {
+    struct dirent64 *e;   /* readdir64: 32-bit readdir fails with
+                            * EOVERFLOW on 64-bit-inode filesystems
+                            * (overlayfs containers, btrfs). */
+    while ((e = readdir64(d))) {
         if (has_wild ? wn_glob_match(f->pattern, e->d_name)
                      : wn_strcaseeq(e->d_name, f->pattern)) {
             snprintf(name_out, cap, "%s", e->d_name);

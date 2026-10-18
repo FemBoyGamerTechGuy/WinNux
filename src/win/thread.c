@@ -3,6 +3,7 @@
  */
 #include "wn_process.h"
 #include "wn_module.h"
+#include "wn_pe.h"
 #include "wn_log.h"
 #include "wn_util.h"
 #include "wn_handle.h"
@@ -29,6 +30,35 @@ typedef struct wn_tls_mod {
 static wn_tls_mod *g_tls_mods;          /* documented global: grows with modules */
 static pthread_mutex_t g_tls_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Registry of live TEBs. Windows loader contract: when a module with static
+ * TLS loads, EVERY existing thread immediately gets a TLS block for it
+ * (future threads get theirs at wn_teb_attach -> wn_tls_thread_register).
+ * TEBs are never unmapped (thread exit keeps the mapping), so nodes stay
+ * valid for the process lifetime. */
+typedef struct wn_tls_teb_node {
+    wn_teb *teb;
+    struct wn_tls_teb_node *next;
+} wn_tls_teb_node;
+
+static wn_tls_teb_node *g_tls_tebs;
+
+/* Allocate the per-thread block for one module into a TEB that lacks it. */
+static void tls_alloc_block(wn_teb *teb, const wn_tls_mod *tm)
+{
+    if (tm->index == 0 || tm->index >= 512)
+        return;
+    if (teb->tls_array[tm->index] != 0)
+        return;                          /* block already present */
+    size_t raw = 0;
+    if (tm->template_end > tm->template_start)
+        raw = (size_t)(tm->template_end - tm->template_start);
+    size_t sz = (raw + tm->zero_fill + 15) & ~15ULL;
+    void *block = wn_xcalloc(1, sz + 8);
+    if (raw && tm->template_start)
+        memcpy(block, (const void *)(uintptr_t)tm->template_start, raw);
+    teb->tls_array[tm->index] = (wn_abiptr)(uintptr_t)block;
+}
+
 struct thread_start_ctx {
     WN_API uint64_t (*start)(uint64_t);
     uint64_t param;
@@ -41,15 +71,37 @@ void wn_tls_register_module(struct wn_module *m)
 {
     if (m->kind != WN_MOD_PE)
         return;
-    const wn_image_dos_header *dos = (const void *)m->pe.base;
-    const wn_image_optional_header64 *oh =
-        (const void *)(m->pe.base + dos->e_lfanew + 4 + sizeof(wn_image_file_header));
-    const wn_image_data_directory *dir = &oh->dirs[WN_IMAGE_DIR_TLS];
-    if (dir->virtual_address == 0 || dir->size < sizeof(wn_image_tls_directory64))
+    /* Arch-correct data-directory access: PE32 and PE32+ keep the directory
+     * table at different optional-header offsets (96 vs 112). The old code
+     * unconditionally used the 64-bit overlay, so 32-bit images read a
+     * garbage TLS directory and silently never registered. */
+    const wn_image_data_directory *dirs = wn_pe_dirs(&m->pe);
+    const wn_image_data_directory *dir = &dirs[WN_IMAGE_DIR_TLS];
+    if (dir->virtual_address == 0)
         return;
-    const wn_image_tls_directory64 *tls = wn_pe_rva(&m->pe, dir->virtual_address, sizeof *tls);
-    if (!tls)
-        return;
+    uint64_t ts = 0, te = 0;
+    uint32_t zero = 0;
+    if (m->pe.is_64) {
+        if (dir->size < sizeof(wn_image_tls_directory64))
+            return;
+        const wn_image_tls_directory64 *tls =
+            wn_pe_rva(&m->pe, dir->virtual_address, sizeof *tls);
+        if (!tls)
+            return;
+        ts = tls->start_address_of_raw_data;
+        te = tls->end_address_of_raw_data;
+        zero = tls->size_of_zero_fill;
+    } else {
+        if (dir->size < sizeof(wn_image_tls_directory32))
+            return;
+        const wn_image_tls_directory32 *tls =
+            wn_pe_rva(&m->pe, dir->virtual_address, sizeof *tls);
+        if (!tls)
+            return;
+        ts = tls->start_address_of_raw_data;
+        te = tls->end_address_of_raw_data;
+        zero = tls->size_of_zero_fill;
+    }
     wn_tls_mod *tm = wn_xcalloc(1, sizeof *tm);
     tm->mod = m;
     tm->index = m->tls_index;
@@ -58,34 +110,40 @@ void wn_tls_register_module(struct wn_module *m)
                        (va) < m->pe.preferred_base + m->pe.size_of_image) \
                       ? (uint64_t)(uintptr_t)m->pe.base + ((va) - m->pe.preferred_base) \
                       : (va))
-    tm->template_start = NORM(tls->start_address_of_raw_data);
-    tm->template_end = NORM(tls->end_address_of_raw_data);
-    tm->zero_fill = tls->size_of_zero_fill;
+    tm->template_start = NORM(ts);
+    tm->template_end = NORM(te);
+    tm->zero_fill = zero;
     #undef NORM
     pthread_mutex_lock(&g_tls_lock);
     tm->next = g_tls_mods;
     g_tls_mods = tm;
+    /* Backfill every live TEB, including the main thread's (its init ran
+     * before any module existed). */
+    for (wn_tls_teb_node *n = g_tls_tebs; n; n = n->next)
+        tls_alloc_block(n->teb, tm);
     pthread_mutex_unlock(&g_tls_lock);
     wn_log(WN_LOG_DEBUG, "tls: module '%s' index %u, template 0x%llx..0x%llx (+%u zero)",
            m->name, tm->index, (unsigned long long)tm->template_start,
            (unsigned long long)tm->template_end, tm->zero_fill);
 }
 
+void wn_tls_thread_register(wn_teb *teb)
+{
+    pthread_mutex_lock(&g_tls_lock);
+    wn_tls_teb_node *n = wn_xcalloc(1, sizeof *n);
+    n->teb = teb;
+    n->next = g_tls_tebs;
+    g_tls_tebs = n;
+    for (wn_tls_mod *tm = g_tls_mods; tm; tm = tm->next)
+        tls_alloc_block(teb, tm);
+    pthread_mutex_unlock(&g_tls_lock);
+}
+
 void wn_tls_thread_init(wn_teb *teb)
 {
     pthread_mutex_lock(&g_tls_lock);
-    for (wn_tls_mod *tm = g_tls_mods; tm; tm = tm->next) {
-        if (tm->index == 0 || tm->index >= 512)
-            continue;
-        size_t raw = 0;
-        if (tm->template_end > tm->template_start)
-            raw = (size_t)(tm->template_end - tm->template_start);
-        size_t sz = (raw + tm->zero_fill + 15) & ~15ULL;
-        void *block = wn_xcalloc(1, sz + 8);
-        if (raw && tm->template_start)
-            memcpy(block, (const void *)(uintptr_t)tm->template_start, raw);
-        teb->tls_array[tm->index] = (wn_abiptr)(uintptr_t)block;
-    }
+    for (wn_tls_mod *tm = g_tls_mods; tm; tm = tm->next)
+        tls_alloc_block(teb, tm);
     pthread_mutex_unlock(&g_tls_lock);
 }
 

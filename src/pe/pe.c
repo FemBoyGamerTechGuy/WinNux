@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/mman.h>
 
 /* Page helpers. */
@@ -201,11 +202,55 @@ uint32_t wn_pe_map(const uint8_t *f, size_t fs, const char *path,
     }
 
     size_t map_size = page_up(img->size_of_image);
-    uint8_t *base = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    uint8_t *base = MAP_FAILED;
+
+    /* Windows loader semantics: an image whose preferred base is available
+     * ALWAYS maps there, and images with RELOCS_STRIPPED / an empty .reloc
+     * directory (the vast majority of pre-ASLR 32-bit EXEs: Delphi/Inno,
+     * VB6, old MSVC) can ONLY load there. Ask the kernel for the exact
+     * address. MAP_FIXED_NOREPLACE (Linux 4.17+) refuses with EEXIST instead
+     * of clobbering existing mappings; on older kernels unknown MAP_ bits are
+     * ignored, which degrades to a plain hint — safe, because the returned
+     * address is verified below and dropped when it is not what we asked. */
+    uintptr_t want = (uintptr_t)img->preferred_base;
+    if (want != 0 && (want & 0xFFFu) == 0) {
+        base = mmap((void *)want, map_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+                        | MAP_FIXED_NOREPLACE,
+                    -1, 0);
+        if (base != MAP_FAILED && (uintptr_t)base != want) {
+            /* Pre-4.17 kernel ignored the NOREPLACE flag and gave us a hint
+             * result elsewhere: useless here, release it. */
+            munmap(base, map_size);
+            base = MAP_FAILED;
+        }
+        if (base == MAP_FAILED && (errno == EINVAL || errno == ENOSYS)) {
+            /* Pre-4.17 kernel that rejects unknown flags: retry as a hint. */
+            base = mmap((void *)want, map_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (base != MAP_FAILED && (uintptr_t)base != want) {
+                munmap(base, map_size);
+                base = MAP_FAILED;
+            }
+        }
+    }
+
     if (base == MAP_FAILED) {
-        wn_log(WN_LOG_ERR, "pe: '%s': mmap of %zu bytes failed", path, map_size);
-        return WN_ERR_NOT_ENOUGH_MEMORY;
+        /* Preferred base busy (or image has none): kernel-chosen address;
+         * wn_pe_apply_relocations fixes the image up if it carries .reloc. */
+        base = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (base == MAP_FAILED) {
+            wn_log(WN_LOG_ERR, "pe: '%s': mmap of %zu bytes failed", path,
+                   map_size);
+            return WN_ERR_NOT_ENOUGH_MEMORY;
+        }
+        wn_log(WN_LOG_INFO, "pe: '%s': preferred base 0x%llx busy; mapped at "
+               "%p (image must relocate)", path,
+               (unsigned long long)img->preferred_base, base);
+    } else {
+        wn_log(WN_LOG_DEBUG, "pe: '%s': mapped at preferred base %p",
+               path, base);
     }
 
     img->base = base;

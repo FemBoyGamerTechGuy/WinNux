@@ -1600,8 +1600,8 @@ uint64_t wn_user32_paint_count(void)
  * exported from user32.dll, exactly like real Windows. */
 extern WN_API wn_handle g32_BeginPaint(uint64_t hwnd, void *ps);
 extern WN_API int32_t g32_EndPaint(uint64_t hwnd, const void *ps);
-extern WN_API wn_handle g32_GetDC(uint64_t hwnd);
-extern WN_API int32_t g32_ReleaseDC(uint64_t hwnd, wn_handle hdc);
+extern WN_API wn_handle g32_GetDC(wn_abiword hwnd);
+extern WN_API int32_t g32_ReleaseDC(wn_abiword hwnd, wn_handle hdc);
 extern WN_API int32_t g32_FillRect(wn_handle hdc, const void *rect, wn_handle brush);
 
 
@@ -2924,6 +2924,110 @@ static const char *dlg_atom_class(uint16_t atom)
     case 0x0085: return "ComboBox";
     default: return NULL;
     }
+}
+
+/* Char walk: C locale has no DBCS lead bytes (see _ismbblead), so a char is
+ * one byte (A) / one UTF-16 unit (W). Returning NULL from the old stubs
+ * crashed Inno's string parsing immediately. */
+static WN_API char *u32_CharNextA(const char *ptr)
+{
+    if (!ptr || !*ptr)
+        return (char *)(uintptr_t)ptr;
+    return (char *)(uintptr_t)ptr + 1;
+}
+
+static WN_API char *u32_CharPrevA(const char *start, const char *cur)
+{
+    if (!cur)
+        return (char *)(uintptr_t)start;
+    if (cur <= start)
+        return (char *)(uintptr_t)cur;
+    return (char *)(uintptr_t)cur - 1;
+}
+
+static WN_API uint16_t *u32_CharNextW(const uint16_t *ptr)
+{
+    if (!ptr || !*ptr)
+        return (uint16_t *)(uintptr_t)ptr;
+    return (uint16_t *)(uintptr_t)ptr + 1;
+}
+
+static WN_API uint16_t *u32_CharPrevW(const uint16_t *start, const uint16_t *cur)
+{
+    if (!cur)
+        return (uint16_t *)(uintptr_t)start;
+    if (cur <= start)
+        return (uint16_t *)(uintptr_t)cur;
+    return (uint16_t *)(uintptr_t)cur - 1;
+}
+
+/* LoadString: RT_STRING table block (uID/16+1) of 16 length-prefixed UTF-16
+ * strings; the wanted entry is uID%16. Inno/Delphi and countless installers
+ * pull ALL of their UI text through this one API. */
+static const uint16_t *load_string_lookup(wn_abiword hinst, uint32_t uid,
+                                          uint16_t *len_out)
+{
+    extern WN_API uint64_t k32_FindResourceA(uint64_t, const char *,
+                                             const char *);
+    extern WN_API void *k32_LockResource(uint64_t);
+    char rid[16];
+    snprintf(rid, sizeof rid, "%u", (unsigned)(uid / 16) + 1);
+    uint64_t hres = k32_FindResourceA(hinst, rid,
+                                      (const char *)(uintptr_t)6 /*RT_STRING*/);
+    if (!hres)
+        return NULL;
+    const uint16_t *p = k32_LockResource(hres);
+    if (!p)
+        return NULL;
+    unsigned idx = uid & 15;
+    for (unsigned i = 0; i < 16; i++) {
+        uint16_t len = *p++;
+        if (i == idx) {
+            *len_out = len;
+            return len ? p : NULL;
+        }
+        p += len;
+    }
+    return NULL;
+}
+
+static WN_API int32_t u32_LoadStringW(wn_abiword hinst, uint32_t uid,
+                                      uint16_t *buf, int32_t cch_max)
+{
+    uint16_t len = 0;
+    const uint16_t *s = load_string_lookup(hinst, uid, &len);
+    if (!s)
+        return 0;
+    if (!buf)
+        return (int32_t)(uintptr_t)s;   /* Windows: read-only pointer back */
+    if (cch_max <= 0)
+        return 0;
+    int32_t copy = (int32_t)len < cch_max - 1 ? (int32_t)len : cch_max - 1;
+    memcpy(buf, s, (size_t)copy * 2);
+    buf[copy] = 0;
+    return copy;
+}
+
+static WN_API int32_t u32_LoadStringA(wn_abiword hinst, uint32_t uid,
+                                      char *buf, int32_t cch_max)
+{
+    uint16_t len = 0;
+    const uint16_t *s = load_string_lookup(hinst, uid, &len);
+    if (!s)
+        return 0;
+    if (!buf)
+        return 0;   /* ANSI variant has no direct resource pointer to return */
+    if (cch_max <= 0)
+        return 0;
+    char *a = wn_utf16_to_utf8(s, len);
+    if (!a)
+        return 0;
+    int32_t n = (int32_t)strlen(a);
+    int32_t copy = n < cch_max - 1 ? n : cch_max - 1;
+    memcpy(buf, a, (size_t)copy);
+    buf[copy] = 0;
+    free(a);
+    return copy;
 }
 
 /* Approx dialog-base-unit conversion (font metrics come with real fonts). */
@@ -4424,6 +4528,12 @@ const wn_export_entry wn_user32_exports[] = {
     { "SetWindowLongPtrA", u32_SetWindowLongPtrA },
     { "MessageBoxA", u32_MessageBoxA },
     { "MessageBoxW", u32_MessageBoxW },
+    { "LoadStringA", u32_LoadStringA },
+    { "LoadStringW", u32_LoadStringW },
+    { "CharNextA", u32_CharNextA },
+    { "CharNextW", u32_CharNextW },
+    { "CharPrevA", u32_CharPrevA },
+    { "CharPrevW", u32_CharPrevW },
     { "MessageBoxIndirectW", u32_MessageBoxIndirectW },
     { "EnableWindow", u32_EnableWindow },
     { "IsWindowEnabled", u32_IsWindowEnabled },

@@ -326,7 +326,7 @@ static void draw_text_into(gdi_obj *dc, int x, int y, const char *s, size_t n)
 /* PAINTSTRUCT x64: hdc@0(8), fErase@8(4), rcPaint@0xC(16), fRestore@0x1C,
  * fIncUpdate@0x20, rgbReserved@0x24[32] — 68 bytes. */
 
-WN_API wn_handle g32_BeginPaint(uint64_t hwnd, void *ps)
+WN_API wn_handle g32_BeginPaint(wn_abiword hwnd, void *ps)
 {
     wn_object *wo = wn_handle_get((wn_handle)(uintptr_t)hwnd, WN_HTYPE_GFX);
     if (!wo || !ps)
@@ -361,7 +361,7 @@ WN_API wn_handle g32_BeginPaint(uint64_t hwnd, void *ps)
     return hdc;
 }
 
-WN_API int32_t g32_EndPaint(uint64_t hwnd, const void *ps)
+WN_API int32_t g32_EndPaint(wn_abiword hwnd, const void *ps)
 {
     (void)ps;
     wn_object *wo = wn_handle_get((wn_handle)(uintptr_t)hwnd, WN_HTYPE_GFX);
@@ -376,7 +376,7 @@ WN_API int32_t g32_EndPaint(uint64_t hwnd, const void *ps)
     return 1;
 }
 
-WN_API wn_handle g32_GetDC(uint64_t hwnd)
+WN_API wn_handle g32_GetDC(wn_abiword hwnd)
 {
     extern wn_bwin *wn_user32_bwin_of(uint64_t hwnd);
     wn_bwin *b = wn_user32_bwin_of(hwnd);
@@ -396,7 +396,7 @@ WN_API wn_handle g32_GetDC(uint64_t hwnd)
     return gdi_new(dc);
 }
 
-WN_API int32_t g32_ReleaseDC(uint64_t hwnd, wn_handle hdc)
+WN_API int32_t g32_ReleaseDC(wn_abiword hwnd, wn_handle hdc)
 {
     (void)hwnd;
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);

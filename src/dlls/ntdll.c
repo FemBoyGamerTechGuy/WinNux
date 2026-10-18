@@ -40,14 +40,14 @@ static WN_API void nt_RtlDeleteCriticalSection(wn_critsect *cs)
     wn_critsect_delete(cs);
 }
 
-static WN_API uint64_t nt_RtlAllocateHeap(uint64_t heap, uint32_t flags, wn_abiword size)
+static WN_API uint64_t nt_RtlAllocateHeap(wn_abiword heap, uint32_t flags, wn_abiword size)
 {
     (void)heap;
     void *p = (flags & 8) ? calloc(1, (size_t)size) : malloc((size_t)size);
     return (uint64_t)(uintptr_t)p;
 }
 
-static WN_API int32_t nt_RtlFreeHeap(uint64_t heap, uint32_t flags, void *ptr)
+static WN_API int32_t nt_RtlFreeHeap(wn_abiword heap, uint32_t flags, void *ptr)
 {
     (void)heap;
     (void)flags;
@@ -55,7 +55,7 @@ static WN_API int32_t nt_RtlFreeHeap(uint64_t heap, uint32_t flags, void *ptr)
     return 1;   /* heap allocations are tracked by the host allocator */
 }
 
-static WN_API uint64_t nt_RtlSizeHeap(uint64_t heap, uint32_t flags, void *ptr)
+static WN_API uint64_t nt_RtlSizeHeap(wn_abiword heap, uint32_t flags, void *ptr)
 {
     (void)heap;
     (void)flags;
