@@ -145,7 +145,8 @@ int wn_virtual_protect(void *addr, uint64_t size, uint32_t newprot,
             while (fgets(line, sizeof line, f)) {
                 uint64_t s, e;
                 char perms[8];
-                if (sscanf(line, "%lx-%lx %4s", &s, &e, perms) == 3 && s <= a && e > a) {
+                if (sscanf(line, "%lx-%lx %4s", (unsigned long *)&s,
+                       (unsigned long *)&e, perms) == 3 && s <= a && e > a) {
                     old = 0;
                     if (perms[0] == 'r') old |= 0x02;
                     if (perms[1] == 'w') old |= 0x04;
@@ -203,7 +204,8 @@ int wn_virtual_query(void *addr, void *mbi)
     while (fgets(line, sizeof line, f)) {
         uint64_t s, e;
         char perms[8];
-        if (sscanf(line, "%lx-%lx %4s", &s, &e, perms) != 3)
+        if (sscanf(line, "%lx-%lx %4s", (unsigned long *)&s,
+                       (unsigned long *)&e, perms) != 3)
             continue;
         if (s <= a && e > a) {
             uint32_t p = 0;

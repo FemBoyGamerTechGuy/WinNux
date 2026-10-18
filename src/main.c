@@ -44,28 +44,49 @@ static WN_API uint64_t guest_entry_shim(uint64_t unused)
     (void)unused;
     wn_module *exe = g_proc.exe;
 
-    /* TLS callbacks (x64: array of VAs, NULL-terminated). */
+    /* TLS callbacks: NULL-terminated array of VAs (8-byte elements on PE32+,
+     * 4-byte on PE32 — width MUST match or we read garbage pointers). */
     if (exe->kind == WN_MOD_PE) {
-        const wn_image_dos_header *dos = (const void *)exe->pe.base;
-        const wn_image_optional_header64 *oh =
-            (const void *)(exe->pe.base + dos->e_lfanew + 4 + sizeof(wn_image_file_header));
-        const wn_image_data_directory *dir = &oh->dirs[WN_IMAGE_DIR_TLS];
-        if (dir->virtual_address && dir->size >= sizeof(wn_image_tls_directory64)) {
-            const wn_image_tls_directory64 *tls =
-                wn_pe_rva(&exe->pe, dir->virtual_address, sizeof *tls);
-            if (tls && tls->address_of_callbacks) {
-                uint64_t cbva = tls->address_of_callbacks;
-                if (cbva >= exe->pe.preferred_base &&
-                    cbva < exe->pe.preferred_base + exe->pe.size_of_image)
-                    cbva = (uint64_t)(uintptr_t)exe->pe.base
-                         + (cbva - exe->pe.preferred_base);
-                uint64_t *cbs = (uint64_t *)(uintptr_t)cbva;
-                typedef WN_API void (*tls_cb)(void *, uint32_t, void *);
-                for (uint32_t i = 0; cbs[i] && i < 64; i++) {
-                    wn_log(WN_LOG_DEBUG, "loader: TLS callback[%u] = 0x%llx", i,
-                           (unsigned long long)cbs[i]);
-                    ((tls_cb)(uintptr_t)cbs[i])(exe->base, 1 /*DLL_PROCESS_ATTACH*/, NULL);
+        const wn_image_data_directory *dirs = wn_pe_dirs(&exe->pe);
+        const wn_image_data_directory *dir = &dirs[WN_IMAGE_DIR_TLS];
+        int cb_width = exe->pe.is_64 ? 8 : 4;
+        uint64_t cbva = 0;
+        if (dir->virtual_address &&
+            dir->size >= (exe->pe.is_64 ? sizeof(wn_image_tls_directory64)
+                                        : sizeof(wn_image_tls_directory32))) {
+            if (exe->pe.is_64) {
+                const wn_image_tls_directory64 *tls =
+                    wn_pe_rva(&exe->pe, dir->virtual_address, sizeof *tls);
+                if (tls)
+                    cbva = tls->address_of_callbacks;
+            } else {
+                const wn_image_tls_directory32 *tls =
+                    wn_pe_rva(&exe->pe, dir->virtual_address, sizeof *tls);
+                if (tls)
+                    cbva = tls->address_of_callbacks;
+            }
+        }
+        if (cbva) {
+            if (cbva >= exe->pe.preferred_base &&
+                cbva < exe->pe.preferred_base + exe->pe.size_of_image)
+                cbva = (uint64_t)(uintptr_t)exe->pe.base
+                     + (cbva - exe->pe.preferred_base);
+            uint8_t *cbs = (uint8_t *)(uintptr_t)cbva;
+            typedef WN_API void (*tls_cb)(void *, uint32_t, void *);
+            for (uint32_t i = 0; i < 64; i++) {
+                uint64_t fnva;
+                if (cb_width == 8)
+                    memcpy(&fnva, cbs + (size_t)i * 8, 8);
+                else {
+                    uint32_t v;
+                    memcpy(&v, cbs + (size_t)i * 4, 4);
+                    fnva = v;
                 }
+                if (!fnva)
+                    break;
+                wn_log(WN_LOG_DEBUG, "loader: TLS callback[%u] = 0x%llx", i,
+                       (unsigned long long)fnva);
+                ((tls_cb)(uintptr_t)fnva)(exe->base, 1 /*DLL_PROCESS_ATTACH*/, NULL);
             }
         }
     }
@@ -137,6 +158,58 @@ static char *resolve_app_path(const char *arg)
     return NULL;
 }
 
+/* Peek at the PE machine type without loading (0 on error). */
+static uint16_t pe_peek_machine(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    wn_image_dos_header dos;
+    if (fread(&dos, 1, sizeof dos, f) != sizeof dos || dos.e_magic != 0x5A4D ||
+        dos.e_lfanew <= 0 || fseek(f, dos.e_lfanew + 4, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    wn_image_file_header fh;
+    if (fread(&fh, 1, sizeof fh, f) != sizeof fh) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return fh.machine;
+}
+
+/* 32-bit EXE on a 64-bit build: re-exec the 32-bit loader (Wine's wine64 /
+ * wine split, inverted). bin/winnux32 lives next to /proc/self/exe. */
+__attribute__((unused)) static int reexec_w32(int argc, char **argv)
+{
+    char self[300];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0)
+        return 0;
+    self[n] = 0;
+    char *slash = strrchr(self, '/');
+    if (!slash)
+        return 0;
+    snprintf(slash + 1, sizeof self - (size_t)(slash + 1 - self), "winnux32");
+    struct stat st;
+    if (stat(self, &st) != 0 || !S_ISREG(st.st_mode))
+        return 0;
+    /* Build the new argv: winnux32 <original run args...> */
+    char **nargv = wn_xmalloc(((size_t)argc + 2) * sizeof(char *));
+    nargv[0] = (char *)"winnux32";
+    nargv[1] = (char *)"run";
+    for (int i = 0; i < argc; i++)
+        nargv[i + 2] = argv[i];
+    nargv[argc + 2] = NULL;
+    wn_log(WN_LOG_INFO, "winnux: 32-bit image -> re-exec %s", self);
+    execv(self, nargv);
+    /* exec failed */
+    wn_log(WN_LOG_ERR, "winnux: exec of %s failed: %s", self, strerror(errno));
+    free(nargv);
+    return 0;
+}
+
 static int cmd_run(int argc, char **argv)
 {
     /* Options before the exe path. */
@@ -184,6 +257,20 @@ static int cmd_run(int argc, char **argv)
                 "as a C:/Z: windows path)\n", exe_arg);
         return 127;
     }
+    /* 32-bit EXE: hand off to the 32-bit loader build (bin/winnux32). */
+    if (pe_peek_machine(exe_path) == WN_IMAGE_FILE_MACHINE_I386) {
+#if defined(__x86_64__)
+        if (reexec_w32(argc - i, argv + i))
+            return 0;     /* never reached on success (execv) */
+        fprintf(stderr, "winnux: this is a 32-bit (i386) executable and the "
+                "32-bit loader 'winnux32' was not found next to winnux.\n"
+                "                build it with: make winnux32\n");
+        free(exe_path);
+        return 1;
+#else
+        /* already the 32-bit build: fall through */
+#endif
+    }
     /* Make it absolute: the guest sees argv[0] as a Windows path, and the
      * working directory can legitimately change during startup. */
     char abs_exe[4096];
@@ -193,8 +280,10 @@ static int cmd_run(int argc, char **argv)
     exe_path = wn_xstrdup(abs_exe[0] ? abs_exe : exe_arg);
 
     wn_module *exe = wn_module_load_exe(exe_path);
-    if (!exe)
+    if (!exe) {
+        free(exe_path);
         return 1;
+    }
     wn_process_note_exe(exe);
     wn_module_build_ldr();
 
@@ -220,6 +309,13 @@ static int cmd_run(int argc, char **argv)
     wn_process_exit(rv);
     return 0;
 }
+
+/* --- i386 note ------------------------------------------------------------------
+ * guest_entry_shim's TLS-callback walk and entry call above are written in
+ * the x64 shapes; on an i386 build the callback array elements are 4 bytes
+ * and the entry takes 3 pointer-sized args (the typedefs already scale
+ * through uintptr_t). The 32-bit TLS directory variant is handled in
+ * wn_pe_tls_setup via wn_pe_dirs(). */
 
 /* --- bench command ---------------------------------------------------------------- */
 

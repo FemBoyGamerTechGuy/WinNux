@@ -32,17 +32,18 @@ typedef wn_dword wn_colorref;
  * and it is the Microsoft x64 ABI. GCC/Clang expose it via ms_abi so builtin
  * functions can be called directly by guest code with zero thunks.
  *
- * i386 (WoW64 groundwork, IN PROGRESS — see STATUS.md): Win32 APIs are
- * stdcall (callee cleans) and msvcrt varargs are cdecl, so the i386 dispatch
- * layer needs per-export convention metadata before any 32-bit guest can
- * run. Until that lands, WN_API maps to PLAIN cdecl on i386: `make
- * check32` compiles the whole tree with -m32 to keep the source 32-bit
- * clean (pointer-size assumptions, struct layouts) without claiming a
- * working convention. */
+ * i386: Win32 APIs are STDCALL (callee cleans the stack — gcc exposes it via
+ * __attribute__((stdcall)) on ELF i386) and CRT functions are CDECL (varargs
+ * MUST be cdecl; the caller cleans). WN_API marks the Win32 surface,
+ * WN_CRTAPI the CRT surface; both are identity on x86_64. The IAT stub
+ * trampoline tail-jumps into these functions with the guest stack untouched,
+ * so each function's compile-time convention is the dispatch metadata. */
 #if defined(__x86_64__)
 #define WN_API __attribute__((ms_abi))
+#define WN_CRTAPI __attribute__((ms_abi))
 #elif defined(__i386__)
-#define WN_API                   /* cdecl; stdcall metadata TBD (STATUS.md) */
+#define WN_API __attribute__((stdcall))
+#define WN_CRTAPI __attribute__((cdecl))
 #else
 #error "WinNux targets x86 (32/64) only; aarch64 is planned"
 #endif

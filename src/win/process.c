@@ -30,6 +30,8 @@ wn_process g_proc;
 
 /* --- TEB -------------------------------------------------------------------- */
 
+#if defined(__x86_64__)
+
 wn_teb *wn_teb_attach(void)
 {
     /* TEB (0x400 bytes) + TLS pointer array (512 slots) in one mapping. */
@@ -53,6 +55,77 @@ wn_teb *wn_teb_attach(void)
     }
     return teb;
 }
+
+#else /* i386 */
+
+/* i386 TEB hosting: %fs must point at the TEB (guest code reads
+ * fs:0x18 self, fs:0x2C TLS array, fs:0x30 PEB, fs:0x34 last error).
+ * glibc owns %gs for its own TLS, so we use the LDT via modify_ldt
+ * (the Wine i386 model): one LDT entry per thread, selector = (n<<3)|7
+ * (LDT, RPL3). struct user_desc is defined inline (16 bytes, bitfields
+ * exactly as the kernel uapi) to avoid an asm/ldt.h include dependency.
+ * LDT entries are PROCESS-GLOBAL: the counter is mutex-guarded. */
+struct wn_user_desc {
+    uint32_t entry_number;
+    uint32_t base_addr;
+    uint32_t limit;
+    uint32_t seg_32bit:1, contents:2, read_exec_only:1, limit_in_pages:1,
+             seg_not_present:1, useable:1;
+};
+
+static uint32_t g_ldt_next;
+static pthread_mutex_t g_ldt_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int teb_load_fs(void *teb)
+{
+    struct wn_user_desc d;
+    memset(&d, 0, sizeof d);
+    pthread_mutex_lock(&g_ldt_lock);
+    d.entry_number = g_ldt_next++;
+    pthread_mutex_unlock(&g_ldt_lock);
+    d.base_addr = (uint32_t)(uintptr_t)teb;
+    d.limit = 0x2000 - 1;        /* TEB (0x400) + TLS array page */
+    d.seg_32bit = 1;
+    d.contents = 0;              /* data, grow-up */
+    d.read_exec_only = 0;
+    d.limit_in_pages = 0;        /* byte-granular limit */
+    d.seg_not_present = 0;
+    d.useable = 1;
+    if (syscall(123 /* SYS_modify_ldt (i386) */, 1 /* write */, &d,
+                sizeof d) != sizeof d) {
+        wn_log(WN_LOG_ERR, "teb: modify_ldt failed: %s", strerror(errno));
+        return -1;
+    }
+    uint32_t sel = (uint32_t)((d.entry_number << 3) | 0x07); /* LDT | RPL3 */
+    __asm__ volatile ("mov %0, %%eax\n\tmov %%ax, %%fs"
+                      : : "r" (sel) : "eax");
+    return 0;
+}
+
+wn_teb *wn_teb_attach(void)
+{
+    uint8_t *mem = mmap(NULL, 0x2000, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        wn_log(WN_LOG_ERR, "teb: mmap failed");
+        abort();
+    }
+    wn_teb *teb = (wn_teb *)mem;
+    memset(teb, 0, 0x400);
+    teb->self = (wn_abiptr)(uintptr_t)teb;
+    teb->tls_array = (wn_abiptr *)(mem + 0x1000);
+    teb->exception_list = 0;
+    teb->peb = g_proc.peb;
+    teb->client_id_process = getpid();
+    teb->client_id_thread = wn_alloc_tid();
+    if (teb_load_fs(teb) != 0) {
+        wn_log(WN_LOG_ERR, "teb: cannot load %%fs (32-bit TEB unavailable)");
+        abort();
+    }
+    return teb;
+}
+
+#endif
 
 wn_teb *wn_teb_current(void)
 {
@@ -162,11 +235,11 @@ uint32_t wn_process_create(const char *prefix, const char *exe_display_name)
     g_proc.ldr->length = sizeof(wn_peb_ldr_data);
     g_proc.ldr->initialized = 1;
     for (int i = 0; i < 3; i++) {
-        uint64_t *heads[] = { g_proc.ldr->in_load_order,
-                              g_proc.ldr->in_memory_order,
-                              g_proc.ldr->in_init_order };
+        wn_abiptr *heads[] = { (wn_abiptr *)g_proc.ldr->in_load_order,
+                               (wn_abiptr *)g_proc.ldr->in_memory_order,
+                               (wn_abiptr *)g_proc.ldr->in_init_order };
         for (int j = 0; j < 2; j++)
-            heads[i][j] = (uint64_t)(uintptr_t)&heads[i][0];
+            heads[i][j] = (wn_abiptr)(uintptr_t)&heads[i][0];
     }
 
     g_proc.params->maximum_length = sizeof(wn_rtl_user_process_parameters);

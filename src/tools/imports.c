@@ -493,7 +493,7 @@ int wn_cmd_imports(int argc, char **argv)
     }
 
     const char *arch = v.is64 ? "PE32+ (x86_64)"
-                    : "PE32 (i386, 32-bit — not loadable yet, see TODO.md)";
+                    : "PE32 (i386, 32-bit — needs bin/winnux32: make winnux32)";
     printf("%s: %s%s, subsystem %u, %u sections, entry rva 0x%x\n",
            path, arch, v.is_dll ? " DLL" : "", v.subsystem, v.nsec,
            v.entry_rva);

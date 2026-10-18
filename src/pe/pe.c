@@ -2,6 +2,8 @@
  *
  * Hardened: every header field is validated before use; malformed images are
  * rejected with a loud log and an error code, never silently accepted.
+ * Both PE32 (i386, magic 0x10b) and PE32+ (x64, magic 0x20b) are parsed;
+ * is_64 selects the optional-header layout everywhere it is read.
  */
 #include "wn_pe.h"
 #include "wn_log.h"
@@ -23,6 +25,25 @@ static size_t page_down(size_t n) { return n & ~0xFFFULL; }
 static uint32_t g_tls_next_index = 1;
 
 uint32_t wn_pe_tls_next_index(void) { return g_tls_next_index++; }
+
+/* --- optional-header accessors (arch-agnostic) ---------------------------- */
+
+/* Offset of the optional header inside the MAPPING (works on the mapped
+ * copy too, where e_lfanew is at the same place). */
+static size_t opt_off(const uint8_t *base_or_file)
+{
+    int32_t lfa = ((const wn_image_dos_header *)(const void *)base_or_file)
+                      ->e_lfanew;
+    return (size_t)lfa + 4 + sizeof(wn_image_file_header);
+}
+
+const wn_image_data_directory *wn_pe_dirs(const wn_pe_image *img)
+{
+    const uint8_t *p = img->base + opt_off(img->base);
+    if (img->is_64)
+        return ((const wn_image_optional_header64 *)(const void *)p)->dirs;
+    return ((const wn_image_optional_header32 *)(const void *)p)->dirs;
+}
 
 /* --- validation + parse -------------------------------------------------- */
 
@@ -50,12 +71,13 @@ static uint32_t read_headers(const uint8_t *f, size_t fs, const char *path,
         return WN_ERR_BAD_FORMAT;
     }
     const wn_image_file_header *fh = (const void *)(p + 4);
-    if (fh->machine != WN_IMAGE_FILE_MACHINE_AMD64) {
-        if (fh->machine == WN_IMAGE_FILE_MACHINE_I386)
-            wn_log(WN_LOG_ERR, "pe: '%s': 32-bit i386 images not supported yet "
-                   "(planned)", path);
-        else
-            wn_log(WN_LOG_ERR, "pe: '%s': unknown machine 0x%04x", path, fh->machine);
+    int is_64;
+    if (fh->machine == WN_IMAGE_FILE_MACHINE_AMD64)
+        is_64 = 1;
+    else if (fh->machine == WN_IMAGE_FILE_MACHINE_I386)
+        is_64 = 0;
+    else {
+        wn_log(WN_LOG_ERR, "pe: '%s': unknown machine 0x%04x", path, fh->machine);
         return WN_ERR_BAD_FORMAT;
     }
     if (fh->number_of_sections == 0 || fh->number_of_sections > 96) {
@@ -65,42 +87,79 @@ static uint32_t read_headers(const uint8_t *f, size_t fs, const char *path,
     }
     size_t need = (size_t)dos->e_lfanew + 4 + sizeof(wn_image_file_header)
                 + fh->size_of_optional_header;
-    if (fh->size_of_optional_header < sizeof(wn_image_optional_header64) || need > fs) {
+    size_t oh_min = is_64 ? sizeof(wn_image_optional_header64)
+                          : sizeof(wn_image_optional_header32);
+    if (fh->size_of_optional_header < oh_min || need > fs) {
         wn_log(WN_LOG_ERR, "pe: '%s': optional header truncated (size %u)",
                path, fh->size_of_optional_header);
         return WN_ERR_BAD_FORMAT;
     }
-    const wn_image_optional_header64 *oh = (const void *)(p + 4 + sizeof(wn_image_file_header));
-    if (oh->magic != WN_IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    const uint8_t *ohp = p + 4 + sizeof(wn_image_file_header);
+    uint16_t magic;
+    memcpy(&magic, ohp, 2);
+    if (is_64 && magic != WN_IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         wn_log(WN_LOG_ERR, "pe: '%s': optional header magic 0x%04x (need PE32+ 0x20b)",
-               path, oh->magic);
+               path, magic);
         return WN_ERR_BAD_FORMAT;
     }
-    if (oh->size_of_image == 0 || oh->size_of_image > 0x40000000u) {
+    if (!is_64 && magic != WN_IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        wn_log(WN_LOG_ERR, "pe: '%s': optional header magic 0x%04x (need PE32 0x10b)",
+               path, magic);
+        return WN_ERR_BAD_FORMAT;
+    }
+    /* Common fields at identical offsets in both layouts (up to
+     * SizeOfHeaders): read via the 64 struct for 64, the 32 struct for 32. */
+    uint32_t size_of_image, size_of_headers, section_alignment, file_alignment;
+    uint32_t entry_rva;
+    uint64_t preferred_base;
+    uint32_t stack_reserve, stack_commit;
+    if (is_64) {
+        const wn_image_optional_header64 *oh = (const void *)ohp;
+        size_of_image = oh->size_of_image;
+        size_of_headers = oh->size_of_headers;
+        section_alignment = oh->section_alignment;
+        file_alignment = oh->file_alignment;
+        entry_rva = oh->address_of_entry_point;
+        preferred_base = oh->image_base;
+        stack_reserve = (uint32_t)(oh->size_of_stack_reserve);
+        stack_commit = (uint32_t)(oh->size_of_stack_commit);
+    } else {
+        const wn_image_optional_header32 *oh = (const void *)ohp;
+        size_of_image = oh->size_of_image;
+        size_of_headers = oh->size_of_headers;
+        section_alignment = oh->section_alignment;
+        file_alignment = oh->file_alignment;
+        entry_rva = oh->address_of_entry_point;
+        preferred_base = oh->image_base;
+        stack_reserve = oh->size_of_stack_reserve;
+        stack_commit = oh->size_of_stack_commit;
+    }
+    if (size_of_image == 0 || size_of_image > 0x40000000u) {
         wn_log(WN_LOG_ERR, "pe: '%s': implausible SizeOfImage 0x%x", path,
-               oh->size_of_image);
+               size_of_image);
         return WN_ERR_BAD_FORMAT;
     }
-    if (oh->section_alignment == 0 || oh->file_alignment == 0 ||
-        oh->section_alignment < oh->file_alignment) {
+    if (section_alignment == 0 || file_alignment == 0 ||
+        section_alignment < file_alignment) {
         wn_log(WN_LOG_ERR, "pe: '%s': bad alignments (sec 0x%x file 0x%x)", path,
-               oh->section_alignment, oh->file_alignment);
+               section_alignment, file_alignment);
         return WN_ERR_BAD_FORMAT;
     }
-    if (oh->size_of_headers > oh->size_of_image) {
+    if (size_of_headers > size_of_image) {
         wn_log(WN_LOG_ERR, "pe: '%s': SizeOfHeaders 0x%x > SizeOfImage 0x%x",
-               path, oh->size_of_headers, oh->size_of_image);
+               path, size_of_headers, size_of_image);
         return WN_ERR_BAD_FORMAT;
     }
 
     img->machine = fh->machine;
-    img->is_64 = 1;
+    img->is_64 = is_64;
     img->is_dll = (fh->characteristics & WN_IMAGE_FILE_DLL) != 0;
-    img->entry_rva = oh->address_of_entry_point;
-    img->preferred_base = oh->image_base;
-    img->size_of_image = oh->size_of_image;
-    img->stack_reserve = (uint32_t)(oh->size_of_stack_reserve ? oh->size_of_stack_reserve : 0x100000);
-    img->stack_commit = (uint32_t)(oh->size_of_stack_commit);
+    img->entry_rva = entry_rva;
+    img->preferred_base = preferred_base;
+    img->size_of_image = size_of_image;
+    img->headers_size = size_of_headers;
+    img->stack_reserve = stack_reserve ? stack_reserve : 0x100000;
+    img->stack_commit = stack_commit;
     img->num_sections = fh->number_of_sections;
     return 0;
 }
@@ -115,11 +174,12 @@ uint32_t wn_pe_map(const uint8_t *f, size_t fs, const char *path,
     if (rc)
         return rc;
 
-    const wn_image_optional_header64 *oh =
-        (const void *)((const uint8_t *)f + ((const wn_image_dos_header *)f)->e_lfanew
-                      + 4 + sizeof(wn_image_file_header));
+    size_t o_off = opt_off(f);
     const wn_image_section_header *secs =
-        (const void *)((const uint8_t *)oh + sizeof *oh);
+        (const void *)((const uint8_t *)f + o_off +
+                       (img->is_64 ? sizeof(wn_image_optional_header64)
+                                   : sizeof(wn_image_optional_header32)));
+    uint32_t hdr_copy_len = img->headers_size;
 
     /* Validate every section before touching memory. */
     for (uint16_t i = 0; i < img->num_sections; i++) {
@@ -154,7 +214,7 @@ uint32_t wn_pe_map(const uint8_t *f, size_t fs, const char *path,
         snprintf(img->path, sizeof img->path, "%s", path);
 
     /* Headers. */
-    size_t hdr_copy = oh->size_of_headers < fs ? oh->size_of_headers : fs;
+    size_t hdr_copy = hdr_copy_len < fs ? hdr_copy_len : fs;
     memcpy(base, f, hdr_copy);
 
     /* Sections (anon mapping is zero-filled; copy raw data on top). */
@@ -172,9 +232,9 @@ uint32_t wn_pe_map(const uint8_t *f, size_t fs, const char *path,
     }
 
     /* Section table lives in the mapped headers now. */
-    img->sections = (void *)(base + ((wn_image_dos_header *)base)->e_lfanew
-                             + 4 + sizeof(wn_image_file_header)
-                             + sizeof(wn_image_optional_header64));
+    img->sections = (void *)(base + o_off +
+                             (img->is_64 ? sizeof(wn_image_optional_header64)
+                                         : sizeof(wn_image_optional_header32)));
     return 0;
 }
 
@@ -191,10 +251,8 @@ void *wn_pe_rva(const wn_pe_image *img, uint32_t rva, size_t min_size)
 
 uint32_t wn_pe_apply_relocations(wn_pe_image *img)
 {
-    const wn_image_dos_header *dos = (const void *)img->base;
-    const wn_image_optional_header64 *oh =
-        (const void *)(img->base + dos->e_lfanew + 4 + sizeof(wn_image_file_header));
-    const wn_image_data_directory *dir = &oh->dirs[WN_IMAGE_DIR_BASERELOC];
+    const wn_image_data_directory *dirs = wn_pe_dirs(img);
+    const wn_image_data_directory *dir = &dirs[WN_IMAGE_DIR_BASERELOC];
     int64_t delta = (int64_t)((uint64_t)(uintptr_t)img->base - img->preferred_base);
     if (delta == 0) {
         wn_log(WN_LOG_DEBUG, "pe: image mapped at preferred base; relocs skipped");
@@ -231,7 +289,7 @@ uint32_t wn_pe_apply_relocations(wn_pe_image *img)
                        (unsigned long long)spot);
                 return WN_ERR_BAD_FORMAT;
             }
-            if (type == WN_IMAGE_REL_BASED_DIR64) {
+            if (type == WN_IMAGE_REL_BASED_DIR64 && img->is_64) {
                 uint64_t val;
                 memcpy(&val, img->base + spot, 8);
                 val += delta;
@@ -313,10 +371,8 @@ void *wn_pe_resolve_export(wn_pe_image *img, const char *name,
         wn_log(WN_LOG_ERR, "pe: export forwarder chain too deep");
         return NULL;
     }
-    const wn_image_dos_header *dos = (const void *)img->base;
-    const wn_image_optional_header64 *oh =
-        (const void *)(img->base + dos->e_lfanew + 4 + sizeof(wn_image_file_header));
-    const wn_image_data_directory *dir = &oh->dirs[WN_IMAGE_DIR_EXPORT];
+    const wn_image_data_directory *dirs = wn_pe_dirs(img);
+    const wn_image_data_directory *dir = &dirs[WN_IMAGE_DIR_EXPORT];
     if (dir->virtual_address == 0)
         return NULL;
     wn_image_export_directory *exp = wn_pe_rva(img, dir->virtual_address, sizeof *exp);
@@ -390,25 +446,41 @@ static uint64_t norm_va(const wn_pe_image *img, uint64_t va)
 uint32_t wn_pe_tls_setup(wn_pe_image *img, uint32_t *out_index)
 {
     *out_index = 0;
-    const wn_image_dos_header *dos = (const void *)img->base;
-    const wn_image_optional_header64 *oh =
-        (const void *)(img->base + dos->e_lfanew + 4 + sizeof(wn_image_file_header));
-    const wn_image_data_directory *dir = &oh->dirs[WN_IMAGE_DIR_TLS];
-    if (dir->virtual_address == 0 || dir->size < sizeof(wn_image_tls_directory64))
+    const wn_image_data_directory *dirs = wn_pe_dirs(img);
+    const wn_image_data_directory *dir = &dirs[WN_IMAGE_DIR_TLS];
+    if (dir->virtual_address == 0)
         return 0;
-    const wn_image_tls_directory64 *tls = wn_pe_rva(img, dir->virtual_address, sizeof *tls);
-    if (!tls)
-        return WN_ERR_BAD_FORMAT;
-    if (tls->address_of_index == 0)
-        return 0;
+    uint64_t index_va = 0, callbacks_va = 0;
+    if (img->is_64) {
+        if (dir->size < sizeof(wn_image_tls_directory64))
+            return 0;
+        const wn_image_tls_directory64 *tls =
+            wn_pe_rva(img, dir->virtual_address, sizeof *tls);
+        if (!tls)
+            return WN_ERR_BAD_FORMAT;
+        if (tls->address_of_index == 0)
+            return 0;
+        index_va = norm_va(img, tls->address_of_index);
+        callbacks_va = norm_va(img, tls->address_of_callbacks);
+    } else {
+        if (dir->size < sizeof(wn_image_tls_directory32))
+            return 0;
+        const wn_image_tls_directory32 *tls =
+            wn_pe_rva(img, dir->virtual_address, sizeof *tls);
+        if (!tls)
+            return WN_ERR_BAD_FORMAT;
+        if (tls->address_of_index == 0)
+            return 0;
+        index_va = norm_va(img, tls->address_of_index);
+        callbacks_va = norm_va(img, tls->address_of_callbacks);
+    }
 
     uint32_t index = wn_pe_tls_next_index();
-    uint64_t index_va = norm_va(img, tls->address_of_index);
     uint32_t *slot = (uint32_t *)(uintptr_t)index_va;
     *slot = index;
     *out_index = index;
     wn_log(WN_LOG_DEBUG, "pe: '%s' static TLS index %u (callbacks at 0x%llx)",
-           img->path, index, (unsigned long long)norm_va(img, tls->address_of_callbacks));
+           img->path, index, (unsigned long long)callbacks_va);
     return 0;
 }
 

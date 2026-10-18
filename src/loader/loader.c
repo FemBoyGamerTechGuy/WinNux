@@ -117,17 +117,18 @@ static uint8_t *read_file(const char *path, size_t *out_size)
 
 /* --- import resolution --------------------------------------------------------- */
 
-/* Resolve all imports of a mapped image. Returns 0 or error. */
+/* Resolve all imports of a mapped image. Returns 0 or error. Handles both
+ * PE32+ (8-byte thunks, ordinal flag 1<<63) and PE32 (4-byte thunks, ordinal
+ * flag 1<<31) — the IAT write width MUST match the image or we corrupt the
+ * neighboring import entries. */
 static uint32_t resolve_imports(wn_module *m)
 {
     if (m->kind != WN_MOD_PE)
         return 0;
     wn_pe_image *img = &m->pe;
-    const wn_image_dos_header *dos = (const void *)img->base;
-    const wn_image_optional_header64 *oh =
-        (const void *)(img->base + dos->e_lfanew + 4 + sizeof(wn_image_file_header));
+    const wn_image_data_directory *dirs = wn_pe_dirs(img);
 
-    const wn_image_data_directory *dir = &oh->dirs[WN_IMAGE_DIR_IMPORT];
+    const wn_image_data_directory *dir = &dirs[WN_IMAGE_DIR_IMPORT];
     if (dir->virtual_address == 0 || dir->size == 0)
         goto delay;
 
@@ -149,18 +150,34 @@ static uint32_t resolve_imports(wn_module *m)
                    m->path, dll_name);
             return WN_ERR_FILE_NOT_FOUND;
         }
-        uint64_t *read_thunks = (uint64_t *)wn_pe_rva(img,
+        int is64 = img->is_64;
+        size_t tstep = is64 ? 8 : 4;
+        uint64_t ordinal_flag = is64 ? WN_IMAGE_ORDINAL_FLAG64
+                                     : WN_IMAGE_ORDINAL_FLAG32;
+        uint8_t *read_thunks = (uint8_t *)wn_pe_rva(img,
             desc->original_first_thunk ? desc->original_first_thunk
-                                       : desc->first_thunk, 8);
-        uint64_t *write_thunks = (uint64_t *)wn_pe_rva(img, desc->first_thunk, 8);
+                                       : desc->first_thunk, tstep);
+        uint8_t *write_thunks = (uint8_t *)wn_pe_rva(img, desc->first_thunk,
+                                                     tstep);
         if (!write_thunks) {
             wn_log(WN_LOG_ERR, "loader: bad thunk RVA in '%s'", m->path);
             return WN_ERR_BAD_FORMAT;
         }
-        for (uint32_t i = 0; read_thunks && write_thunks[i]; i++) {
-            uint64_t t = read_thunks[i];
+        for (uint32_t i = 0;; i++) {
+            uint64_t t;
+            if (is64)
+                memcpy(&t, read_thunks ? read_thunks + (size_t)i * 8
+                                       : write_thunks + (size_t)i * 8, 8);
+            else {
+                uint32_t t32;
+                memcpy(&t32, read_thunks ? read_thunks + (size_t)i * 4
+                                         : write_thunks + (size_t)i * 4, 4);
+                t = t32;
+            }
+            if (!t)
+                break;
             void *fn;
-            if (t & WN_IMAGE_ORDINAL_FLAG64) {
+            if (t & ordinal_flag) {
                 fn = wn_module_get_proc_ordinal(dep, (uint32_t)(t & 0xFFFF));
             } else {
                 wn_image_import_by_name *ibn =
@@ -173,13 +190,19 @@ static uint32_t resolve_imports(wn_module *m)
                 if (!fn)
                     fn = wn_stub_for(dep->name, ibn->name);
             }
-            write_thunks[i] = (uint64_t)(uintptr_t)fn;
+            if (is64) {
+                uint64_t v = (uint64_t)(uintptr_t)fn;
+                memcpy(write_thunks + (size_t)i * 8, &v, 8);
+            } else {
+                uint32_t v = (uint32_t)(uintptr_t)fn;
+                memcpy(write_thunks + (size_t)i * 4, &v, 4);
+            }
         }
     }
 
 delay:
     /* Delay imports: resolved eagerly (valid simplification, logged). */
-    const wn_image_data_directory *dd = &oh->dirs[WN_IMAGE_DIR_DELAY_IMPORT];
+    const wn_image_data_directory *dd = &dirs[WN_IMAGE_DIR_DELAY_IMPORT];
     if (dd->virtual_address && dd->size) {
         wn_log(WN_LOG_DEBUG, "loader: '%s' has delay imports (resolved eagerly)",
                m->path);
@@ -192,21 +215,55 @@ delay:
             wn_module *dep = wn_module_load_dll(dll_name, NULL);
             if (!dep)
                 continue;
+            int is64 = img->is_64;
+            size_t tstep = is64 ? 8 : 4;
+            uint64_t ordinal_flag = is64 ? WN_IMAGE_ORDINAL_FLAG64
+                                         : WN_IMAGE_ORDINAL_FLAG32;
             uint32_t iat_rva = did->p_iat;
-            uint64_t *thunks = (uint64_t *)wn_pe_rva(img, iat_rva, 8);
+            uint8_t *thunks = (uint8_t *)wn_pe_rva(img, iat_rva, tstep);
             uint32_t int_rva = did->p_int;
-            uint64_t *names = (uint64_t *)wn_pe_rva(img, int_rva, 8);
-            for (uint32_t i = 0; thunks && thunks[i]; i++) {
+            uint8_t *names = (uint8_t *)wn_pe_rva(img, int_rva, tstep);
+            for (uint32_t i = 0;; i++) {
+                uint64_t t;
+                if (is64) {
+                    if (!thunks)
+                        break;
+                    memcpy(&t, thunks + (size_t)i * 8, 8);
+                } else {
+                    if (!thunks)
+                        break;
+                    uint32_t t32;
+                    memcpy(&t32, thunks + (size_t)i * 4, 4);
+                    t = t32;
+                }
+                if (!t)
+                    break;
                 void *fn = NULL;
-                if (names && names[i] && !(names[i] & WN_IMAGE_ORDINAL_FLAG64)) {
-                    wn_image_import_by_name *ibn =
-                        wn_pe_rva(img, (uint32_t)names[i], sizeof *ibn);
-                    if (ibn)
-                        fn = wn_module_get_proc(dep, ibn->name, 0, 0);
+                if (names) {
+                    uint64_t nm;
+                    if (is64)
+                        memcpy(&nm, names + (size_t)i * 8, 8);
+                    else {
+                        uint32_t n32;
+                        memcpy(&n32, names + (size_t)i * 4, 4);
+                        nm = n32;
+                    }
+                    if (nm && !(nm & ordinal_flag)) {
+                        wn_image_import_by_name *ibn =
+                            wn_pe_rva(img, (uint32_t)nm, sizeof *ibn);
+                        if (ibn)
+                            fn = wn_module_get_proc(dep, ibn->name, 0, 0);
+                    }
                 }
                 if (!fn)
                     fn = wn_stub_for(dll_name, "delay-import");
-                thunks[i] = (uint64_t)(uintptr_t)fn;
+                if (is64) {
+                    uint64_t v = (uint64_t)(uintptr_t)fn;
+                    memcpy(thunks + (size_t)i * 8, &v, 8);
+                } else {
+                    uint32_t v = (uint32_t)(uintptr_t)fn;
+                    memcpy(thunks + (size_t)i * 4, &v, 4);
+                }
             }
         }
     }
@@ -260,10 +317,12 @@ static wn_module *load_pe(const char *host_path, const char *display_name,
     m->loading = 0;
 
     if (!is_exe && m->pe.entry_rva) {
-        typedef WN_API uint32_t (*dllmain_fn)(uint64_t, uint32_t, uint64_t);
+        /* DllMain(hinst, reason, reserved): pointer-sized args so the i386
+         * stdcall callee cleans exactly what we pushed. */
+        typedef WN_API uint32_t (*dllmain_fn)(uintptr_t, uint32_t, uintptr_t);
         dllmain_fn entry = (dllmain_fn)(void *)(m->base + m->pe.entry_rva);
         wn_log(WN_LOG_DEBUG, "loader: DllMain('%s', PROCESS_ATTACH)", m->name);
-        uint32_t r = entry((uint64_t)(uintptr_t)m->base, 1 /*DLL_PROCESS_ATTACH*/, 0);
+        uint32_t r = entry((uintptr_t)m->base, 1 /*DLL_PROCESS_ATTACH*/, 0);
         if (!r)
             wn_log(WN_LOG_WARN, "loader: DllMain of '%s' returned FALSE "
                    "(load continues; Windows would fail it)", m->name);
@@ -588,27 +647,28 @@ void wn_module_build_ldr(void)
             e->base_dll_name.buffer = base;
         }
 
-        /* Link into all three lists at the tail. */
-        struct { uint64_t *head; size_t off; } lists[3] = {
-            { g_proc.ldr->in_load_order,    offsetof(wn_ldr_entry, in_load_order) },
-            { g_proc.ldr->in_memory_order,  offsetof(wn_ldr_entry, in_memory_order) },
-            { g_proc.ldr->in_init_order,    offsetof(wn_ldr_entry, in_init_order) },
+        /* Link into all three lists at the tail. LIST_ENTRY links are
+         * ABI-pointer-width (8/4) — the walk must use wn_abiptr. */
+        struct { wn_abiptr *head; size_t off; } lists[3] = {
+            { (wn_abiptr *)g_proc.ldr->in_load_order,    offsetof(wn_ldr_entry, in_load_order) },
+            { (wn_abiptr *)g_proc.ldr->in_memory_order,  offsetof(wn_ldr_entry, in_memory_order) },
+            { (wn_abiptr *)g_proc.ldr->in_init_order,    offsetof(wn_ldr_entry, in_init_order) },
         };
         for (int li = 0; li < 3; li++) {
-            uint64_t *head = lists[li].head;
-            uint64_t *mylinks = (uint64_t *)((char *)e + lists[li].off);
+            wn_abiptr *head = lists[li].head;
+            wn_abiptr *mylinks = (wn_abiptr *)((char *)e + lists[li].off);
             /* head's Flink = first element; walk to tail. */
-            uint64_t *tail = (uint64_t *)head[1];
+            wn_abiptr *tail = (wn_abiptr *)(uintptr_t)head[1];
             if (!tail || (void *)tail == (void *)head) {
-                head[0] = (uint64_t)(uintptr_t)mylinks;
-                head[1] = (uint64_t)(uintptr_t)mylinks;
-                mylinks[0] = (uint64_t)(uintptr_t)head;
-                mylinks[1] = (uint64_t)(uintptr_t)head;
+                head[0] = (wn_abiptr)(uintptr_t)mylinks;
+                head[1] = (wn_abiptr)(uintptr_t)mylinks;
+                mylinks[0] = (wn_abiptr)(uintptr_t)head;
+                mylinks[1] = (wn_abiptr)(uintptr_t)head;
             } else {
                 mylinks[0] = tail[0];
-                mylinks[1] = (uint64_t)(uintptr_t)tail;
-                tail[0] = (uint64_t)(uintptr_t)mylinks;
-                head[1] = (uint64_t)(uintptr_t)mylinks;
+                mylinks[1] = (wn_abiptr)(uintptr_t)tail;
+                tail[0] = (wn_abiptr)(uintptr_t)mylinks;
+                head[1] = (wn_abiptr)(uintptr_t)mylinks;
             }
         }
     }

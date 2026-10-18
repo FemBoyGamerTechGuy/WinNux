@@ -2024,7 +2024,7 @@ static void tv_notify_selchanged(wn_window *w, int old_idx, int new_idx)
     uint8_t buf[160];
     memset(buf, 0, sizeof buf);
     uint64_t parent_h = w->parent ? w->parent : 0;
-    *(uint64_t *)(void *)(buf + 0)  = (uint64_t)hwnd_of_window(w); /* hwndFrom */
+    *(uint64_t *)(void *)(buf + 0)  = (uint64_t)(uintptr_t)hwnd_of_window(w); /* hwndFrom */
     *(uint64_t *)(void *)(buf + 8)  = w->id;                      /* idFrom */
     *(uint32_t *)(void *)(buf + 16) = TVN_SELCHANGEDA_;
     for (int pass = 0; pass < 2; pass++) {

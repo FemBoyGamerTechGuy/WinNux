@@ -37,7 +37,13 @@ typedef struct dns_rec {
     } data;
 } dns_rec;
 
+/* 48 bytes on x64; on i386 (4-byte pointers, pack 4) it is 36 — the struct
+ * is native-layout per arch, which IS the Windows ABI per bitness. */
+#if defined(__x86_64__)
 _Static_assert(sizeof(dns_rec) == 48, "DNS_RECORD ABI (pack 4)");
+#else
+_Static_assert(sizeof(dns_rec) == 40, "DNS_RECORD32 ABI");
+#endif
 
 #define DNS_TYPE_A       1
 #define DNS_TYPE_PTR     12

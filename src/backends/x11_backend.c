@@ -107,10 +107,16 @@ typedef struct wnx_image {
     void *obf4, *obf5, *obf6, *obf7;
 } wnx_XImage;
 
+/* The wire-ABI offsets above were probed on LP64 X11 (Wine's layout). On
+ * i386 the pointer fields are 4 bytes and these asserts do not hold: the
+ * X11 glyph-cache path is x64-only for now (32-bit GUI is a later
+ * milestone; console apps never touch it). */
+#if defined(__x86_64__)
 _Static_assert(offsetof(wnx_XImage, data) == 16, "XImage ABI");
 _Static_assert(offsetof(wnx_XImage, byte_order) == 24, "XImage ABI");
 _Static_assert(offsetof(wnx_XImage, bytes_per_line) == 44, "XImage ABI");
 _Static_assert(offsetof(wnx_XImage, bits_per_pixel) == 48, "XImage ABI");
+#endif
 
 /* --- resolved function pointers -------------------------------------------- */
 static wnx_Display (*pXOpenDisplay)(const char *);

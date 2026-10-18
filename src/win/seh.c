@@ -134,7 +134,9 @@ static int dispatch_veh(wn_exc_record *rec, wn_context64 *ctx, ucontext_t *uc)
         wn_exc_pointers ep = { rec, ctx };
         int64_t r = n->handler(&ep);
         if (r == (int64_t)WN_EXC_CONT_EXEC) {
-            /* Copy GPRs back so execution resumes modified. */
+            /* Copy GPRs back so execution resumes modified. The ucontext
+             * greg indices are REG_R* on x64 / REG_E* on i386. */
+#if defined(__x86_64__)
             uc->uc_mcontext.gregs[REG_RAX] = ctx->rax;
             uc->uc_mcontext.gregs[REG_RCX] = ctx->rcx;
             uc->uc_mcontext.gregs[REG_RDX] = ctx->rdx;
@@ -152,6 +154,17 @@ static int dispatch_veh(wn_exc_record *rec, wn_context64 *ctx, ucontext_t *uc)
             uc->uc_mcontext.gregs[REG_R14] = ctx->r14;
             uc->uc_mcontext.gregs[REG_R15] = ctx->r15;
             uc->uc_mcontext.gregs[REG_RIP] = ctx->rip;
+#else
+            uc->uc_mcontext.gregs[REG_EAX] = (uint32_t)ctx->rax;
+            uc->uc_mcontext.gregs[REG_ECX] = (uint32_t)ctx->rcx;
+            uc->uc_mcontext.gregs[REG_EDX] = (uint32_t)ctx->rdx;
+            uc->uc_mcontext.gregs[REG_EBX] = (uint32_t)ctx->rbx;
+            uc->uc_mcontext.gregs[REG_ESP] = (uint32_t)ctx->rsp;
+            uc->uc_mcontext.gregs[REG_EBP] = (uint32_t)ctx->rbp;
+            uc->uc_mcontext.gregs[REG_ESI] = (uint32_t)ctx->rsi;
+            uc->uc_mcontext.gregs[REG_EDI] = (uint32_t)ctx->rdi;
+            uc->uc_mcontext.gregs[REG_EIP] = (uint32_t)ctx->rip;
+#endif
             return 1;
         }
     }
@@ -166,6 +179,7 @@ static void fill_context(wn_context64 *ctx, const ucontext_t *uc)
     ctx->seg_cs = 0x33;
     ctx->seg_ss = 0x2B;
     ctx->eflags = (uint32_t)uc->uc_mcontext.gregs[REG_EFL];
+#if defined(__x86_64__)
     ctx->rax = uc->uc_mcontext.gregs[REG_RAX];
     ctx->rcx = uc->uc_mcontext.gregs[REG_RCX];
     ctx->rdx = uc->uc_mcontext.gregs[REG_RDX];
@@ -183,6 +197,17 @@ static void fill_context(wn_context64 *ctx, const ucontext_t *uc)
     ctx->r14 = uc->uc_mcontext.gregs[REG_R14];
     ctx->r15 = uc->uc_mcontext.gregs[REG_R15];
     ctx->rip = uc->uc_mcontext.gregs[REG_RIP];
+#else
+    ctx->rax = uc->uc_mcontext.gregs[REG_EAX];
+    ctx->rcx = uc->uc_mcontext.gregs[REG_ECX];
+    ctx->rdx = uc->uc_mcontext.gregs[REG_EDX];
+    ctx->rbx = uc->uc_mcontext.gregs[REG_EBX];
+    ctx->rsp = uc->uc_mcontext.gregs[REG_ESP];
+    ctx->rbp = uc->uc_mcontext.gregs[REG_EBP];
+    ctx->rsi = uc->uc_mcontext.gregs[REG_ESI];
+    ctx->rdi = uc->uc_mcontext.gregs[REG_EDI];
+    ctx->rip = uc->uc_mcontext.gregs[REG_EIP];
+#endif
     if (uc->uc_mcontext.fpregs)
         memcpy(ctx->fltsave, uc->uc_mcontext.fpregs, 512);
 }
@@ -232,24 +257,28 @@ crash_report(wn_exc_record *rec, wn_context64 *ctx)
     wn_log(WN_LOG_ERR, "  RIP=%016llx", (unsigned long long)ctx->rip);
     /* Frame-pointer backtrace (MSVC /Oy- builds): stop on anything that does
      * not look like a sane chain. Best-effort - we are already crashing. */
+#if defined(__x86_64__)
+    /* RBP frame-chain walk (MSVC builds keep frame pointers on x64). The
+     * i386 frame chain is 4-byte; the walk is skipped there for now. */
     {
         uint64_t rbp = ctx->rbp;
         for (int i = 0; i < 24 && rbp; i++) {
             if (rbp & 7 || rbp < 0x1000 || rbp - ctx->rbp > 0x400000ULL ||
                 (i && rbp <= ctx->rbp + (uint64_t)i * 16))
                 break;
-            uint64_t ret = *(const uint64_t *)(const void *)(rbp + 8);
+            uint64_t ret = *(const uint64_t *)(const void *)(uintptr_t)(rbp + 8);
             if (!ret)
                 break;
             char w[96];
             wn_module_describe_addr((const void *)(uintptr_t)ret, w, sizeof w);
             wn_log(WN_LOG_ERR, "  #%d from %s", i, w);
-            uint64_t next = *(const uint64_t *)(const void *)rbp;
+            uint64_t next = *(const uint64_t *)(const void *)(uintptr_t)rbp;
             if (next <= rbp)
                 break;
             rbp = next;
         }
     }
+#endif
     exit((int)rec->exception_code);
 }
 
@@ -264,12 +293,24 @@ static void signal_handler(int sig, siginfo_t *si, void *uc_)
                "jumping back to caller", si->si_addr);
         wn_safe_fault_jump();
     }
-    wn_module *m = wn_module_from_addr((const void *)uc->uc_mcontext.gregs[REG_RIP], NULL);
+    wn_module *m = wn_module_from_addr((const void *)(uintptr_t)
+#if defined(__x86_64__)
+        uc->uc_mcontext.gregs[REG_RIP]
+#else
+        uc->uc_mcontext.gregs[REG_EIP]
+#endif
+        , NULL);
     if (!m) {
         /* Fault inside host code: not ours to hide. Re-raise default. */
         wn_log(WN_LOG_ERR, "seh: host-side fault (SIG%d addr=%p ip=%p) — "
                "re-raising, this is a WinNux bug", sig, si->si_addr,
-               (void *)uc->uc_mcontext.gregs[REG_RIP]);
+               (void *)(uintptr_t)
+#if defined(__x86_64__)
+               uc->uc_mcontext.gregs[REG_RIP]
+#else
+               uc->uc_mcontext.gregs[REG_EIP]
+#endif
+               );
         void *bt[16];
         int n = backtrace(bt, 16);
         char **sym = backtrace_symbols(bt, n);
@@ -304,7 +345,12 @@ static void signal_handler(int sig, siginfo_t *si, void *uc_)
         rec.exception_code = 0xC0000026; /* STATUS_NONCONTINUABLE_EXCEPTION */
         break;
     }
-    rec.exception_address = uc->uc_mcontext.gregs[REG_RIP];
+    rec.exception_address =
+#if defined(__x86_64__)
+        uc->uc_mcontext.gregs[REG_RIP];
+#else
+        uc->uc_mcontext.gregs[REG_EIP];
+#endif
 
     wn_context64 ctx;
     fill_context(&ctx, uc);

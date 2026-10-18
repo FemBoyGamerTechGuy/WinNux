@@ -29,8 +29,8 @@
 typedef void *ft_library;
 typedef void *ft_face;
 
-static int  (*pFT_Init_FreeType)(ft_library *);
-static int  (*pFT_Done_FreeType)(ft_library);
+static int  (*pFT_Init_FreeType)(ft_library *) __attribute__((unused));
+static int  (*pFT_Done_FreeType)(ft_library) __attribute__((unused));
 static int  (*pFT_New_Face)(ft_library, const char *, long, ft_face *);
 static int  (*pFT_Done_Face)(ft_face);
 static int  (*pFT_Set_Pixel_Sizes)(ft_face, unsigned, unsigned);
@@ -68,11 +68,13 @@ typedef struct {
     int32_t bitmap_top;                /* 0xC4 */
 } ft_glyph_slot;
 
+#if defined(__x86_64__)   /* overlays probed on the 64-bit lib only */
 _Static_assert(offsetof(ft_glyph_slot, advance_x) == 0x80, "ft ABI");
 _Static_assert(offsetof(ft_glyph_slot, format) == 0x90, "ft ABI");
 _Static_assert(offsetof(ft_glyph_slot, rows) == 0x98, "ft ABI");
 _Static_assert(offsetof(ft_glyph_slot, buffer) == 0xA8, "ft ABI");
 _Static_assert(offsetof(ft_glyph_slot, bitmap_left) == 0xC0, "ft ABI");
+#endif
 
 typedef struct {
     void *face;                       /* 0 */
@@ -123,7 +125,8 @@ static void load_maps(void)
     while (fgets(line, sizeof line, f) && g_map_count < 4096) {
         uintptr_t lo, hi;
         char perms[8] = { 0 };
-        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) != 3)
+        if (sscanf(line, "%lx-%lx %4s", (unsigned long *)&lo,
+                   (unsigned long *)&hi, perms) != 3)
             continue;
         if (perms[0] != 'r')
             continue;
@@ -299,6 +302,13 @@ static ft_family family_of(const char *face)
 
 static int ft_init(void)
 {
+#if !defined(__x86_64__)
+    /* The struct overlays above were probed against the LP64 build of
+     * libfreetype; a 32-bit lib has different offsets and the /maps-guided
+     * signature scan would be wrong. 32-bit builds fall back to the bitmap
+     * atlas (32-bit GUI fidelity is a later milestone). */
+    return -1;
+#else
     if (g_ft_state)
         return g_ft_state;
     void *h = dlopen("libfreetype.so.6", RTLD_LAZY | RTLD_LOCAL);
@@ -361,6 +371,7 @@ static int ft_init(void)
         g_lib = NULL;
     }
     return g_ft_state;
+#endif
 }
 
 /* --- slot management ----------------------------------------------------------- */

@@ -1,8 +1,9 @@
 /* wn_process.h — guest-visible process state: TEB, PEB, LDR, parameters.
  *
- * Offsets match Windows x64 layouts exactly for every field guest code is
- * known to read (gs:0x30 self, gs:0x58 TLS array, gs:0x60 PEB, gs:0x68 last
- * error, PEB image base/Ldr/ProcessParameters/ProcessHeap/NumberOfProcessors).
+ * Offsets match the Windows layouts exactly for every field guest code is
+ * known to read. x64: gs:0x30 self, gs:0x58 TLS array, gs:0x60 PEB,
+ * gs:0x68 last error. i386: fs:0x18 self, fs:0x2C TLS array, fs:0x30 PEB,
+ * fs:0x34 last error. wn_abiptr is the ABI pointer word (8/4 bytes).
  */
 #ifndef WN_PROCESS_H
 #define WN_PROCESS_H
@@ -10,7 +11,14 @@
 #include "wn_types.h"
 #include <pthread.h>
 
+#if defined(__x86_64__)
+typedef uint64_t wn_abiptr;
+#elif defined(__i386__)
+typedef uint32_t wn_abiptr;
+#endif
+
 /* --- TEB (offsets are the ABI) ------------------------------------------- */
+#if defined(__x86_64__)
 typedef struct wn_teb {
     uint64_t exception_list;        /* 0x00 (x64: mostly unused)        */
     uint64_t stack_base;            /* 0x08                             */
@@ -33,8 +41,35 @@ typedef struct wn_teb {
     uint64_t wn_thread;             /* 0xE0: WN-internal wn_thread*     */
     uint64_t reserved_e8[88];       /* pad to 0x400                     */
 } wn_teb;
+#else
+/* i386 TEB: NT_TIB32 fields + ClientId at 0x20, TLS pointer 0x2C, PEB 0x30,
+ * LastErrorValue 0x34 (read by guest code as fs:0x34). */
+typedef struct wn_teb {
+    wn_abiptr exception_list;        /* 0x00                            */
+    wn_abiptr stack_base;            /* 0x04                            */
+    wn_abiptr stack_limit;           /* 0x08                            */
+    wn_abiptr subsystem_tib;         /* 0x0C                            */
+    wn_abiptr fiber_data_version;    /* 0x10                            */
+    wn_abiptr arbitrary_user_pointer;/* 0x14                            */
+    wn_abiptr self;                  /* 0x18 == address of this TEB     */
+    wn_abiptr environment_pointer;   /* 0x1C                            */
+    wn_abiptr client_id_process;     /* 0x20                            */
+    wn_abiptr client_id_thread;      /* 0x24 (Linux gettid)             */
+    wn_abiptr active_rpc_handle;     /* 0x28                            */
+    wn_abiptr *tls_array;            /* 0x2C ThreadLocalStoragePointer  */
+    struct wn_peb *peb;              /* 0x30                            */
+    uint32_t last_error;             /* 0x34                            */
+    uint32_t count_owned_critsects;  /* 0x38                            */
+    wn_abiptr csr_thread;            /* 0x3C                            */
+    wn_abiptr win32_thread_info;     /* 0x40 (user32 later)             */
+    wn_abiptr reserved_44[39];       /* 0x44..0xdf                      */
+    wn_abiptr wn_thread;             /* 0xE0: WN-internal wn_thread*    */
+    wn_abiptr reserved_e4[199];      /* pad to 0x400                    */
+} wn_teb;
+#endif
 
 /* --- PEB (offsets are the ABI; asserted below) ------------------------------ */
+#if defined(__x86_64__)
 typedef struct wn_peb_ldr_data {
     uint32_t length;                /* 0x00                             */
     uint32_t initialized;           /* 0x04                             */
@@ -64,7 +99,39 @@ typedef struct wn_peb {
     uint32_t nt_global_flag;              /* 0xBC */
     uint8_t  pad_c0[0x100 - 0xC0];
 } wn_peb;
+#else
+/* i386 PEB: Mutant 0x04, ImageBaseAddress 0x08, Ldr 0x0C,
+ * ProcessParameters 0x10, ProcessHeap 0x18, NtGlobalFlag 0x68. */
+typedef struct wn_peb_ldr_data {
+    uint32_t length;                /* 0x00                             */
+    uint32_t initialized;           /* 0x04                             */
+    wn_abiptr ss_handle;            /* 0x08                             */
+    wn_abiptr in_load_order[2];     /* 0x0C LIST_ENTRY head             */
+    wn_abiptr in_memory_order[2];   /* 0x14 LIST_ENTRY head             */
+    wn_abiptr in_init_order[2];     /* 0x1C LIST_ENTRY head             */
+    wn_abiptr pad[4];
+} wn_peb_ldr_data;
 
+typedef struct wn_peb {
+    uint8_t  inherited_address_space;     /* 0x00 */
+    uint8_t  read_image_file_exec_options;/* 0x01 */
+    uint8_t  being_debugged;              /* 0x02 */
+    uint8_t  bitfield;                    /* 0x03 */
+    wn_abiptr mutant;                     /* 0x04 */
+    wn_abiptr image_base_address;         /* 0x08 */
+    wn_peb_ldr_data *ldr;                 /* 0x0C */
+    struct wn_rtl_user_process_parameters *process_parameters; /* 0x10 */
+    wn_abiptr subsystem_data;             /* 0x14 */
+    wn_abiptr process_heap;               /* 0x18 */
+    void    *fast_peb_lock;               /* 0x1C */
+    uint8_t  pad_20[0x64 - 0x20];         /* 0x20..0x63 */
+    uint32_t number_of_processors;        /* 0x64 */
+    uint32_t nt_global_flag;              /* 0x68 */
+    uint8_t  pad_6c[0x100 - 0x6C];
+} wn_peb;
+#endif
+
+#if defined(__x86_64__)
 _Static_assert(offsetof(wn_peb, mutant) == 0x08, "PEB ABI");
 _Static_assert(offsetof(wn_peb, image_base_address) == 0x10, "PEB ABI");
 _Static_assert(offsetof(wn_peb, ldr) == 0x18, "PEB ABI");
@@ -78,7 +145,24 @@ _Static_assert(offsetof(wn_teb, self) == 0x30, "TEB ABI");
 _Static_assert(offsetof(wn_teb, tls_array) == 0x58, "TEB ABI");
 _Static_assert(offsetof(wn_teb, peb) == 0x60, "TEB ABI");
 _Static_assert(offsetof(wn_teb, wn_thread) == 0xE0, "TEB ABI");
+#else
+_Static_assert(offsetof(wn_peb, mutant) == 0x04, "PEB32 ABI");
+_Static_assert(offsetof(wn_peb, image_base_address) == 0x08, "PEB32 ABI");
+_Static_assert(offsetof(wn_peb, ldr) == 0x0C, "PEB32 ABI");
+_Static_assert(offsetof(wn_peb, process_parameters) == 0x10, "PEB32 ABI");
+_Static_assert(offsetof(wn_peb, process_heap) == 0x18, "PEB32 ABI");
+_Static_assert(offsetof(wn_peb, fast_peb_lock) == 0x1C, "PEB32 ABI");
+_Static_assert(offsetof(wn_peb, number_of_processors) == 0x64, "PEB32 ABI");
+_Static_assert(offsetof(wn_peb, nt_global_flag) == 0x68, "PEB32 ABI");
+_Static_assert(offsetof(wn_teb, last_error) == 0x34, "TEB32 ABI");
+_Static_assert(offsetof(wn_teb, self) == 0x18, "TEB32 ABI");
+_Static_assert(offsetof(wn_teb, tls_array) == 0x2C, "TEB32 ABI");
+_Static_assert(offsetof(wn_teb, peb) == 0x30, "TEB32 ABI");
+_Static_assert(offsetof(wn_teb, wn_thread) == 0xE0, "TEB32 ABI");
+_Static_assert(sizeof(wn_teb) == 0x400, "TEB32 size");
+#endif
 
+#if defined(__x86_64__)
 typedef struct wn_rtl_user_process_parameters {
     uint32_t maximum_length;          /* 0x00 */
     uint32_t length;                  /* 0x04 */
@@ -122,6 +206,53 @@ typedef struct wn_critsect {
     uint32_t spin_count;              /* 0x20 */
     uint32_t pad24;
 } wn_critsect;
+#else
+/* i386 RTL_USER_PROCESS_PARAMETERS: pointers 4 bytes, UNICODE_STRING 8 bytes
+ * (natural), CommandLine 0x40, Environment 0x48 (the i386 ABI). */
+typedef struct wn_rtl_user_process_parameters {
+    uint32_t maximum_length;          /* 0x00 */
+    uint32_t length;                  /* 0x04 */
+    uint32_t flags;                   /* 0x08 */
+    uint32_t debug_flags;             /* 0x0c */
+    wn_abiptr console_handle;         /* 0x10 */
+    wn_abiptr console_flags;          /* 0x14 */
+    wn_abiptr standard_input;         /* 0x18 */
+    wn_abiptr standard_output;        /* 0x1c */
+    wn_abiptr standard_error;         /* 0x20 */
+    wn_unicode_string current_directory;   /* 0x24 */
+    wn_abiptr current_directory_handle;     /* 0x2c */
+    wn_unicode_string dll_path;            /* 0x30 */
+    wn_unicode_string image_path_name;     /* 0x38 */
+    wn_unicode_string command_line;        /* 0x40 */
+    uint16_t *environment;                 /* 0x48 */
+    wn_abiptr remainder[24];
+} wn_rtl_user_process_parameters;
+
+/* LDR_DATA_TABLE_ENTRY (i386): DllBase 0x18, FullDllName 0x24. */
+typedef struct wn_ldr_entry {
+    wn_abiptr in_load_order[2];        /* 0x00 Flink/Blink */
+    wn_abiptr in_memory_order[2];      /* 0x08 */
+    wn_abiptr in_init_order[2];        /* 0x10 */
+    wn_abiptr dll_base;                /* 0x18 */
+    wn_abiptr entry_point;             /* 0x1c */
+    uint32_t size_of_image;            /* 0x20 */
+    uint32_t pad24;
+    wn_unicode_string full_dll_name;   /* 0x24 */
+    wn_unicode_string base_dll_name;   /* 0x2c */
+    wn_abiptr remainder[8];
+} wn_ldr_entry;
+
+/* RTL_CRITICAL_SECTION (i386): LockCount 0x04, OwningThread 0x0C. */
+typedef struct wn_critsect {
+    wn_abiptr debug_info;              /* 0x00 */
+    int32_t lock_count;                /* 0x04: -1 free */
+    int32_t recursion_count;           /* 0x08 */
+    wn_abiptr owning_thread;           /* 0x0c (tid) */
+    wn_abiptr lock_semaphore;          /* 0x10 unused */
+    uint32_t spin_count;               /* 0x14 */
+    uint32_t pad18;
+} wn_critsect;
+#endif
 
 /* --- threads --------------------------------------------------------------- */
 typedef struct wn_thread {

@@ -1013,7 +1013,7 @@ static WN_API int32_t k32_TlsSetValue(uint32_t idx, void *v)
         wn_last_error_set(WN_ERR_INVALID_PARAMETER);
         return 0;
     }
-    teb->tls_array[idx] = (uint64_t)(uintptr_t)v;
+    teb->tls_array[idx] = (wn_abiptr)(uintptr_t)v;
     return 1;
 }
 
@@ -2576,12 +2576,12 @@ static WN_API int32_t k32_DuplicateHandle(wn_handle src_proc, wn_handle src,
         wn_last_error_set(WN_ERR_INVALID_PARAMETER);
         return 0;
     }
-    if ((int64_t)(uintptr_t)src == -1) {        /* current process */
+    if ((intptr_t)(uintptr_t)src == -1) {        /* current process */
         static int proc_obj;
         *out = wn_handle_alloc(WN_HTYPE_PROCESS, &proc_obj);
         return 1;
     }
-    if ((int64_t)(uintptr_t)src == -2) {        /* current thread */
+    if ((intptr_t)(uintptr_t)src == -2) {        /* current thread */
         wn_thread *th = wn_thread_current();
         if (!th) {
             wn_last_error_set(WN_ERR_INVALID_HANDLE);

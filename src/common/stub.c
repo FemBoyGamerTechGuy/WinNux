@@ -37,12 +37,18 @@ extern void wn_stub_entry_trampoline(void);
 static wn_stub_info **g_infos;     /* index i <-> stub i */
 static uint32_t g_info_count;
 
-WN_API void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
-                               uint64_t a3, uint64_t a4, uint64_t guest_ret);
+/* The impl is called by the raw-asm trampoline: ms_abi on x64 (the asm
+ * builds the MS register+shadow layout), plain cdecl on i386. */
+#if defined(__x86_64__)
+#define WN_STUBIMPL WN_API
+#else
+#define WN_STUBIMPL
+#endif
 
-/* MS-ABI assembly bridge (see file comment).
- * i386: no ms_abi split exists; the bridge becomes a cdecl/stdcall-aware
- * thunk — future work with the WoW64 dispatch metadata. */
+WN_STUBIMPL void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
+                                    uint64_t a3, uint64_t a4, uint64_t guest_ret);
+
+/* MS-ABI assembly bridge (see file comment). */
 #if defined(__x86_64__)
 __asm__(
     ".text\n"
@@ -64,13 +70,33 @@ __asm__(
     ".size wn_stub_entry_trampoline, .-wn_stub_entry_trampoline\n"
 );
 #else
-/* i386 trampoline: TODO with per-export convention metadata */
-__asm__(".globl wn_stub_entry_trampoline\n.type wn_stub_entry_trampoline,@function\nwn_stub_entry_trampoline:\n ret\n");
+/* i386 bridge. At entry: [esp]=ret-to-guest, [esp+4..+16]=a1..a4,
+ * [esp+20]=info (pushed by the stub code). cdecl impl; returns 0 with a
+ * PLAIN ret — cdecl guests clean their own args; stdcall guests leak the
+ * arg frame per call (documented: only unimplemented imports hit this). */
+__asm__(
+    ".text\n"
+    ".globl wn_stub_entry_trampoline\n"
+    ".type wn_stub_entry_trampoline, @function\n"
+    "wn_stub_entry_trampoline:\n"
+    "    popl  %eax\n"                 /* eax = info                     */
+    "    pushl 0(%esp)\n"              /* arg6: guest ret addr           */
+    "    pushl 20(%esp)\n"             /* arg5: a4 (orig +16, one push)  */
+    "    pushl 16(%esp)\n"             /* arg4: a3                       */
+    "    pushl 12(%esp)\n"             /* arg3: a2                       */
+    "    pushl 8(%esp)\n"              /* arg2: a1                       */
+    "    pushl %eax\n"                 /* arg1: info                     */
+    "    call  wn_stub_entry_impl\n"
+    "    addl  $24, %esp\n"
+    "    xorl  %eax, %eax\n"           /* return 0                      */
+    "    ret\n"
+    ".size wn_stub_entry_trampoline, .-wn_stub_entry_trampoline\n"
+);
 #endif
 
 
-WN_API void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
-                               uint64_t a3, uint64_t a4, uint64_t guest_ret)
+WN_STUBIMPL void wn_stub_entry_impl(uint64_t info_p, uint64_t a1, uint64_t a2,
+                                    uint64_t a3, uint64_t a4, uint64_t guest_ret)
 {
     wn_stub_info *info = (wn_stub_info *)(uintptr_t)info_p;
     if (!info)
@@ -134,6 +160,7 @@ void *wn_stub_for(const char *dll, const char *name)
     g_info_count++;
 
     uint8_t *p = g_stub_region + (size_t)idx * WN_STUB_SLOT;
+#if defined(__x86_64__)
     uint64_t info_addr = (uint64_t)(uintptr_t)g_infos[idx];
     uint64_t entry_addr = (uint64_t)(uintptr_t)&wn_stub_entry_trampoline;
     if (info_addr < 0x100000000ULL) {
@@ -143,6 +170,13 @@ void *wn_stub_for(const char *dll, const char *name)
     }
     *p++ = 0x48; *p++ = 0xB8; memcpy(p, &entry_addr, 8); p += 8;      /* mov rax,imm64  */
     *p++ = 0xFF; *p++ = 0xE0;                                         /* jmp rax        */
+#else
+    uint32_t info_addr = (uint32_t)(uintptr_t)g_infos[idx];
+    *p++ = 0x68; memcpy(p, &info_addr, 4); p += 4;                    /* push imm32     */
+    int32_t rel = (int32_t)((uintptr_t)&wn_stub_entry_trampoline
+                            - (uintptr_t)(p + 5));
+    *p++ = 0xE9; memcpy(p, &rel, 4); p += 4;                          /* jmp rel32      */
+#endif
     return g_stub_region + (size_t)idx * WN_STUB_SLOT;
 }
 

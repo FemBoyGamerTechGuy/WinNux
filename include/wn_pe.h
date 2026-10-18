@@ -202,6 +202,16 @@ typedef struct {
     uint32_t characteristics;
 } wn_image_tls_directory64;
 
+/* PE32 (i386) TLS directory: 6 dwords + 2 dwords = 24 bytes. */
+typedef struct {
+    uint32_t start_address_of_raw_data;
+    uint32_t end_address_of_raw_data;
+    uint32_t address_of_index;
+    uint32_t address_of_callbacks;
+    uint32_t size_of_zero_fill;
+    uint32_t characteristics;
+} wn_image_tls_directory32;
+
 /* --- Relocations --------------------------------------------------------------- */
 #define WN_IMAGE_REL_BASED_ABSOLUTE 0
 #define WN_IMAGE_REL_BASED_HIGHLOW  3
@@ -215,16 +225,20 @@ typedef struct wn_pe_image {
     size_t   mapped_size;           /* page-rounded size mapped */
     uint64_t preferred_base;        /* ImageBase from header */
     uint16_t machine;
-    int      is_64;
+    int      is_64;                 /* 1 = PE32+, 0 = PE32 (i386) */
     int      is_dll;
     uint32_t entry_rva;
     uint32_t size_of_image;
+    uint32_t headers_size;          /* SizeOfHeaders (bytes copied from file) */
     uint32_t stack_reserve, stack_commit;
     wn_image_section_header *sections; /* points into image headers */
     uint16_t num_sections;
     char     path[1024];            /* host path it was loaded from */
     /* File bytes are released after mapping; only the mapping remains. */
 } wn_pe_image;
+
+/* The image's data directories (works for PE32 and PE32+). */
+const wn_image_data_directory *wn_pe_dirs(const wn_pe_image *img);
 
 /* Parse+map a PE image from a file's bytes. Returns 0 on success.
  * On failure returns a Win32-ish error code and logs loudly.

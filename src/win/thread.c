@@ -84,7 +84,7 @@ void wn_tls_thread_init(wn_teb *teb)
         void *block = wn_xcalloc(1, sz + 8);
         if (raw && tm->template_start)
             memcpy(block, (const void *)(uintptr_t)tm->template_start, raw);
-        teb->tls_array[tm->index] = (uint64_t)(uintptr_t)block;
+        teb->tls_array[tm->index] = (wn_abiptr)(uintptr_t)block;
     }
     pthread_mutex_unlock(&g_tls_lock);
 }

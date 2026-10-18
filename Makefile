@@ -92,18 +92,72 @@ clean:
 # layouts — see STATUS.md "32-bit".
 HAVE_M32 := $(shell echo 'int winnux_probe;' | $(CC) -m32 -x c - -o /dev/null >/dev/null 2>&1 && echo yes || echo no)
 
-check32:
-	@mkdir -p obj32
-ifeq ($(HAVE_M32),no)
-	@echo "check32: SKIP - no working -m32 toolchain on this box"
-	@echo "  Debian/Ubuntu: apt install gcc-multilib (as root)"
-	@echo "  Arch:          pacman -S gcc-multilib lib32-gcc-libs"
+
+# --- 32-bit (i386) loader build --------------------------------------------
+# winnux32 is the i386 build of the same runtime: `winnux run app.exe` re-execs
+# it for PE32 (i386) images (Wine's wine/wine64 split, inverted).
+# Toolchain discovery: native -m32 first (Arch/Debian with gcc-multilib);
+# else a local glibc32 sysroot (WINNUX_M32_SYSROOT, e.g. our dev box's
+# toolchain/root32) with patched ld scripts + lib32gcc-14-dev crt files.
+M32_SYSROOT ?= /home/z/my-project/toolchain/root32
+OBJ32   := obj32
+TARGET32 := $(BIN)/winnux32
+
+define m32_probe
+$(shell printf 'int main(){return 0;}' > /tmp/w32p.c; \
+  if $(CC) -m32 -no-pie -static-libgcc /tmp/w32p.c -o /tmp/w32p 2>/dev/null; then \
+    echo native; \
+  elif [ -d "$(M32_SYSROOT)/usr/lib32" ]; then \
+    echo sysroot; \
+  else echo none; fi)
+endef
+
+M32_MODE := $(strip $(m32_probe))
+ifeq ($(M32_MODE),native)
+M32FLAGS := -m32 -no-pie -static-libgcc
+M32POST  :=
+else ifeq ($(M32_MODE),sysroot)
+M32FLAGS := -m32 -no-pie -static-libgcc \
+  -isystem $(M32_SYSROOT)/usr/include \
+  -isystem $(M32_SYSROOT)/usr/include/i386-linux-gnu \
+  -B$(M32_SYSROOT)/usr/lib32/ \
+  -B$(M32_SYSROOT)/usr/lib/gcc/x86_64-linux-gnu/14/ \
+  -L$(M32_SYSROOT)/usr/lib32
+M32POST  :=
 else
-	@echo "== i386 compile check (no link; dispatch metadata is future work) =="
+M32FLAGS :=
+endif
+
+OBJS32  := $(patsubst src/%.c,$(OBJ32)/%.o,$(SRCS))
+
+.PHONY: winnux32 check32
+
+winnux32: $(TARGET32)
+
+$(TARGET32): $(OBJS32) | $(BIN)
+ifneq ($(M32_MODE),none)
+	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) $(M32FLAGS) -o $@ $(OBJS32) $(LDLIBS)
+	@echo "built $(TARGET32) ($(M32_MODE) toolchain)"
+else
+	@echo "winnux32: SKIP - no -m32 toolchain (native or $(M32_SYSROOT))"
+	@echo "  Arch:   enable [multilib] in /etc/pacman.conf, then: pacman -S gcc-multilib lib32-gcc-libs"
+	@echo "  Debian: apt install gcc-multilib (as root)"
+endif
+
+$(OBJ32)/%.o: src/%.c | $(OBJ32)
+ifneq ($(M32_MODE),none)
+	@mkdir -p $(dir $@)
+	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) $(M32FLAGS) -c -o $@ $<
+endif
+check32:
+ifeq ($(M32_MODE),none)
+	@echo "check32: SKIP - no -m32 toolchain (native or $(M32_SYSROOT))"
+else
+	@echo "== i386 compile check (mode: $(M32_MODE)) =="
 	@rc=0; for src in $(SRCS); do \
-		obj="obj32/$$(echo $$src | sed 's|^src/||; s|\.c$$|.o|; s|/|_|g')"; \
-		if ! $(CC) $(CFLAGS) -m32 -c -o $$obj $$src 2>/tmp/check32.err; then \
-			echo "FAIL: $$src"; head -12 /tmp/check32.err; rc=1; \
+		obj="$(OBJ32)/$$(echo $$src | sed 's|^src/||; s|\.c$$|.o|')"; \
+		if ! $(CC) $(CSTD) $(WARN) $(DEFS) $(INC) -O1 $(M32FLAGS) -c -o $$obj $$src 2>/tmp/check32.err; then \
+			echo "FAIL: $$src"; head -20 /tmp/check32.err; rc=1; \
 		fi; \
 	done; \
 	if [ $$rc = 0 ]; then echo "check32: all sources compile under -m32"; \
