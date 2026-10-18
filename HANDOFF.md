@@ -44,10 +44,16 @@ re-exec (`winnux run x.exe -e ...`); 64-bit suite 15/15.
    failures there drive the next fixes — watch for DLL-name coverage
    (NSIS-era: setupapi, RichEdit) and CRT startup edges. qemu is the
    pre-flight, his box is the truth.
-2. **32-bit GUI**: extract libx11-6:i386 into toolchain/root32 so qemu
-   can open windows, then dual-layout the remaining GUI structs
-   (TVITEM/DRAWITEMSTRUCT/NMTREEVIEW/WINDOWPLACEMENT) — the MSG/
-   RegisterClass/proc pattern is the template (wn_abiword + arch #if).
+2. **i386 WinMain-CRT exit crash** (TODO P0.2a, precise repro ready):
+   gui32.exe dies after WinMain returns (SIGSEGV 0xfffffffc; main()-
+   entry builds exit cleanly; with/without X11 — NOT the GUI path).
+   Likely frame-SEH chain (fs:0 list is NULL) or the CRT exit handler;
+   ALSO our SEH handler dies before logging on i386 guest faults —
+   suspect dispatch_veh/crash_report handing 64-bit-shaped
+   EXCEPTION_POINTERS to the 32-bit filter. 32-bit X11 under qemu is
+   DONE (i386 libX11/xcb/xau/xdmcp extracted to root32/usr/lib32 via
+   symlinks — dlopen works; gui32 opens a window and maps it before
+   the crash).
 3. **PuTTY Open -> session** (unchanged from session 6): the config box
    works; drive the Open button to the terminal window.
 

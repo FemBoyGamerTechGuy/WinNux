@@ -344,6 +344,46 @@ static WN_CRTAPI int   *ms___p__fmode(void)       { return &g_fmode; }
 static WN_CRTAPI char ***ms___p___initenv(void)   { return &g_initenv_ptr; }
 static WN_CRTAPI uint32_t *ms___lc_codepage(void) { return &g_lc_codepage; }
 
+/* _acmdln/_wcmdln: the CRT's view of the command line. mingw's WinMain
+ * startup reads *__p__acmdln() — a NULL deref there killed every
+ * -mwindows i386 build (gui32 smoke test). Backed by g_proc cmdline. */
+static char *g_acmdln;
+static uint16_t *g_wcmdln;
+
+static void ms_cmdln_init(void)
+{
+    if (!g_acmdln)
+        g_acmdln = g_proc.cmdline_utf8 ? g_proc.cmdline_utf8 : (char *)"";
+    if (!g_wcmdln)
+        g_wcmdln = g_proc.cmdline_utf16 ? g_proc.cmdline_utf16
+                                        : (uint16_t *)L"";
+}
+
+static WN_CRTAPI char **ms___p__acmdln(void)
+{
+    ms_cmdln_init();
+    return &g_acmdln;
+}
+
+static WN_CRTAPI uint16_t **ms___p__wcmdln(void)
+{
+    ms_cmdln_init();
+    return &g_wcmdln;
+}
+
+/* Multi-byte lead/trail tests: C locale (CP1252/ASCII) has no multi-byte
+ * sequences — every byte is a single-byte character, so _ismbblead /
+ * _ismbbtrail always return 0 (mingw CRT calls these while parsing the
+ * command line). _ismbblead must NOT stay a stub: pre-WinMain code paths
+ * call it with real chars. */
+static WN_CRTAPI int32_t ms__ismbblead(uint32_t c) { (void)c; return 0; }
+static WN_CRTAPI int32_t ms__ismbbtrail(uint32_t c) { (void)c; return 0; }
+static WN_CRTAPI int32_t ms__ismbcspace(uint32_t c) { return (c == ' ') ? 1 : 0; }
+static WN_CRTAPI int32_t ms__setmbcp(int32_t cp)
+{
+    return (cp == 0 || cp == 1252) ? 0 : -1;  /* _MB_CP_ANSI / SBCS ok */
+}
+
 /* localeconv: minimal C-locale lconv. */
 struct ms_lconv {
     char *decimal_point, *thousands_sep, *grouping;
@@ -1378,6 +1418,16 @@ const wn_export_entry wn_msvcrt_exports[] = {
     { "__p__commode", ms___p__commode },
     { "__p__fmode", ms___p__fmode },
     { "__p___initenv", ms___p___initenv },
+    { "__p__acmdln", ms___p__acmdln },
+    { "_ismbblead", ms__ismbblead },
+    { "_ismbbtrail", ms__ismbbtrail },
+    { "_ismbcspace", ms__ismbcspace },
+    { "_setmbcp", ms__setmbcp },
+    { "__p__wcmdln", ms___p__wcmdln },
+    /* _acmdln/_wcmdln as DATA exports: address of our variable (the _iob
+     * pattern; MSVC exports them as data). */
+    { "_acmdln", (void *)&g_acmdln },
+    { "_wcmdln", (void *)&g_wcmdln },
     { "__lc_codepage", ms___lc_codepage },
     { "__set_app_type", ms___set_app_type },
     { "__setusermatherr", ms___setusermatherr },

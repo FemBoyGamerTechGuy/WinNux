@@ -1476,8 +1476,13 @@ static WN_API uint64_t u32_DispatchMessageA(const void *msg)
     wn_abiword wp = *(const wn_abiword *)(const void *)(p + WN_MSG_WPOFF);
     wn_abiword_s lp = *(const wn_abiword_s *)(const void *)(p + WN_MSG_LPOFF);
     wn_window *w = win_from_hwnd(hwnd);
-    if (w && w->cls && w->cls->proc)
+    wn_log(WN_LOG_DEBUG, "dispatch: hwnd=%llx msg=%u wp=%llx lp=%llx w=%p",
+           (unsigned long long)hwnd, message, (unsigned long long)wp,
+           (unsigned long long)lp, (void *)w);
+    if (w && w->cls && w->cls->proc) {
+        wn_log(WN_LOG_DEBUG, "dispatch: -> proc %p", (void *)(uintptr_t)w->cls->proc);
         return w->cls->proc(hwnd, message, wp, lp);
+    }
     return 0;
 }
 

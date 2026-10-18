@@ -14,7 +14,23 @@ localtime/qsort — all qemu-verified, 64-bit 15/15). Next:
    qemu passed hello32/heap32/torture32, but the user's box is the
    ground truth (his kernel + real apps). 7zr.exe (console) is the
    next-best candidate. NSIS installer GUI = P0.2 territory.
-2. **32-bit GUI structures beyond MSG**: TVITEM/DRAWITEMSTRUCT/
+2a. **i386 WinMain-CRT exit crash (NEXT, precise repro)**: `gui32.exe`
+   (mingw i686, WinMain entry — scripts/gui32.c) crashes after WinMain
+   returns: SIGSEGV si_addr=0xfffffffc (a [reg-4] deref, reg=0 — smells
+   like the frame-based SEH chain walk on a NULL fs:0 registration list,
+   or a CRT exit handler deref). Evidence: (a) the SAME source built
+   with main() instead of WinMain exits CLEANLY; (b) console torture32
+   (main) exits cleanly; (c) crash reproduces with AND without X11
+   display — so it is NOT in the GUI/pump path, it is in the CRT exit
+   path after WinMain; (d) our SEH signal handler itself dies before
+   logging ANYTHING for this fault (second SIGSEGV, si_code=SI_KERNEL)
+   — handler-on-i386 hardening needed too (dispatch_veh /
+   crash_report's 64-bit-shaped wn_exc_record/wn_context64 handed to
+   the guest's 32-bit SetUnhandledExceptionFilter proc 0x40a9afa0 is
+   the prime suspect for the handler-death). Build the repro with
+   toolchain/root/usr/bin/i686-w64-mingw32-gcc-posix -mwindows, run
+   under scripts/dev/run32.sh.
+2b. **32-bit GUI structures beyond MSG**: TVITEM/DRAWITEMSTRUCT/
    NMTREEVIEW/WINDOWPLACEMENT + WNDCLASSEX remaining fields are still
    x64-shaped. Fill_msg/RegisterClass/Dispatch/IsDialogMessage/proc
    typedefs are done; the rest of the dialog+control read paths need
