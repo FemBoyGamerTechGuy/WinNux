@@ -2,9 +2,8 @@
  *
  * REAL: CommandLineToArgvW (full Windows quoting rules), SHGetFolderPath /
  * SHGetSpecialFolderPath (prefix-backed user/profile dirs, CSIDL_FLAG_CREATE
- * honored), IsUserAnAdmin (euid check).
- * Honest failures: ShellExecute (we cannot host shell launches yet) returns
- * SE_ERR_NOASSOC and logs loudly.
+ * honored), IsUserAnAdmin (euid check), ShellExecuteA/W + Ex (URLs and files
+ * through xdg-open, .exe/.bat re-launched through our own loader).
  */
 #include "wn_dll.h"
 #include "wn_log.h"
@@ -12,12 +11,14 @@
 #include "wn_util.h"
 #include "wn_path.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* --- CommandLineToArgvW: canonical MSVCRT argument splitting --------------- */
@@ -235,16 +236,125 @@ static WN_API int32_t sh_IsUserAnAdmin(void)
     return geteuid() == 0;
 }
 
+/* --- ShellExecute: real ------------------------------------------------- */
+
+/* Split a params string on whitespace (quote-aware enough for launching). */
+static int sh_split_params(const char *params, char *argv[], int max)
+{
+    int n = 0;
+    const char *p = params;
+    while (p && *p && n < max - 1) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        const char *start = p;
+        int inq = 0;
+        while (*p && (inq || (*p != ' ' && *p != '\t'))) {
+            if (*p == '"')
+                inq = !inq;
+            p++;
+        }
+        size_t len = (size_t)(p - start);
+        char *a = wn_xmalloc(len + 1);
+        size_t o = 0;
+        for (size_t i = 0; i < len; i++)
+            if (start[i] != '"')
+                a[o++] = start[i];
+        a[o] = 0;
+        argv[n++] = a;
+    }
+    return n;
+}
+
+static int sh_is_url(const char *f)
+{
+    const char *c = strchr(f, ':');
+    if (!c || c == f)
+        return 0;
+    for (const char *p = f; p < c; p++)
+        if (!isalnum((unsigned char)*p) && *p != '+' && *p != '-' && *p != '.')
+            return 0;
+    /* scheme present: http/https/mailto/etc. open in the host browser */
+    return 1;
+}
+
+/* Launch and don't wait (the shell case). Returns >32 (SE success band). */
+static uintptr_t sh_launch(const char *file, const char *params, const char *dir)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return 0;                       /* 0 = out of memory (SE_ERR_OOM) */
+    if (pid == 0) {
+        /* child: exec immediately; never touch our locks/allocations */
+        if (dir && *dir)
+            chdir(dir);
+        if (sh_is_url(file)) {
+            execlp("xdg-open", "xdg-open", file, (char *)NULL);
+            _exit(127);
+        }
+        /* .exe/.bat: launch through our own loader (a second WinNux app) */
+        size_t fl = strlen(file);
+        int is_exe = (fl > 4 && !strcasecmp(file + fl - 4, ".exe")) ||
+                     (fl > 4 && !strcasecmp(file + fl - 4, ".bat")) ||
+                     (fl > 4 && !strcasecmp(file + fl - 4, ".cmd"));
+        char self[300];
+        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (is_exe && n > 0) {
+            self[n] = 0;
+            char *argv[66];
+            int ac = 0;
+            argv[ac++] = (char *)"winnux";
+            argv[ac++] = (char *)"run";
+            argv[ac++] = (char *)file;
+            if (params && *params)
+                ac += sh_split_params(params, argv + ac, 64 - ac);
+            argv[ac] = NULL;
+            execv(self, argv);
+            _exit(127);
+        }
+        /* any other file/dir: host association via xdg-open */
+        execlp("xdg-open", "xdg-open", file, (char *)NULL);
+        _exit(127);
+    }
+    /* parent: xdg-open delegates to the browser and exits quickly, so a
+     * plain waitpid is fine (and keeps SIGCHLD semantics untouched). */
+    int st;
+    waitpid(pid, &st, 0);
+    return 42;                          /* >32: success (HINSTANCE band) */
+}
+
+static uintptr_t sh_execute_core(const char *verb, const char *file,
+                                 const char *params, const char *dir)
+{
+    if (!file || !*file) {
+        wn_last_error_set(2 /*ERROR_FILE_NOT_FOUND*/);
+        return 2;                       /* SE_ERR_FNF */
+    }
+    (void)verb;
+    wn_log(WN_LOG_DEBUG, "shell32: ShellExecute('%s' '%s' '%s')",
+           verb ? verb : "open", file, params ? params : "");
+    /* Windows-path files must map into the prefix before the host shell
+     * sees them. */
+    char host[1100];
+    if (!sh_is_url(file)) {
+        wn_path_win_to_host(file, host, sizeof host);
+        file = host;
+    }
+    uintptr_t r = sh_launch(file, params, dir);
+    if (r == 0) {
+        wn_last_error_set(8 /*ERROR_NOT_ENOUGH_MEMORY*/);
+        return 8;                       /* SE_ERR_OOM */
+    }
+    return r;
+}
+
 static WN_API uint64_t sh_ShellExecuteA(uint64_t hwnd, const char *verb,
                                         const char *file, const char *params,
                                         const char *dir, int32_t show)
 {
-    (void)hwnd; (void)verb; (void)params; (void)dir; (void)show;
-    wn_log(WN_LOG_WARN, "shell32: ShellExecuteA('%s') not implemented: no "
-           "shell integration yet -> SE_ERR_NOASSOC (31)",
-           file ? file : "(null)");
-    wn_last_error_set(WN_ERR_CALL_NOT_IMPLEMENTED);
-    return 31;   /* SE_ERR_NOASSOC */
+    (void)hwnd; (void)show;
+    return (uint64_t)sh_execute_core(verb, file, params, dir);
 }
 
 static WN_API uint64_t sh_ShellExecuteW(uint64_t hwnd, const uint16_t *verb,
@@ -252,35 +362,64 @@ static WN_API uint64_t sh_ShellExecuteW(uint64_t hwnd, const uint16_t *verb,
                                         const uint16_t *params,
                                         const uint16_t *dir, int32_t show)
 {
-    (void)hwnd; (void)verb; (void)params; (void)dir; (void)show;
-    char *f = NULL;
-    if (file) {
-        size_t l = 0;
-        while (file[l])
-            l++;
-        f = wn_utf16_to_utf8(file, l);
-    }
-    wn_log(WN_LOG_WARN, "shell32: ShellExecuteW('%s') not implemented -> 31",
-           f ? f : "(null)");
-    free(f);
-    wn_last_error_set(WN_ERR_CALL_NOT_IMPLEMENTED);
-    return 31;
+    (void)hwnd; (void)show;
+    if (!file)
+        return 2;
+    size_t l = 0;
+    while (file[l])
+        l++;
+    char *f = wn_utf16_to_utf8(file, l);
+    char *v = verb ? wn_utf16_to_utf8(verb, 256) : NULL;
+    char *pa = params ? wn_utf16_to_utf8(params, 1024) : NULL;
+    char *d = dir ? wn_utf16_to_utf8(dir, 1024) : NULL;
+    uintptr_t r = sh_execute_core(v, f ? f : "", pa, d);
+    free(f); free(v); free(pa); free(d);
+    return (uint64_t)r;
+}
+
+/* SHELLEXECUTEINFOA x64: cbSize@0 fMask@4 hwnd@8 lpVerb@0x10 lpFile@0x18
+ * lpParameters@0x20 lpDirectory@0x28 nShow@0x30 hInstApp@0x38 ... hProcess@0x68 */
+static int sh_fill_exec_info(void *info, int wide, const char *file)
+{
+    (void)wide;   /* the A/W distinction only matters for reading lpFile */
+    uint8_t *b = info;
+    uint32_t cb = *(const uint32_t *)(const void *)(b + 0);
+    if (cb < 0x40)
+        return 0;
+    uintptr_t r = sh_execute_core(
+        NULL,
+        file,
+        NULL,
+        NULL);
+    *(uint64_t *)(void *)(b + 0x38) = (uint64_t)r;   /* hInstApp */
+    return r > 32;
 }
 
 static WN_API int32_t sh_ShellExecuteExA(void *info)
 {
-    (void)info;
-    wn_log(WN_LOG_WARN, "shell32: ShellExecuteExA not implemented -> FALSE");
-    wn_last_error_set(WN_ERR_CALL_NOT_IMPLEMENTED);
-    return 0;
+    if (!info)
+        return 0;
+    uint8_t *b = info;
+    const char *file = *(const char *const *)(const void *)(b + 0x18);
+    wn_last_error_set(0);
+    return sh_fill_exec_info(info, 0, file ? file : "");
 }
 
 static WN_API int32_t sh_ShellExecuteExW(void *info)
 {
-    (void)info;
-    wn_log(WN_LOG_WARN, "shell32: ShellExecuteExW not implemented -> FALSE");
-    wn_last_error_set(WN_ERR_CALL_NOT_IMPLEMENTED);
-    return 0;
+    if (!info)
+        return 0;
+    uint8_t *b = info;
+    const uint16_t *file = *(const uint16_t *const *)(const void *)(b + 0x18);
+    if (!file)
+        return 0;
+    size_t l = 0;
+    while (file[l])
+        l++;
+    char *f = wn_utf16_to_utf8(file, l);
+    int32_t r = sh_fill_exec_info(info, 1, f ? f : "");
+    free(f);
+    return r;
 }
 
 const wn_export_entry wn_shell32_exports[] = {

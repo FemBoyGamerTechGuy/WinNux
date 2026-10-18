@@ -87,6 +87,10 @@ typedef struct wn_backend {
     int  (*poll_fd)(void);
     /* Query a top-level window's position on screen (optional). */
     void (*win_pos)(wn_bwin *w, int *x, int *y);
+    /* Lock a window to its current size (WM size hints; dialogs without
+     * WS_THICKFRAME are NOT user-resizable on Windows — X11 WMs resize
+     * anything unless told otherwise). NULL = unsupported. */
+    void (*win_fixed_size)(wn_bwin *w);
 } wn_backend;
 
 /* Select and initialize the backend. Returns 0 on success. */

@@ -338,6 +338,35 @@ static void x11_win_set_title(wn_bwin *b, const char *title)
 
 static int (*pXMoveResizeWindow)(wnx_Display, wnx_Window, int, int,
                                  unsigned, unsigned);
+static int (*pXSetWMNormalHints)(wnx_Display, wnx_Window, void *);
+
+/* XSizeHints x64 (LP64): flags@0(4)+pad, x@8 y@12 width@16 height@20,
+ * min_width@24 min_height@28 max_width@32 max_height@36, width_inc@40,
+ * height_inc@44, min_aspect@48(4x int) max_aspect@64, base_width@80,
+ * base_height@84, win_gravity@88 -> 96 bytes total. Oversized buffer
+ * (HANDOFF gotcha: never undersize X struct overlays). */
+#define XSIZEHINTS_BYTES 96
+#define XHINT_PMIN 0x10
+#define XHINT_PMAX 0x20
+
+static void x11_win_fixed_size(wn_bwin *b)
+{
+    if (!pXSetWMNormalHints)
+        return;
+    x11_win_priv *p = b->priv;
+    if (!p || !p->xwin)
+        return;
+    uint8_t hints[XSIZEHINTS_BYTES];
+    memset(hints, 0, sizeof hints);
+    *(int *)(void *)(hints + 0) = XHINT_PMIN | XHINT_PMAX;
+    *(int *)(void *)(hints + 24) = b->width;    /* min_width  */
+    *(int *)(void *)(hints + 28) = b->height;   /* min_height */
+    *(int *)(void *)(hints + 32) = b->width;    /* max_width  */
+    *(int *)(void *)(hints + 36) = b->height;   /* max_height */
+    pXSetWMNormalHints(g_dpy, p->xwin, hints);
+    pXFlush(g_dpy);
+}
+
 
 static void x11_win_move_resize(wn_bwin *b, int x, int y, int cw, int ch)
 {
@@ -609,6 +638,7 @@ static int x11_init(void)
     pXFreePixmap = dlsym(x, "XFreePixmap");
     pXSetBackground = dlsym(x, "XSetBackground");
     pXMoveResizeWindow = dlsym(x, "XMoveResizeWindow");
+    pXSetWMNormalHints = dlsym(x, "XSetWMNormalHints");
     pXBell = dlsym(x, "XBell");
     if (pXLoadQueryFont) {
         g_font = pXLoadQueryFont(g_dpy, "fixed");
@@ -628,6 +658,7 @@ const wn_backend wn_x11_backend = {
     .win_show = x11_win_show,
     .win_set_title = x11_win_set_title,
     .win_move_resize = x11_win_move_resize,
+    .win_fixed_size = x11_win_fixed_size,
     .pump = x11_pump,
     .present = x11_present,
     .draw_text = x11_draw_text,

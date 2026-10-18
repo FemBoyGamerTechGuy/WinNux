@@ -1143,6 +1143,13 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
      * (owner-relative dialogs, apps that pre-position their windows). */
     if ((x != 0 || y != 0) && be->win_move_resize)
         be->win_move_resize(win->bwin, x, y, w, h);
+    /* Windows semantics: windows without WS_THICKFRAME are NOT user-
+     * resizable (dialogs!). X11 WMs resize anything that lacks size hints
+     * — locking min==max keeps fixed dialogs fixed (the "resizing breaks
+     * the entire app" report: putty's config box is fixed-size on
+     * Windows). */
+    if (!(style & 0x00040000u /*WS_THICKFRAME*/) && be->win_fixed_size)
+        be->win_fixed_size(win->bwin);
 
     if (style & 0x10000000 /* WS_VISIBLE */)
         u32_ShowWindow((uint64_t)(uintptr_t)hwnd, 5);
