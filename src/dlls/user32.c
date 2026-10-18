@@ -97,6 +97,8 @@ static wn_timer g_timers[32];
 static int g_backend_up;
 static int g_quit_posted;
 static uint32_t g_quit_code;
+static void tv_free(wn_window *w);       /* tree view payload (defined later) */
+static int ctl_row_h(void);              /* control row height (defined later) */
 static uint64_t g_paint_counter;
 /* focus + activation (single-GUI-thread model). */
 static uint64_t g_focus_hwnd;       /* 0 = unset */
@@ -468,6 +470,15 @@ static int ensure_gui(void)
     }
     g_backend_up = 1;
     g_msg_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (g_msg_fd < 0)
+        return -1;
+    /* state=1 on success — WITHOUT this, every CreateWindowEx re-ran
+     * wn_backend_init() and created a NEW eventfd, overwriting g_msg_fd
+     * and leaking the old fd per call (dialog items! ~50 per dialog).
+     * After a long interactive session the process hit EMFILE ("Too
+     * many open files") and the registry save was the first casualty
+     * (user-reported: cannot open system.reg.tmp for write). */
+    state = 1;
     return 0;
 }
 
@@ -1179,6 +1190,14 @@ static WN_API int32_t u32_DestroyWindow(uint64_t hwnd)
     /* WM_DESTROY goes through the proc directly (in-order with calls). */
     if (w->cls && w->cls->proc)
         w->cls->proc(hwnd, WN_WM_DESTROY, 0, 0);
+    /* control payloads (tree view nodes, list items) */
+    if (w->ctl_priv)
+        tv_free(w);
+    for (int i = 0; i < w->n_items; i++)
+        free(w->items[i]);
+    free(w->items);
+    w->items = NULL;
+    w->n_items = w->items_cap = 0;
     if (w->is_child) {
         /* Child surfaces are ours; the backend never saw them. */
         free(w->bwin->pixels);
@@ -1540,6 +1559,8 @@ extern WN_API int32_t g32_FillRect(wn_handle hdc, const void *rect, wn_handle br
 extern WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
                                    const char *s, int32_t count);
 extern WN_API uint32_t g32_SetTextColor(wn_handle hdc, uint32_t color);
+extern WN_API int32_t g32_SetPixel(wn_handle hdc, int32_t x, int32_t y,
+                                   uint32_t color);
 extern WN_API int32_t g32_SetBkMode(wn_handle hdc, int32_t mode);
 extern WN_API wn_handle g32_CreateSolidBrush(uint32_t color);
 extern WN_API wn_handle g32_SelectObject(wn_handle hdc, wn_handle obj);
@@ -1556,6 +1577,11 @@ extern WN_API wn_handle g32_SelectObject(wn_handle hdc, wn_handle obj);
 static void compose_child(wn_window *child)
 {
     if (!child || !child->parent || !child->bwin)
+        return;
+    /* Group boxes paint directly onto the parent (transparent interiors);
+     * their own surface is never composited. */
+    if (child->cls && wn_strcaseeq(child->cls->name, "Button") &&
+        (child->style & 0xF) == 0x7 /*BS_GROUPBOX*/)
         return;
     wn_window *pw = win_from_hwnd(child->parent);
     if (!pw || !pw->bwin || !pw->bwin->pixels || !child->bwin->pixels)
@@ -1626,15 +1652,16 @@ static void compose_children_of(uint64_t parent)
  */
 
 typedef enum { CTL_BUTTON, CTL_STATIC, CTL_EDIT, CTL_LISTBOX, CTL_COMBO,
-               CTL_SCROLLBAR } ctl_kind;
+               CTL_SCROLLBAR, CTL_TREEVIEW } ctl_kind;
 
 static ctl_kind ctl_kind_of(const char *cls)
 {
-    if (wn_strcaseeq(cls, "Button"))    return CTL_BUTTON;
-    if (wn_strcaseeq(cls, "Static"))    return CTL_STATIC;
-    if (wn_strcaseeq(cls, "Edit"))      return CTL_EDIT;
-    if (wn_strcaseeq(cls, "ListBox"))   return CTL_LISTBOX;
-    if (wn_strcaseeq(cls, "ComboBox"))  return CTL_COMBO;
+    if (wn_strcaseeq(cls, "Button"))         return CTL_BUTTON;
+    if (wn_strcaseeq(cls, "Static"))         return CTL_STATIC;
+    if (wn_strcaseeq(cls, "Edit"))           return CTL_EDIT;
+    if (wn_strcaseeq(cls, "ListBox"))        return CTL_LISTBOX;
+    if (wn_strcaseeq(cls, "ComboBox"))       return CTL_COMBO;
+    if (wn_strcaseeq(cls, "SysTreeView32"))  return CTL_TREEVIEW;
     return CTL_SCROLLBAR;
 }
 
@@ -1718,6 +1745,399 @@ static void ctl_repaint(wn_window *w)
     w->dirty.r = w->cw;
     w->dirty.b = w->ch;
     compose_child(w);
+}
+
+/* --- SysTreeView32 (comctl32 tree view) --------------------------------------------
+ * PuTTY's config box is built around one: the category pane is a tree view
+ * (dialog.c: CreateWindowEx(WS_EX_CLIENTEDGE, WC_TREEVIEW, ...)), and a
+ * TVN_SELCHANGED WM_NOTIFY tells the dlgproc to rebuild the right-hand
+ * panel. Struct layouts are the Win64 ABI:
+ *   TVITEM x64: mask@0(4) hItem@8(8) state@16(4) stateMask@20(4) pszText@24(8)
+ *               cchTextMax@32(4) iImage@36(4) iSelectedImage@40(4)
+ *               cChildren@44(4) lParam@48(8)                      = 56 bytes
+ *   TVINSERTSTRUCT: hParent@0(8) hInsertAfter@8(8) item@16(56)     = 72
+ *   NMTREEVIEW: hdr@0(24) action@24 itemOld@32 itemNew@88 ptDrag@144 = 152
+ * Item handles are index+1 (0 = NULL; TVI_* are 0xFFFF0000+ so no clash). */
+
+/* TVI_* are (HTREEITEM)(ULONG_PTR)-0x10000 etc. — SIGN-EXTENDED to
+ * 0xFFFFFFFFFFFF0000+ in Win64. A zero-extended 0xFFFF0000 constant made
+ * every root insert fail silently (putty's walk then parented everything to
+ * NULL and the Session/Terminal/Window/Connection categories vanished —
+ * found by disassembling the TVI_ROOT constant in putty.exe). */
+#define TVI_ROOT_H   0xFFFFFFFFFFFF0000ULL
+#define TVI_FIRST_H  0xFFFFFFFFFFFF0001ULL
+#define TVI_LAST_H   0xFFFFFFFFFFFF0002ULL
+#define TVI_SORT_H   0xFFFFFFFFFFFF0003ULL
+#define TVIS_SELECTED_ 0x0002u
+#define TVIS_EXPANDED_ 0x0020u
+#define TVM_INSERTITEMA_ 0x1100u
+#define TVM_INSERTITEMW_ 0x1132u
+#define TVM_DELETEITEM_  0x1101u
+#define TVM_EXPAND_      0x1102u
+#define TVM_GETITEMRECT_ 0x1104u
+#define TVM_GETCOUNT_    0x1105u
+#define TVM_GETNEXTITEM_ 0x110Au
+#define TVM_SELECTITEM_  0x110Bu
+#define TVM_GETITEMA_    0x110Cu
+#define TVM_GETITEMW_    0x113Eu
+#define TVM_SETITEMA_    0x110Du
+#define TVM_ENSUREVISIBLE_ 0x1114u
+#define TVM_SETITEMHEIGHT_ 0x111Bu
+#define TVM_GETITEMHEIGHT_ 0x111Cu
+#define TVN_SELCHANGEDA_ 0xFFFFFE6Eu   /* TVN_FIRST(-400) - 2 */
+#define WM_NOTIFY_       0x004Eu
+
+#define TV_MAX_NODES 4096
+
+typedef struct tv_node {
+    char     *text;
+    uint64_t  lparam;
+    uint32_t  state;
+    int       parent;            /* -1 = root level */
+    int       first_child, last_child;
+    int       next, prev;        /* siblings, -1 = none */
+    int       has_children;
+} tv_node;
+
+typedef struct {
+    tv_node *nodes;
+    int      count, cap;
+    int      root_first, root_last;
+    int      sel;                /* index, -1 = none */
+} tv_data;
+
+static tv_data *tv_of(wn_window *w)
+{
+    if (!w->ctl_priv) {
+        tv_data *tv = wn_xcalloc(1, sizeof *tv);
+        tv->root_first = tv->root_last = -1;
+        tv->sel = -1;
+        w->ctl_priv = tv;
+    }
+    return w->ctl_priv;
+}
+
+static void tv_free(wn_window *w)
+{
+    tv_data *tv = w->ctl_priv;
+    if (!tv)
+        return;
+    for (int i = 0; i < tv->count; i++)
+        free(tv->nodes[i].text);
+    free(tv->nodes);
+    free(tv);
+    w->ctl_priv = NULL;
+}
+
+static int tv_has_children(tv_data *tv, int idx)
+{
+    return tv->nodes[idx].first_child >= 0 || tv->nodes[idx].has_children;
+}
+
+/* Depth-first visible walk (children only of EXPANDED nodes). Writes the
+ * visible indices into vis[] (capacity cap); returns the count. */
+static int tv_walk_visible(tv_data *tv, int *vis, int cap)
+{
+    int n = 0;
+    int cur = tv->root_first;
+    while (cur >= 0 && n < cap) {
+        vis[n++] = cur;
+        if (tv->nodes[cur].first_child >= 0 &&
+            (tv->nodes[cur].state & TVIS_EXPANDED_)) {
+            cur = tv->nodes[cur].first_child;
+            continue;
+        }
+        if (tv->nodes[cur].next >= 0) {
+            cur = tv->nodes[cur].next;
+            continue;
+        }
+        /* up to the nearest ancestor with a following sibling */
+        while (cur >= 0 && tv->nodes[cur].next < 0)
+            cur = tv->nodes[cur].parent;
+        if (cur >= 0)
+            cur = tv->nodes[cur].next;
+    }
+    return n;
+}
+
+static int tv_reserve(tv_data *tv, int need)
+{
+    if (need <= tv->count)
+        return 0;
+    if (need > TV_MAX_NODES)
+        return -1;
+    if (need > tv->cap) {
+        int cap = tv->cap ? tv->cap * 2 : 64;
+        while (cap < need)
+            cap *= 2;
+        tv_node *nn = realloc(tv->nodes, (size_t)cap * sizeof(tv_node));
+        if (!nn)
+            return -1;
+        tv->nodes = nn;
+        tv->cap = cap;
+    }
+    return 0;
+}
+
+/* TVM_INSERTITEM: returns the new HTREEITEM (index+1) or 0. */
+static uint64_t tv_insert(wn_window *w, const uint8_t *ins_raw, int wide)
+{
+    tv_data *tv = tv_of(w);
+    if (!ins_raw || tv->count >= TV_MAX_NODES)
+        return 0;
+    uint64_t hparent    = *(const uint64_t *)(const void *)(ins_raw + 0);
+    uint64_t hafter     = *(const uint64_t *)(const void *)(ins_raw + 8);
+    const uint8_t *item = ins_raw + 16;
+    uint32_t mask   = *(const uint32_t *)(const void *)(item + 0);
+    /* hItem @8 unused on insert */
+    uint64_t psz    = *(const uint64_t *)(const void *)(item + 24);
+    int cchildren   = *(const int32_t *)(const void *)(item + 44);
+    uint64_t lparam = *(const uint64_t *)(const void *)(item + 48);
+
+    char text[512] = "";
+    if ((mask & 0x1 /*TVIF_TEXT*/) && psz) {
+        if (wide) {
+            char *a = wn_utf16_to_utf8((const uint16_t *)(uintptr_t)psz, 512);
+            snprintf(text, sizeof text, "%s", a ? a : "");
+            free(a);
+        } else {
+            snprintf(text, sizeof text, "%s", (const char *)(uintptr_t)psz);
+        }
+    }
+    int pidx = -1;
+    if (hparent && hparent != TVI_ROOT_H) {
+        if (hparent > (uint64_t)tv->count || hparent >= TVI_ROOT_H)
+            return 0;                    /* invalid parent handle */
+        pidx = (int)hparent - 1;
+    }
+    if (tv_reserve(tv, tv->count + 1) != 0)
+        return 0;
+    tv_node *nd = &tv->nodes[tv->count];
+    memset(nd, 0, sizeof *nd);
+    nd->text = wn_xstrdup(text);
+    nd->lparam = (mask & 0x4 /*TVIF_PARAM*/) ? lparam : 0;
+    nd->state = 0;
+    nd->parent = pidx;
+    nd->first_child = nd->last_child = -1;
+    nd->next = nd->prev = -1;
+    nd->has_children = (mask & 0x40 /*TVIF_CHILDREN*/) ? (cchildren != 0) : 0;
+    int idx = tv->count++;
+
+    /* link into the parent's child chain (or the root chain) */
+    int *first, *last;
+    if (pidx < 0) {
+        first = &tv->root_first;
+        last = &tv->root_last;
+    } else {
+        first = &tv->nodes[pidx].first_child;
+        last = &tv->nodes[pidx].last_child;
+    }
+    int after;
+    if (hafter == TVI_FIRST_H)
+        after = -2;                    /* prepend */
+    else if (hafter == TVI_SORT_H)
+        after = *last;                 /* v1: append (sorting not needed) */
+    else if (hafter == TVI_LAST_H || hafter == 0 || hafter >= TVI_ROOT_H)
+        after = *last;                 /* append; NULL == TVI_LAST (putty) */
+    else if (hafter <= (uint64_t)tv->count)
+        after = (int)hafter - 1;
+    else
+        after = *last;
+    if (after == -2 || *first < 0) {
+        if (*first < 0) {
+            *first = *last = idx;
+        } else {
+            nd->next = *first;
+            tv->nodes[*first].prev = idx;
+            *first = idx;
+        }
+    } else {
+        int nx = tv->nodes[after].next;
+        nd->prev = after;
+        nd->next = nx;
+        tv->nodes[after].next = idx;
+        if (nx >= 0)
+            tv->nodes[nx].prev = idx;
+        else
+            *last = idx;
+    }
+    if (pidx >= 0)
+        tv->nodes[pidx].has_children = 1;
+    wn_log(WN_LOG_DEBUG, "user32: TVM_INSERTITEM '%s' parent=%d -> 0x%llx",
+           text, pidx, (unsigned long long)idx + 1);
+    return (uint64_t)idx + 1;
+}
+
+/* Fill a caller TVITEM (A or W) from a node. Returns 1 on success. */
+static int tv_get_item(wn_window *w, uint8_t *item, int wide)
+{
+    tv_data *tv = tv_of(w);
+    uint32_t mask = *(const uint32_t *)(const void *)(item + 0);
+    uint64_t hitem = *(const uint64_t *)(const void *)(item + 8);
+    if (!hitem || hitem > (uint64_t)tv->count)
+        return 0;
+    int idx = (int)hitem - 1;
+    tv_node *nd = &tv->nodes[idx];
+    if (mask & 0x1 /*TVIF_TEXT*/) {
+        uint64_t psz = *(const uint64_t *)(const void *)(item + 24);
+        int cap = *(const int32_t *)(const void *)(item + 32);
+        if (psz && cap > 0) {
+            if (wide) {
+                uint16_t *wt = (uint16_t *)(uintptr_t)psz;
+                size_t l = 0;
+                while (nd->text[l] && l < (size_t)(cap - 1)) {
+                    wt[l] = (uint8_t)nd->text[l];   /* latin1-ish; fine */
+                    l++;
+                }
+                wt[l] = 0;
+            } else {
+                snprintf((char *)(uintptr_t)psz, (size_t)cap, "%s", nd->text);
+            }
+        }
+    }
+    if (mask & 0x4 /*TVIF_PARAM*/)
+        *(uint64_t *)(void *)(item + 48) = nd->lparam;
+    if (mask & 0x8 /*TVIF_STATE*/) {
+        uint32_t st = nd->state;
+        if (idx == tv->sel)
+            st |= TVIS_SELECTED_;
+        *(uint32_t *)(void *)(item + 16) = st;
+    }
+    if (mask & 0x40 /*TVIF_CHILDREN*/)
+        *(int32_t *)(void *)(item + 44) = tv_has_children(tv, idx) ? 1 : 0;
+    return 1;
+}
+
+/* TVN_SELCHANGED to the parent, delivered SYNCHRONOUSLY (Windows delivers
+ * WM_NOTIFY inside TreeView_SelectItem; putty's TVN handler rebuilds the
+ * panel immediately). itemOld/itemNew are prefilled. */
+static void tv_notify_selchanged(wn_window *w, int old_idx, int new_idx)
+{
+    tv_data *tv = tv_of(w);
+    uint8_t buf[160];
+    memset(buf, 0, sizeof buf);
+    uint64_t parent_h = w->parent ? w->parent : 0;
+    *(uint64_t *)(void *)(buf + 0)  = (uint64_t)hwnd_of_window(w); /* hwndFrom */
+    *(uint64_t *)(void *)(buf + 8)  = w->id;                      /* idFrom */
+    *(uint32_t *)(void *)(buf + 16) = TVN_SELCHANGEDA_;
+    for (int pass = 0; pass < 2; pass++) {
+        int idx = pass == 0 ? old_idx : new_idx;
+        uint8_t *it = buf + (pass == 0 ? 32 : 88);
+        if (idx >= 0 && idx < tv->count) {
+            *(uint32_t *)(void *)(it + 0) = 0x1 | 0x4 | 0x8 | 0x40;
+            *(uint64_t *)(void *)(it + 8) = (uint64_t)idx + 1;
+            *(uint32_t *)(void *)(it + 16) = (idx == tv->sel) ? TVIS_SELECTED_ : 0;
+            *(uint64_t *)(void *)(it + 48) = tv->nodes[idx].lparam;
+            *(int32_t *)(void *)(it + 44) = tv_has_children(tv, idx);
+        }
+    }
+    if (parent_h)
+        u32_SendMessageA(parent_h, WM_NOTIFY_, w->id,
+                         (int64_t)(uintptr_t)buf);
+}
+
+/* Select + notify. Returns 1 on success. */
+static int tv_select(wn_window *w, int idx, int notify)
+{
+    tv_data *tv = tv_of(w);
+    if (idx < -1 || idx >= tv->count)
+        return 0;
+    int old = tv->sel;
+    if (idx == old)
+        return 1;
+    tv->sel = idx;
+    ctl_repaint(w);
+    if (notify)
+        tv_notify_selchanged(w, old, idx);
+    return 1;
+}
+
+static int tv_get_next(wn_window *w, uint32_t code, uint64_t hitem)
+{
+    tv_data *tv = tv_of(w);
+    int is_tvi = (hitem == 0 || hitem >= TVI_ROOT_H);
+    switch (code) {
+    case 0: /* TVGN_ROOT */   return tv->root_first;
+    case 9: /* TVGN_CARET */  return tv->sel;
+    case 4: { /* TVGN_CHILD: TVI_ROOT asks for the first root */
+        if (hitem == TVI_ROOT_H)
+            return tv->root_first;
+        if (is_tvi || hitem > (uint64_t)tv->count)
+            return -1;
+        return tv->nodes[hitem - 1].first_child;
+    }
+    case 3: { /* TVGN_PARENT */
+        if (is_tvi || hitem > (uint64_t)tv->count)
+            return -1;
+        return tv->nodes[hitem - 1].parent;
+    }
+    case 1: { /* TVGN_NEXT */
+        if (is_tvi || hitem > (uint64_t)tv->count)
+            return -1;
+        return tv->nodes[hitem - 1].next;
+    }
+    case 2: { /* TVGN_PREVIOUS */
+        if (is_tvi || hitem > (uint64_t)tv->count)
+            return -1;
+        return tv->nodes[hitem - 1].prev;
+    }
+    case 5: { /* TVGN_FIRSTVISIBLE */
+        int vis[256];
+        int n = tv_walk_visible(tv, vis, 256);
+        return n > 0 ? vis[0] : -1;
+    }
+    default:
+        return -1;
+    }
+}
+
+static void tv_paint(wn_window *w, wn_handle hdc)
+{
+    tv_data *tv = tv_of(w);
+    int W = w->cw, H = w->ch;
+    int rh = ctl_row_h() + 2;
+    int vis[512];
+    int n = tv_walk_visible(tv, vis, 512);
+    int rows = (H - 2) / rh;
+    for (int i = 0; i < rows && i < n; i++) {
+        int idx = vis[i];
+        tv_node *nd = &tv->nodes[idx];
+        int level = 0;
+        for (int p = nd->parent; p >= 0; p = tv->nodes[p].parent)
+            level++;
+        int x = 4 + level * 18;
+        int y = 1 + i * rh;
+        /* toggle box for parents */
+        if (tv_has_children(tv, idx)) {
+            int32_t bx[4] = { x, y + (rh - 11) / 2, x + 11,
+                              y + (rh - 11) / 2 + 11 };
+            wn_handle bb = g32_CreateSolidBrush(0x00FFFFFF);
+            g32_FillRect(hdc, bx, bb);
+            wn_handle_close(bb);
+            int cy = y + (rh - 11) / 2 + 5;
+            for (int t = 2; t < 9; t++)
+                g32_SetPixel(hdc, x + t, cy, 0);
+            if (!(nd->state & TVIS_EXPANDED_))
+                for (int t = 2; t < 9; t++)
+                    g32_SetPixel(hdc, x + 5, y + (rh - 11) / 2 + t, 0);
+            x += 15;
+        } else {
+            x += 15;
+        }
+        if (idx == tv->sel) {
+            int32_t sr[4] = { x - 1, y, W - 1, y + rh };
+            wn_handle sb = g32_CreateSolidBrush(0x00A8000A);
+            g32_FillRect(hdc, sr, sb);
+            wn_handle_close(sb);
+            g32_SetTextColor(hdc, 0x00FFFFFF);
+        } else {
+            g32_SetTextColor(hdc, 0);
+        }
+        int32_t tr[4] = { x + 2, y, W - 2, y + rh };
+        g32_DrawTextA(hdc, nd->text, -1, tr,
+                      0x20 | 0x100 | 0x24 /*SINGLELINE|NOPREFIX|VCENTER*/);
+    }
+    g32_SetTextColor(hdc, 0);
 }
 
 /* item storage for list/combo */
@@ -1859,26 +2279,44 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
     ctl_kind k = ctl_kind_of(cls);
     switch (msg) {
     case WN_WM_PAINT: {
-        wn_handle hdc = g32_GetDC(hwnd);
+        int is_gb = (k == CTL_BUTTON && (w->style & 0xF) == 0x7);
+        /* Group boxes paint TRANSPARENTLY onto the PARENT canvas (Windows
+         * composes them last, top of the sibling z-order; putty creates the
+         * panel group box after the fields). Their own surface would be
+         * opaque white — blitting it covered the fields. */
+        int off_x = 0, off_y = 0;
+        wn_handle hdc;
+        if (is_gb && w->parent) {
+            hdc = g32_GetDC(w->parent);
+            off_x = w->wx;
+            off_y = w->wy;
+        } else {
+            hdc = g32_GetDC(hwnd);
+        }
         if (!hdc)
             return 0;
         int W = w->cw, H = w->ch;
         int32_t rect[4] = { 0, 0, W, H };
-        uint32_t face = (k == CTL_EDIT || k == CTL_LISTBOX) ? 0x00FFFFFF
-                                                          : 0x00C8D0D4;
-        wn_handle bg = g32_CreateSolidBrush(face);
-        g32_FillRect(hdc, rect, bg);
-        wn_handle_close(bg);
+        uint32_t face = (k == CTL_EDIT || k == CTL_LISTBOX || k == CTL_TREEVIEW)
+                          ? 0x00FFFFFF : 0x00C8D0D4;
+        int is_groupbox = is_gb;
+        if (!is_groupbox) {
+            wn_handle bg = g32_CreateSolidBrush(face);
+            g32_FillRect(hdc, rect, bg);
+            wn_handle_close(bg);
+        }
         wn_handle dark = g32_CreateSolidBrush(0x00606060);
         wn_handle lite = g32_CreateSolidBrush(0x00FFFFFF);
         int32_t top[4]  = { 0, 0, W, 1 };
         int32_t lef[4]  = { 0, 0, 1, H };
         int32_t bot[4]  = { 0, H - 1, W, H };
         int32_t rig[4]  = { W - 1, 0, W, H };
-        g32_FillRect(hdc, top, k == CTL_STATIC ? lite : dark);
-        g32_FillRect(hdc, lef, k == CTL_STATIC ? lite : dark);
-        g32_FillRect(hdc, bot, k == CTL_STATIC ? dark : lite);
-        g32_FillRect(hdc, rig, k == CTL_STATIC ? dark : lite);
+        if (!is_groupbox) {    /* the groupbox draws its own frame */
+            g32_FillRect(hdc, top, k == CTL_STATIC ? lite : dark);
+            g32_FillRect(hdc, lef, k == CTL_STATIC ? lite : dark);
+            g32_FillRect(hdc, bot, k == CTL_STATIC ? dark : lite);
+            g32_FillRect(hdc, rig, k == CTL_STATIC ? dark : lite);
+        }
         wn_handle_close(dark);
         wn_handle_close(lite);
         int rh = ctl_row_h();
@@ -1889,25 +2327,30 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
         switch (k) {
         case CTL_BUTTON: {
             uint32_t bs = w->style & 0xF;
-            if (bs == 0x2 /*BS_AUTOCHECKBOX*/ || bs == 0x1 /*BS_CHECKBOX*/ ||
-                bs == 0x9 /*BS_AUTORADIO*/ || bs == 0x3 /*BS_RADIOBUTTON*/) {
+            if (bs == 0x2 /*BS_AUTOCHECKBOX*/ || bs == 0x3 /*BS_CHECKBOX*/ ||
+                bs == 0x9 /*BS_AUTORADIO*/ || bs == 0x4 /*BS_RADIOBUTTON*/) {
                 ctl_paint_check(hdc, 4, (H - 13) / 2, (int)w->check,
-                                bs >= 0x3 && bs <= 0x9 ? 1 : 0);
+                                bs == 0x9 || bs == 0x4 ? 1 : 0);
                 int32_t tr[4] = { 22, 0, W - 4, H };
                 g32_DrawTextA(hdc, w->title, -1, tr,
-                              0x20 | 0x100 | 0x24 /*SINGLELINE|NOPREFIX|VCENTER*/);
-            } else if (bs == 0x5 /*BS_GROUPBOX*/) {
-                /* frame + label on the top edge */
-                int32_t fr[4] = { 1, 7, W - 1, H - 1 };
+                              0x20 | 0x24 /*SINGLELINE|VCENTER: prefix parsed*/);
+            } else if (bs == 0x7 /*BS_GROUPBOX — 0x7! 0x5 is BS_3STATE*/) {
+                /* frame + label on the top edge, in PARENT coordinates */
+                int32_t fr[4] = { off_x + 1, off_y + 7, off_x + W - 1,
+                                  off_y + H - 1 };
                 g32_Rectangle(hdc, fr[0], fr[1], fr[2], fr[3]);
-                int32_t tr[4] = { 8, 0, 8 + (int)strlen(w->title) * 8 + 4, 16 };
+                int32_t tr[4] = { off_x + 8, off_y,
+                                  off_x + 8 + (int)strlen(w->title) * 8 + 4,
+                                  off_y + 16 };
                 wn_handle fbg = g32_CreateSolidBrush(0x00C8D0D4);
                 g32_FillRect(hdc, tr, fbg);
                 wn_handle_close(fbg);
                 g32_DrawTextA(hdc, w->title, -1, tr,
-                              0x20 | 0x100 | 0x24);
+                              0x20 | 0x24);
             } else {
-                /* push button: raised 3D frame + centered text + focus */
+                /* push button: raised 3D frame + centered text + focus.
+                 * NO DT_NOPREFIX: button captions parse '&x' accelerators
+                 * (putty: "&About" etc.). */
                 extern WN_API int32_t g32_DrawEdge(wn_handle, void *rect,
                                                    uint32_t, uint32_t);
                 int32_t fr[4] = { 0, 0, W - 1, H - 1 };
@@ -1918,7 +2361,7 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
                 (void)old;
                 g32_SetBkMode(hdc, 1);
                 g32_DrawTextA(hdc, w->title, -1, tr,
-                              0x20 | 0x100 | 0x24 | 6 /*CENTER*/);
+                              0x20 | 0x24 | 6 /*CENTER: prefix parsed*/);
                 if (focused && !disabled) {   /* dotted focus rect */
                     extern WN_API int32_t g32_SetPixel(wn_handle, int32_t,
                                                         int32_t, uint32_t);
@@ -1950,7 +2393,7 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
                 /* resource painting handled via STM_SETIMAGE later */
             } else {
                 int32_t tr[4] = { 4, 0, W - 4, H };
-                uint32_t fmt = 0x20 | 0x100 | 0x24;
+                uint32_t fmt = 0x20 | 0x24;   /* statics parse prefixes */
                 if ((w->style & 0x3) == 0x1) fmt |= 2;          /* RIGHT */
                 else if ((w->style & 0x3) == 0x2) fmt |= 6;     /* CENTER */
                 g32_DrawTextA(hdc, w->title, -1, tr, fmt);
@@ -1978,6 +2421,9 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
             g32_SetTextColor(hdc, 0);
             break;
         }
+        case CTL_TREEVIEW:
+            tv_paint(w, hdc);
+            break;
         case CTL_COMBO: {
             /* closed combo: edit field + arrow button */
             int32_t tr[4] = { 3, (H - rh - 2) / 2, W - 20, (H + rh) / 2 };
@@ -1997,7 +2443,26 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
                 g32_TextOutA(hdc, 4, (H - rh) / 2, w->title, -1);
             break;
         }
-        g32_ReleaseDC(hwnd, hdc);
+        g32_ReleaseDC(is_groupbox && w->parent ? w->parent : hwnd, hdc);
+        if (is_groupbox) {
+            /* painted into the parent; damage that region and present */
+            wn_window *pw = w->parent ? win_from_hwnd(w->parent) : NULL;
+            if (pw) {
+                if (pw->dirty.l < 0) {
+                    pw->dirty.l = w->wx;
+                    pw->dirty.t = w->wy;
+                    pw->dirty.r = w->wx + w->cw;
+                    pw->dirty.b = w->wy + w->ch;
+                } else {
+                    if (w->wx < pw->dirty.l) pw->dirty.l = w->wx;
+                    if (w->wy < pw->dirty.t) pw->dirty.t = w->wy;
+                    if (w->wx + w->cw > pw->dirty.r) pw->dirty.r = w->wx + w->cw;
+                    if (w->wy + w->ch > pw->dirty.b) pw->dirty.b = w->wy + w->ch;
+                }
+            }
+            present_root(w);
+            return 0;
+        }
         compose_child(w);
         return 0;
     }
@@ -2049,6 +2514,33 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
             } else if (idx >= 0 && idx < w->n_items) {
                 ctl_notify(w, 2 /* LBN_DBLCLK-ish: second click */);
             }
+            return 0;
+        }
+        case CTL_TREEVIEW: {
+            /* click selects a category (TVN_SELCHANGED -> putty rebuilds
+             * the panel); clicking a node's +/- box toggles expansion. */
+            tv_data *tv = tv_of(w);
+            int my = (int)(int16_t)((uint64_t)lp >> 16);
+            int mx = (int)(int16_t)((uint64_t)lp & 0xFFFF);
+            int rh = ctl_row_h() + 2;
+            int vis[512];
+            int n = tv_walk_visible(tv, vis, 512);
+            int row = (my - 1) / rh;
+            if (row < 0 || row >= n)
+                return 0;
+            int idx = vis[row];
+            int level = 0;
+            for (int p = tv->nodes[idx].parent; p >= 0;
+                 p = tv->nodes[p].parent)
+                level++;
+            int box_x = 4 + level * 18;
+            if (tv_has_children(tv, idx) && mx >= box_x &&
+                mx < box_x + 11) {
+                tv->nodes[idx].state ^= TVIS_EXPANDED_;
+                ctl_repaint(w);
+                return 0;
+            }
+            tv_select(w, idx, 1);
             return 0;
         }
         case CTL_COMBO:
@@ -2174,6 +2666,126 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
     case SBM_GETPOS: return (uint64_t)w->sel;
     case SBM_SETRANGE: return 0;
     case SBM_GETRANGE: return 0;
+    /* --- SysTreeView32 messages (TVM_*) --- */
+    case TVM_INSERTITEMA_:
+    case TVM_INSERTITEMW_:
+        return tv_insert(w, (const uint8_t *)(uintptr_t)lp,
+                         msg == TVM_INSERTITEMW_);
+    case TVM_GETITEMA_:
+    case TVM_GETITEMW_:
+        if ((uint64_t)lp >= TVI_ROOT_H)
+            return 0;
+        return (uint64_t)tv_get_item(w, (uint8_t *)(uintptr_t)lp,
+                                     msg == TVM_GETITEMW_);
+    case TVM_SETITEMA_:
+        /* v1: only state (expand) changes matter to real clients */
+        if (lp) {
+            const uint8_t *it = (const uint8_t *)(uintptr_t)lp;
+            uint32_t mask = *(const uint32_t *)(const void *)(it + 0);
+            uint64_t hitem = *(const uint64_t *)(const void *)(it + 8);
+            tv_data *tv = tv_of(w);
+            if (hitem && hitem <= (uint64_t)tv->count && (mask & 0x8)) {
+                uint32_t st = *(const uint32_t *)(const void *)(it + 16);
+                uint32_t smask = *(const uint32_t *)(const void *)(it + 20);
+                tv->nodes[hitem - 1].state =
+                    (tv->nodes[hitem - 1].state & ~smask) |
+                    (st & smask);
+                ctl_repaint(w);
+                return 1;
+            }
+        }
+        return 0;
+    case TVM_GETNEXTITEM_: {
+        int r = tv_get_next(w, (uint32_t)wp, (uint64_t)lp);
+        return r >= 0 ? (uint64_t)r + 1 : 0;
+    }
+    case TVM_SELECTITEM_:
+        if (wp == 9 /*TVGN_CARET*/) {
+            if ((uint64_t)lp == 0 || (uint64_t)lp >= TVI_ROOT_H)
+                return (uint64_t)tv_select(w, -1, 1);
+            return (uint64_t)tv_select(w, (int)lp - 1, 1);
+        }
+        return 0;
+    case TVM_EXPAND_: {
+        tv_data *tv = tv_of(w);
+        if (!lp || (uint64_t)lp >= TVI_ROOT_H || (uint64_t)lp > (uint64_t)tv->count)
+            return 0;
+        tv_node *nd = &tv->nodes[lp - 1];
+        if (!tv_has_children(tv, (int)lp - 1))
+            return 0;
+        if (wp == 2 /*TVE_EXPAND*/)
+            nd->state |= TVIS_EXPANDED_;
+        else if (wp == 1 /*TVE_COLLAPSE*/)
+            nd->state &= ~TVIS_EXPANDED_;
+        else if (wp == 3 /*TVE_TOGGLE*/)
+            nd->state ^= TVIS_EXPANDED_;
+        ctl_repaint(w);
+        return 1;
+    }
+    case TVM_GETCOUNT_: {
+        tv_data *tv = tv_of(w);
+        return (uint64_t)tv->count;
+    }
+    case TVM_DELETEITEM_:
+        /* v1: only the whole tree (TVI_ROOT) is cleared, which is what
+         * real apps do when rebuilding; selective unlink is TODO. */
+        tv_free(w);
+        ctl_repaint(w);
+        return 1;
+    case TVM_GETITEMRECT_: {
+        tv_data *tv = tv_of(w);
+        if (!lp)
+            return 0;
+        int32_t *rc = (int32_t *)(uintptr_t)lp;
+        int32_t hitem = rc[0];            /* macro stores hItem in left */
+        if (hitem <= 0 || hitem > tv->count)
+            return 0;
+        int vis[512];
+        int n = tv_walk_visible(tv, vis, 512);
+        int rh = ctl_row_h() + 2;
+        for (int i = 0; i < n; i++) {
+            if (vis[i] == hitem - 1) {
+                rc[0] = 0;
+                rc[1] = 1 + i * rh;
+                rc[2] = w->cw;
+                rc[3] = 1 + (i + 1) * rh;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case TVM_ENSUREVISIBLE_: return 1;
+    case TVM_SETITEMHEIGHT_: return 0;
+    case TVM_GETITEMHEIGHT_: return (uint64_t)(ctl_row_h() + 2);
+    case WN_WM_KEYDOWN: {
+        /* tree view keyboard navigation (arrows move selection like
+         * Windows; putty drives the config tree with them) */
+        if (k != CTL_TREEVIEW)
+            return 0;
+        tv_data *tv = tv_of(w);
+        int vis[512];
+        int n = tv_walk_visible(tv, vis, 512);
+        int cur = -1;
+        for (int i = 0; i < n; i++)
+            if (vis[i] == tv->sel)
+                cur = i;
+        uint32_t vk = (uint32_t)wp;
+        if (vk == 0x28 /*VK_DOWN*/ && n) {
+            tv_select(w, vis[cur < 0 ? 0 : (cur + 1 < n ? cur + 1 : cur)], 1);
+        } else if (vk == 0x26 /*VK_UP*/ && n) {
+            tv_select(w, vis[cur <= 0 ? 0 : cur - 1], 1);
+        } else if (vk == 0x27 /*VK_RIGHT*/ && tv->sel >= 0 &&
+                   tv_has_children(tv, tv->sel)) {
+            tv->nodes[tv->sel].state |= TVIS_EXPANDED_;
+            ctl_repaint(w);
+        } else if (vk == 0x25 /*VK_LEFT*/ && tv->sel >= 0 &&
+                   tv_has_children(tv, tv->sel) &&
+                   (tv->nodes[tv->sel].state & TVIS_EXPANDED_)) {
+            tv->nodes[tv->sel].state &= ~TVIS_EXPANDED_;
+            ctl_repaint(w);
+        }
+        return 0;
+    }
     default:
         return 0;
     }
@@ -2183,7 +2795,8 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
 static wn_wndclass *builtin_control_class(const char *name)
 {
     static const char *known[] = { "Button", "Edit", "Static", "ListBox",
-                                   "ComboBox", "ScrollBar", "#32770", NULL };
+                                   "ComboBox", "ScrollBar", "SysTreeView32",
+                                   "#32770", NULL };
     for (int i = 0; known[i]; i++) {
         if (!wn_strcaseeq(name, known[i]))
             continue;

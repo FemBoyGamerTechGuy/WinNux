@@ -82,6 +82,21 @@ static gdi_obj *gdi_get(wn_handle h, gdi_kind kind)
     } else if (g->kind != kind) {
         return NULL;
     }
+    /* Window DCs cache the pixel buffer; a backend RESIZE reallocs it.
+     * Re-bind lazily on every use so a DC held across a resize can never
+     * draw through a freed buffer (the "resizing breaks the app" class:
+     * pointer identity + dimensions are re-read from the LIVE wn_bwin). */
+    if (g->kind == GDI_DC_WINDOW && g->dc.bwin) {
+        if (g->dc.pixels != g->dc.bwin->pixels ||
+            g->dc.w != g->dc.bwin->width ||
+            g->dc.h != g->dc.bwin->height ||
+            g->dc.stride != g->dc.bwin->stride) {
+            g->dc.pixels = g->dc.bwin->pixels;
+            g->dc.w = g->dc.bwin->width;
+            g->dc.h = g->dc.bwin->height;
+            g->dc.stride = g->dc.bwin->stride;
+        }
+    }
     return g;
 }
 
@@ -1024,9 +1039,44 @@ static WN_API int32_t g32_GetTextExtentPoint32W(wn_handle hdc,
     return 1;
 }
 
-/* DrawTextA/W: single-line + DT_CALCRECT + word-wrap basics.
- * DT_*: LEFT 0, CENTER 6, RIGHT 2, VCENTER 0x24, TOP 0, BOTTOM 8,
- * CALCRECT 0x400, SINGLELINE 0x20, NOPREFIX 0x100, WORDBREAK 0x10. */
+/* Measure the pixel width of a UTF-16 run with the DC's current font
+ * (FreeType advances when available, average width otherwise). */
+static void measure_text16(gdi_obj *dc, const uint16_t *s, size_t n, int *out_w)
+{
+    *out_w = 0;
+    if (!s || !n)
+        return;
+    gdi_obj *fobj = dc->dc.cur_font ? dc->dc.cur_font : default_font(dc);
+    int slot = fobj && fobj->kind == GDI_FONT ? fobj->font.ft_slot : -1;
+    if (slot >= 0 && wn_ft_available()) {
+        int wpx = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (!s[i])
+                break;
+            uint32_t cp = s[i];
+            if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < n &&
+                s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (s[i + 1] - 0xDC00);
+                i++;
+            }
+            const wn_ft_glyph_t *g = wn_ft_glyph(slot, cp);
+            wpx += g ? g->adv_x : 0;
+        }
+        *out_w = wpx;
+        return;
+    }
+    int cell_h, adv;
+    font_metrics(dc, &cell_h, &adv);
+    *out_w = (int)n * adv;
+}
+
+/* DrawTextA/W: single-line + DT_CALCRECT + word-wrap basics + accelerator
+ * prefixes. DT_*: LEFT 0, CENTER 6, RIGHT 2, VCENTER 0x24, TOP 0, BOTTOM 8,
+ * CALCRECT 0x400, SINGLELINE 0x20, NOPREFIX 0x100, WORDBREAK 0x10.
+ * WITHOUT DT_NOPREFIX (Windows default) the text is processed: '&x' marks
+ * 'x' as the keyboard accelerator (drawn underlined, '&' removed), '&&'
+ * collapses to a literal '&'. Dialog control captions rely on this — putty
+ * labels like "Cate&gory:" were rendering a raw ampersand before. */
 static int32_t draw_text_common(gdi_obj *dc, const uint16_t *s, size_t n,
                                 void *rect, uint32_t fmt)
 {
@@ -1037,6 +1087,34 @@ static int32_t draw_text_common(gdi_obj *dc, const uint16_t *s, size_t n,
     font_metrics(dc, &cell_h, &adv);
     uint32_t f = fmt ? fmt : 0;   /* DT_LEFT|DT_TOP is 0 */
     int calc = (f & 0x400) != 0;
+    /* Pass 1: build the display string with prefixes stripped.
+     * u_line/u_col describe the underlined char in DISPLAY coords. */
+    uint16_t disp[4096];
+    size_t dn = 0;
+    int u_line = -1, u_col = -1;
+    if (!(f & 0x100 /*DT_NOPREFIX*/) && n <= 4096) {
+        int line = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (s[i] == u'&') {
+                if (i + 1 < n && s[i + 1] == u'&') {
+                    disp[dn++] = u'&';       /* && -> literal & */
+                    i++;
+                } else if (i + 1 < n && s[i + 1] != u'\n') {
+                    u_line = line;           /* &x -> underline x */
+                    u_col = (int)dn;
+                    disp[dn++] = s[++i];
+                }
+                continue;
+            }
+            if (s[i] == u'\n')
+                line++;
+            disp[dn++] = s[i];
+        }
+        s = disp;
+        n = dn;
+    } else {
+        u_line = -1;
+    }
     /* wrap: split at spaces/newlines when WORDBREAK */
     int max_w = r[2] - r[0];
     int lines = 1;
@@ -1088,6 +1166,16 @@ static int32_t draw_text_common(gdi_obj *dc, const uint16_t *s, size_t n,
         else if ((f & 6) == 6 /*CENTER*/)
             x0 = r[0] + (r[2] - r[0] - wpx) / 2;
         draw_text16(dc, x0, y0 + line_idx * cell_h, s + start, len);
+        /* accelerator underline for THIS line */
+        if (u_line == line_idx && u_col >= 0 &&
+            (size_t)u_col >= start && (size_t)u_col < start + len) {
+            int pre = 0, chw = 0;
+            measure_text16(dc, s + start, (size_t)u_col - start, &pre);
+            measure_text16(dc, s + u_col, 1, &chw);
+            int uy = y0 + line_idx * cell_h + cell_h - 2;
+            fill_rect_rgb(dc, x0 + pre, uy, x0 + pre + (chw ? chw : adv),
+                          uy + 1, colorref_to_u32(dc->dc.text_color));
+        }
         if (i < n && s[i] == '\n')
             i++;
         line_idx++;
