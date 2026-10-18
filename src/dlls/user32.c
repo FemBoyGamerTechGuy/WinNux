@@ -2274,6 +2274,7 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
             if (be && be->present && w->bwin)
                 be->present(w->bwin);
             w->dirty.l = -1;
+            w->paint_pending = 0;   /* re-arm generate_paints */
         }
         typedef WN_API int64_t (*dlgproc_fn)(uint64_t, uint32_t, uint64_t,
                                              int64_t);
@@ -2451,6 +2452,12 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
             break;
         }
         g32_ReleaseDC(is_groupbox && w->parent ? w->parent : hwnd, hdc);
+        /* Paint completed: clear the pending flag so generate_paints()
+         * can post future WM_PAINTs for this window (typing, selection
+         * changes...). Without this a control painted ONCE and never
+         * again — paint_pending was only cleared via g32_EndPaint, which
+         * the builtin control classes never call. */
+        wn_user32_validate_paint(hwnd);
         if (is_groupbox) {
             /* painted into the parent; damage that region and present */
             wn_window *pw = w->parent ? win_from_hwnd(w->parent) : NULL;
@@ -2474,7 +2481,7 @@ static WN_API uint64_t ctl_proc(uint64_t hwnd, uint32_t msg, uint64_t wp,
         return 0;
     }
     case WN_WM_CHAR: {
-        if (k == CTL_EDIT) {
+            if (k == CTL_EDIT) {
             ctl_edit_char(w, (uint16_t)wp);
             ctl_repaint(w);
             return 0;
