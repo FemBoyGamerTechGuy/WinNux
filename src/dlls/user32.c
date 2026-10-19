@@ -4203,11 +4203,13 @@ static WN_API int64_t u32_DefDlgProcA(wn_abiword hwnd, uint32_t msg, wn_abiword 
     return ctl_proc(hwnd, msg, wp, lp);
 }
 
-static WN_API int32_t u32_MessageBoxIndirectW(wn_abiword hwnd, const void *params)
+static WN_API int32_t u32_MessageBoxIndirectW(const void *params)
 {
-    /* MSGBOXPARAMSW: cbSize@0, hwndOwner@8, hInstance@0x10, lpszText@0x18,
-     * lpszCaption@0x20, dwStyle@0x28, ... */
+    /* MessageBoxIndirectW(CONST MSGBOXPARAMSW*) - ONE parameter; the owner
+     * window lives INSIDE the struct (hwndOwner@8), not on the stack. */
     const uint8_t *p = params;
+    wn_abiword hwnd = params
+        ? *(wn_abiword *)(const void *)(p + 0x8) : 0;
     const uint16_t *text = params ? *(const uint16_t **)(const void *)(p + 0x18) : NULL;
     const uint16_t *cap = params ? *(const uint16_t **)(const void *)(p + 0x20) : NULL;
     return u32_MessageBoxW(hwnd, text, cap,

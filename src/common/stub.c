@@ -117,12 +117,11 @@ __asm__(
 
 
 /* --- i386 stdcall argument counts ----------------------------------------- */
-#if !defined(__x86_64__)
-/* Known stdcall parameter counts for frequently-missed exports. The i386
- * trampoline pops nargs*4 bytes after the return address; CRT (cdecl)
- * callers are recognized dynamically by the `add esp,imm` they emit right
- * after the call. An unknown stdcall export pops 0 (leaks its frame) with
- * a loud warning — never crashes the stack the other direction. */
+/* Known stdcall parameter counts for frequently-missed exports. Shared by
+ * the i386 trampoline (native winnux32) AND the in-process wow64 stub32
+ * path: a missing stdcall import MUST still pop its arg frame, otherwise
+ * every call skews the 32-bit guest stack (LuaForWindows installer:
+ * InterlockedExchange stub returned cdecl -> +8 skew -> ret to garbage). */
 static const struct { const char *dll, *name; uint8_t nargs; } g_stub_pop_table[] = {
     { "kernel32.dll", "SetDefaultDllDirectories", 1 },
     { "kernel32.dll", "SetDllDirectoryA", 1 },
@@ -173,6 +172,220 @@ static const struct { const char *dll, *name; uint8_t nargs; } g_stub_pop_table[
     { "advapi32.dll", "LookupPrivilegeValueW", 4 },
     { "advapi32.dll", "AdjustTokenPrivileges", 6 },
     { "advapi32.dll", "GetTokenInformation", 5 },
+    /* Inno Setup (LuaForWindows installer) second-stage imports. */
+    { "oleaut32.dll", "SafeArrayPutElement", 3 },
+    { "oleaut32.dll", "SafeArrayCreate", 3 },
+    { "advapi32.dll", "SetSecurityDescriptorDacl", 4 },
+    { "advapi32.dll", "RegQueryInfoKeyA", 12 },
+    { "advapi32.dll", "RegQueryInfoKeyW", 12 },
+    { "advapi32.dll", "RegDeleteValueA", 2 },
+    { "advapi32.dll", "RegDeleteValueW", 2 },
+    { "advapi32.dll", "RegDeleteKeyA", 2 },
+    { "advapi32.dll", "RegDeleteKeyW", 2 },
+    { "advapi32.dll", "OpenThreadToken", 4 },
+    { "advapi32.dll", "InitializeSecurityDescriptor", 2 },
+    { "advapi32.dll", "FreeSid", 1 },
+    { "advapi32.dll", "EqualSid", 2 },
+    { "advapi32.dll", "AllocateAndInitializeSid", 11 },
+    { "kernel32.dll", "WriteProfileStringA", 3 },
+    { "kernel32.dll", "WriteProfileStringW", 3 },
+    { "kernel32.dll", "WritePrivateProfileStringA", 3 },
+    { "kernel32.dll", "WritePrivateProfileStringW", 3 },
+    { "kernel32.dll", "TransactNamedPipe", 5 },
+    { "kernel32.dll", "TerminateThread", 2 },
+    { "kernel32.dll", "SetNamedPipeHandleState", 4 },
+    { "kernel32.dll", "SetFileTime", 4 },
+    { "kernel32.dll", "OpenProcess", 3 },
+    { "kernel32.dll", "OpenMutexA", 3 },
+    { "kernel32.dll", "OpenMutexW", 3 },
+    { "kernel32.dll", "MoveFileExA", 3 },
+    { "kernel32.dll", "MoveFileExW", 3 },
+    { "kernel32.dll", "LocalFileTimeToFileTime", 2 },
+    { "kernel32.dll", "FileTimeToLocalFileTime", 2 },
+    { "kernel32.dll", "DeviceIoControl", 8 },
+    { "kernel32.dll", "CreateNamedPipeA", 7 },
+    { "kernel32.dll", "CreateNamedPipeW", 7 },
+    { "kernel32.dll", "CompareStringA", 6 },
+    { "kernel32.dll", "CompareStringW", 6 },
+    { "kernel32.dll", "CompareFileTime", 2 },
+    { "kernel32.dll", "SetVolumeLabelA", 2 },
+    { "mpr.dll", "WNetGetConnectionA", 3 },
+    { "mpr.dll", "WNetGetConnectionW", 3 },
+    { "mpr.dll", "WNetAddConnection2A", 4 },
+    { "mpr.dll", "WNetAddConnection2W", 4 },
+    { "mpr.dll", "WNetCancelConnection2A", 3 },
+    { "mpr.dll", "WNetCancelConnection2W", 3 },
+    { "mpr.dll", "WNetOpenEnumA", 5 },
+    { "mpr.dll", "WNetOpenEnumW", 5 },
+    { "mpr.dll", "WNetCloseEnum", 1 },
+    { "mpr.dll", "WNetEnumResourceA", 4 },
+    /* Inno Setup 2nd-stage import batch (arities from mingw-w64
+     * headers via scripts/dev/gen_stub_pops.py + MSDN). */
+    { "gdi32.dll", "AddFontResourceA", 1 },
+    { "user32.dll", "AdjustWindowRectEx", 4 },
+    { "user32.dll", "AppendMenuA", 4 },
+    { "gdi32.dll", "Arc", 9 },
+    { "user32.dll", "BringWindowToTop", 1 },
+    { "user32.dll", "CallNextHookEx", 4 },
+    { "user32.dll", "CharLowerA", 1 },
+    { "user32.dll", "CharLowerBuffA", 2 },
+    { "user32.dll", "CharToOemBuffA", 3 },
+    { "user32.dll", "CharUpperBuffA", 2 },
+    { "user32.dll", "CheckMenuItem", 3 },
+    { "gdi32.dll", "Chord", 9 },
+    { "gdi32.dll", "CreateBitmap", 5 },
+    { "gdi32.dll", "CreateBrushIndirect", 1 },
+    { "gdi32.dll", "CreateCompatibleBitmap", 3 },
+    { "gdi32.dll", "CreateDIBitmap", 6 },
+    { "user32.dll", "CreateIcon", 7 },
+    { "user32.dll", "CreateMenu", 0 },
+    { "gdi32.dll", "CreatePalette", 1 },
+    { "gdi32.dll", "CreatePenIndirect", 1 },
+    { "user32.dll", "CreatePopupMenu", 0 },
+    { "gdi32.dll", "CreateRectRgn", 4 },
+    { "user32.dll", "DefFrameProcA", 5 },
+    { "user32.dll", "DefMDIChildProcA", 4 },
+    { "user32.dll", "DeleteMenu", 3 },
+    { "user32.dll", "DestroyCursor", 1 },
+    { "user32.dll", "DestroyMenu", 1 },
+    { "user32.dll", "DrawFocusRect", 2 },
+    { "user32.dll", "DrawFrameControl", 4 },
+    { "user32.dll", "DrawIcon", 4 },
+    { "user32.dll", "DrawIconEx", 9 },
+    { "user32.dll", "DrawMenuBar", 1 },
+    { "gdi32.dll", "Ellipse", 5 },
+    { "user32.dll", "EnableMenuItem", 3 },
+    { "gdi32.dll", "EnumFontsA", 4 },
+    { "user32.dll", "EnumThreadWindows", 3 },
+    { "user32.dll", "EnumWindows", 2 },
+    { "user32.dll", "EqualRect", 2 },
+    { "gdi32.dll", "ExcludeClipRect", 5 },
+    { "gdi32.dll", "ExtFloodFill", 5 },
+    { "user32.dll", "FrameRect", 3 },
+    { "kernel32.dll", "FreeResource", 1 },
+    { "gdi32.dll", "GetBitmapBits", 3 },
+    { "user32.dll", "GetClassInfoA", 3 },
+    { "user32.dll", "GetClassInfoW", 3 },
+    { "gdi32.dll", "GetClipBox", 2 },
+    { "kernel32.dll", "GetComputerNameA", 2 },
+    { "gdi32.dll", "GetCurrentPositionEx", 2 },
+    { "user32.dll", "GetCursor", 0 },
+    { "user32.dll", "GetDCEx", 3 },
+    { "gdi32.dll", "GetDIBits", 7 },
+    { "kernel32.dll", "GetDiskFreeSpaceA", 5 },
+    { "user32.dll", "GetIconInfo", 2 },
+    { "user32.dll", "GetKeyNameTextA", 3 },
+    { "user32.dll", "GetKeyState", 1 },
+    { "user32.dll", "GetLastActivePopup", 1 },
+    { "kernel32.dll", "GetLogicalDrives", 0 },
+    { "user32.dll", "GetMenu", 1 },
+    { "user32.dll", "GetMenuItemCount", 1 },
+    { "user32.dll", "GetMenuState", 3 },
+    { "user32.dll", "GetMenuStringA", 5 },
+    { "user32.dll", "GetMessagePos", 0 },
+    { "gdi32.dll", "GetObjectA", 3 },
+    { "gdi32.dll", "GetPaletteEntries", 4 },
+    { "gdi32.dll", "GetPixel", 3 },
+    { "kernel32.dll", "GetPrivateProfileStringA", 6 },
+    { "kernel32.dll", "GetProfileStringA", 5 },
+    { "user32.dll", "GetPropA", 2 },
+    { "user32.dll", "GetScrollPos", 2 },
+    { "kernel32.dll", "GetShortPathNameA", 3 },
+    { "user32.dll", "GetSubMenu", 2 },
+    { "user32.dll", "GetSystemMenu", 2 },
+    { "gdi32.dll", "GetSystemPaletteEntries", 4 },
+    { "gdi32.dll", "GetTextExtentPointA", 4 },
+    { "user32.dll", "GetWindow", 2 },
+    { "gdi32.dll", "GetWindowOrgEx", 2 },
+    { "user32.dll", "GetWindowRgn", 2 },
+    { "user32.dll", "GetWindowThreadProcessId", 2 },
+    { "kernel32.dll", "GlobalAddAtomA", 1 },
+    { "kernel32.dll", "GlobalDeleteAtom", 1 },
+    { "kernel32.dll", "GlobalHandle", 1 },
+    { "kernel32.dll", "GlobalReAlloc", 3 },
+    { "user32.dll", "InflateRect", 3 },
+    { "user32.dll", "InsertMenuA", 5 },
+    { "user32.dll", "InsertMenuItemA", 4 },
+    { "gdi32.dll", "IntersectClipRect", 5 },
+    { "user32.dll", "IntersectRect", 3 },
+    { "kernel32.dll", "IsBadWritePtr", 2 },
+    { "user32.dll", "IsRectEmpty", 1 },
+    { "user32.dll", "IsWindowVisible", 1 },
+    { "gdi32.dll", "LineDDA", 6 },
+    { "user32.dll", "LoadBitmapA", 2 },
+    { "user32.dll", "MapVirtualKeyA", 2 },
+    { "user32.dll", "MapWindowPoints", 4 },
+    { "user32.dll", "OemToCharA", 2 },
+    { "user32.dll", "OemToCharBuffA", 3 },
+    { "gdi32.dll", "PatBlt", 6 },
+    { "gdi32.dll", "Pie", 9 },
+    { "gdi32.dll", "Polyline", 3 },
+    { "user32.dll", "PtInRect", 2 },
+    { "gdi32.dll", "RealizePalette", 1 },
+    { "gdi32.dll", "RectVisible", 2 },
+    { "gdi32.dll", "RemoveFontResourceA", 1 },
+    { "user32.dll", "RemoveMenu", 3 },
+    { "user32.dll", "RemovePropA", 2 },
+    { "user32.dll", "ReplyMessage", 1 },
+    { "gdi32.dll", "RestoreDC", 2 },
+    { "gdi32.dll", "RoundRect", 7 },
+    { "gdi32.dll", "SaveDC", 1 },
+    { "user32.dll", "ScrollWindow", 5 },
+    { "user32.dll", "ScrollWindowEx", 8 },
+    { "gdi32.dll", "SelectPalette", 3 },
+    { "user32.dll", "SendMessageTimeoutA", 7 },
+    { "user32.dll", "SendNotifyMessageA", 4 },
+    { "user32.dll", "SetMenu", 2 },
+    { "user32.dll", "SetPropA", 3 },
+    { "gdi32.dll", "SetROP2", 2 },
+    { "user32.dll", "SetRect", 5 },
+    { "user32.dll", "SetRectEmpty", 1 },
+    { "user32.dll", "SetScrollInfo", 4 },
+    { "user32.dll", "SetScrollPos", 4 },
+    { "gdi32.dll", "SetStretchBltMode", 2 },
+    { "gdi32.dll", "SetViewportOrgEx", 4 },
+    { "gdi32.dll", "SetWindowOrgEx", 4 },
+    { "user32.dll", "SetWindowRgn", 3 },
+    { "user32.dll", "SetWindowsHookExA", 4 },
+    { "user32.dll", "ShowOwnedPopups", 2 },
+    { "gdi32.dll", "StretchBlt", 11 },
+    { "gdi32.dll", "StretchDIBits", 13 },
+    { "user32.dll", "TrackPopupMenu", 7 },
+    { "user32.dll", "TranslateMDISysAccel", 2 },
+    { "user32.dll", "UnhookWindowsHookEx", 1 },
+    { "gdi32.dll", "UnrealizeObject", 1 },
+    { "user32.dll", "UnregisterClassA", 2 },
+    { "user32.dll", "WaitForInputIdle", 2 },
+    { "user32.dll", "WaitMessage", 0 },
+    { "user32.dll", "WinHelpA", 4 },
+    { "user32.dll", "WindowFromPoint", 1 },
+    { "ole32.dll", "CLSIDFromProgID", 2 },
+    { "ole32.dll", "CoDisconnectObject", 2 },
+    { "ole32.dll", "CoFreeUnusedLibraries", 0 },
+    { "shell32.dll", "ExtractIconA", 3 },
+    { "kernel32.dll", "FileTimeToSystemTime", 2 },
+    { "oleaut32.dll", "GetActiveObject", 3 },
+    { "kernel32.dll", "GetLocalTime", 1 },
+    { "kernel32.dll", "GetOverlappedResult", 5 },
+    { "oleaut32.dll", "LoadTypeLib", 2 },
+    { "oleaut32.dll", "RegisterTypeLib", 3 },
+    { "shell32.dll", "SHBrowseForFolder", 1 },
+    { "shell32.dll", "SHChangeNotify", 4 },
+    { "shell32.dll", "SHGetFileInfoA", 5 },
+    { "shell32.dll", "SHGetMalloc", 1 },
+    { "shell32.dll", "SHGetPathFromIDList", 2 },
+    { "mpr.dll", "WNetGetUniversalNameA", 5 },
+    { "comctl32.dll", "ImageList_BeginDrag", 3 },
+    { "comctl32.dll", "ImageList_Destroy", 1 },
+    { "comctl32.dll", "ImageList_DragEnter", 2 },
+    { "comctl32.dll", "ImageList_DragLeave", 1 },
+    { "comctl32.dll", "ImageList_DragMove", 2 },
+    { "comctl32.dll", "ImageList_DragShowNolock", 1 },
+    { "comctl32.dll", "ImageList_EndDrag", 0 },
+    { "comctl32.dll", "ImageList_GetDragImage", 4 },
+    { "comctl32.dll", "ImageList_ReplaceIcon", 3 },
+    { "comctl32.dll", "ImageList_SetBkColor", 2 },
+    { "comctl32.dll", "ImageList_SetDragCursorImage", 4 },
 };
 
 /* Case-insensitive dll compare ignoring an optional .dll suffix on either
@@ -191,18 +404,17 @@ static int stub_dll_eq(const char *a, const char *b)
     return strcasecmp(ea, eb) == 0;
 }
 
-static uint16_t stub_table_pop(const char *dll, const char *name, int *known)
+/* Public: stack WORDS a missing import pops (stdcall), or -1 when unknown.
+ * Used by the i386 trampoline AND the in-process wow64 stub32 registry to
+ * keep 32-bit stacks balanced. */
+int wn_stub_pop_words_for(const char *dll, const char *name)
 {
     for (size_t i = 0; i < sizeof g_stub_pop_table / sizeof g_stub_pop_table[0]; i++)
         if (stub_dll_eq(g_stub_pop_table[i].dll, dll) &&
-            !strcasecmp(g_stub_pop_table[i].name, name)) {
-            if (known)
-                *known = 1;
-            return (uint16_t)(g_stub_pop_table[i].nargs * 4);
-        }
-    return 0;
+            !strcasecmp(g_stub_pop_table[i].name, name))
+            return g_stub_pop_table[i].nargs;
+    return -1;
 }
-#endif
 
 WN_STUBIMPL_DECL void wn_stub_entry_impl(wn_abiword info_p, wn_abiword a1,
                                          wn_abiword a2, wn_abiword a3,
@@ -287,9 +499,9 @@ void *wn_stub_for(const char *dll, const char *name)
     info->hits = 0;
 #if !defined(__x86_64__)
     {
-        int known = 0;
-        info->pop = stub_table_pop(dll, name, &known);
-        info->pop_known = (uint8_t)known;
+        int words = wn_stub_pop_words_for(dll, name);
+        info->pop = words >= 0 ? (uint16_t)(words * 4) : 0;
+        info->pop_known = words >= 0;
     }
 #else
     info->pop = 0;

@@ -2,6 +2,7 @@
  * TLS blocks, suspend/resume via SIGUSR1, thread exit.
  */
 #include "wn_process.h"
+#include "wn_wow64.h"
 #include "wn_module.h"
 #include "wn_pe.h"
 #include "wn_log.h"
@@ -53,7 +54,33 @@ static void tls_alloc_block(wn_teb *teb, const wn_tls_mod *tm)
     if (tm->template_end > tm->template_start)
         raw = (size_t)(tm->template_end - tm->template_start);
     size_t sz = (raw + tm->zero_fill + 15) & ~15ULL;
-    void *block = wn_xcalloc(1, sz + 8);
+    void *block;
+    if (g_wow64_active) {
+        /* 32-bit guest (in-process wow64): the TLS block MUST live below
+         * 4GB, and the guest reads it through fs:[0x2C] -> TEB32 slots.
+         * The 64-bit TEB keeps the mirror for our own Tls* impls. This is
+         * the exe+0x4325 "NULL static-TLS block" crash (guest writes
+         * [block+4] with block == NULL). */
+        wn_wow64_thread *wt = (wn_wow64_thread *)(uintptr_t)
+            *(volatile uint64_t *)((uint8_t *)teb + 0xE8);
+        if (!wt || !wt->teb32)
+            return;                      /* thread not wow64-hosted yet */
+        uint32_t *slots32 = (uint32_t *)(wt->teb32 + 0xE10);
+        if (tm->index >= 64)
+            return;                      /* TEB32 has 64 slots (+expansion) */
+        if (slots32[tm->index] != 0)
+            return;
+        block = wn_low_malloc(sz + 8);
+        if (!block)
+            return;
+        memset(block, 0, sz + 8);
+        if (raw && tm->template_start)
+            memcpy(block, (const void *)(uintptr_t)tm->template_start, raw);
+        slots32[tm->index] = (uint32_t)(uintptr_t)block;
+        teb->tls_array[tm->index] = (wn_abiptr)(uintptr_t)block;
+        return;
+    }
+    block = wn_xcalloc(1, sz + 8);
     if (raw && tm->template_start)
         memcpy(block, (const void *)(uintptr_t)tm->template_start, raw);
     teb->tls_array[tm->index] = (wn_abiptr)(uintptr_t)block;

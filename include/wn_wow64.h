@@ -57,6 +57,9 @@ typedef struct wn_wow64_thread {
     uint32_t start32;              /* 180 CreateThread start             */
     uint32_t param32;              /* 184                                */
     struct wn_wow64_thread *self;  /* 192                                */
+    uint8_t *seh_low;              /* 200 low SEH scratch (0x400)        */
+    uint32_t dispatch32;           /* 208 builtin serves a 32-bit caller */
+    uint32_t args32;               /* 212 guest esp at the args (debug)  */
 } wn_wow64_thread;
 
 /* scratch layout (low, 0x100): 0x00 exit_blk (4 u64: retval, new_esp32,
@@ -139,5 +142,17 @@ int wn_wow64_fault_hook(void *uc_, void *fault_addr_v, int si_code, int sig);
 
 /* Query: is addr inside the gate/thunk region (for crash reporting)? */
 int wn_wow64_is_gate_addr(const void *addr);
+
+/* Is the CURRENT builtin invocation serving a 32-bit guest call? Layout-
+ * sensitive struct writers (SYSTEM_INFO, MEMORY_BASIC_INFORMATION, ...) must
+ * use the i386 layout when this returns 1 - the host build is x86-64 even
+ * while running an i386 guest in-process, so compile-time #if is WRONG for
+ * the in-process wow64 path (found via the LuaForWindows installer). */
+int wn_wow64_guest32(void);
+
+/* Write a HANDLE-sized out-param with the CALLER's pointer width. A 32-bit
+ * caller's HKEY/HMODULE/... slot is 4 bytes; an 8-byte host store smashes
+ * the adjacent guest data (registry handles corrupted the Inno heap). */
+void wn_wow64_out_handle(void *slot, uint64_t val);
 
 #endif /* WN_WOW64_H */

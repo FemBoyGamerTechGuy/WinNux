@@ -15,11 +15,13 @@
 #include "wn_module.h"
 #include "wn_dll.h"
 #include "wn_log.h"
+#include "wn_stub.h"
 #include "wn_util.h"
 #include "wn_path.h"
 #include "wn_pe.h"
 
 #include <errno.h>
+#include <malloc.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,9 +31,21 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+/* Shared process-level globals (both builds). On the i386 build the whole
+ * layer is inert: g_wow64_active stays 0 forever (guests run natively) and
+ * the g_wow64_* mirrors are never consulted. */
 int g_wow64_active = 0;
 uint32_t g_wow64_peb32, g_wow64_params32, g_wow64_ldr32;
 uint32_t g_wow64_env_w32, g_wow64_cmdline_w32, g_wow64_cmdline_a32;
+
+#if defined(__x86_64__)
+/* Everything below is the in-process compat-mode layer and exists ONLY on
+ * the x86-64 build (it switches CS to __USER32_CS, decodes fs-prefixed
+ * guest instructions from 64-bit signal contexts and thunks into ms_abi
+ * builtins). The i386 build (winnux32) runs PE32 guests natively — %fs
+ * hosts the TEB via modify_ldt (process.c), WN_API is stdcall so builtins
+ * are IAT-called directly — and compiles the interface stubs at the
+ * bottom of this file instead. */
 
 /* from wow64_gates.S */
 extern const uint8_t wow64_thunk_gate[], wow64_thunk_gate_end[];
@@ -145,10 +159,14 @@ static uint8_t *g_lh_base;
 static size_t   g_lh_size, g_lh_used;
 static lh_hdr  *g_lh_free;
 
+#define WOW64_HEAP_HINT  0x50000000ull
+#define WOW64_STACK_HINT 0x60000000ull
+
 static void lh_init(void)
 {
     g_lh_size = 512u << 20;
-    g_lh_base = mmap(NULL, g_lh_size, PROT_READ | PROT_WRITE,
+    g_lh_base = mmap((void *)(uintptr_t)WOW64_HEAP_HINT, g_lh_size,
+                     PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT | MAP_NORESERVE,
                      -1, 0);
     if (g_lh_base == MAP_FAILED) {
@@ -254,7 +272,7 @@ wn_wow64_thread *wn_wow64_thread_attach(void)
         return NULL;
     }
     wn_wow64_thread *wt = wn_xcalloc(1, sizeof *wt);
-    wt->teb32 = wn_low_mmap(0x1000, PROT_READ | PROT_WRITE, 0);
+    wt->teb32 = wn_low_mmap(0x1000, PROT_READ | PROT_WRITE, 0x5F000000);
     wt->scratch = wn_low_malloc(0x100);
     if (wt->teb32 == MAP_FAILED || !wt->scratch) {
         wn_log(WN_LOG_ERR, "wow64: teb32/scratch alloc failed");
@@ -480,7 +498,23 @@ uint32_t wn_wow64_thunk_for(void *fn, const char *dll_name, const char *name)
     wn_sig32 sig;
     memset(&sig, 0, sizeof sig);
     if (!wn_sig32_lookup(name, &sig)) {
-        /* unknown signature (rare): 4-word stdcall guess */
+        /* unknown signature: 4-word stdcall guess. WRONG arity here corrupts
+         * the 32-bit stack (found via the LuaForWindows installer: GetVersion
+         * was missing from the table and popped 16 bytes off a 0-arg call,
+         * skewing every frame after it). Warn once per name so new gaps are
+         * caught by any debug run, and regenerate gen_sigs32.c to fix. */
+        static char warned[32][96];
+        static int warned_n;
+        int seen = 0;
+        for (int i = 0; i < warned_n; i++)
+            if (!strcmp(warned[i], name)) { seen = 1; break; }
+        if (!seen && warned_n < 32) {
+            snprintf(warned[warned_n], sizeof warned[0], "%s", name);
+            wn_log(WN_LOG_WARN, "wow64: no 32-bit signature for %s!%s "
+                   "(guessing 4-word stdcall - fix gen_sigs32.c)",
+                   dll_name ? dll_name : "?", name ? name : "?");
+            warned_n++;
+        }
         sig.cleanup = 4;
         sig.arity = 4;
     }
@@ -492,7 +526,23 @@ uint32_t wn_wow64_thunk_for(void *fn, const char *dll_name, const char *name)
 
 uint32_t wn_wow64_stub32_for(const char *dll_name, const char *name)
 {
-    return thunk_register(NULL, dll_name, name, 0, WN32_CDECL | WN32_STUB32, 0);
+    /* A missing stdcall import still pops its own arg frame: use the real
+     * signature when we know it (implemented elsewhere / curated table),
+     * else keep the cdecl guess AND warn — an unbalanced stub corrupts the
+     * 32-bit stack on EVERY call (LuaForWindows: InterlockedExchange). */
+    uint16_t cleanup = 0;
+    wn_sig32 sig;
+    if (wn_sig32_lookup(name, &sig) && !(sig.flags & WN32_VARARG))
+        cleanup = sig.cleanup;
+    else {
+        int words = wn_stub_pop_words_for(dll_name, name);
+        if (words >= 0)
+            cleanup = (uint16_t)words;
+        else
+            wn_log(WN_LOG_WARN, "wow64: stub32 %s!%s has unknown arity "
+                   "(returning cdecl - stack may skew)", dll_name, name);
+    }
+    return thunk_register(NULL, dll_name, name, cleanup, WN32_STUB32, 0);
 }
 
 uint32_t wn_wow64_data32_for(const void *obj)
@@ -519,6 +569,15 @@ void wow64_dispatch_c(wn_wow64_thread *wt, uint64_t *frame)
         return;
     }
     thunk_ent *ent = &g_thunks[funcid];
+    wn_log(WN_LOG_DEBUG, "wow64: call %s esp=%x clean=%u",
+           ent->name, (uint32_t)(uintptr_t)(args), ent->cleanup);
+
+    /* Layout-sensitive builtins consult wn_wow64_guest32() to pick the
+     * i386 struct layout; keep it true for the whole invocation (nested
+     * host-side helper calls stay in 32-bit-serving context). */
+    uint32_t saved_disp32 = wt->dispatch32;
+    wt->dispatch32 = 1;
+    wt->args32 = (uint32_t)(uintptr_t)args;
 
     uint64_t a[12];
     double d[3];
@@ -550,6 +609,7 @@ void wow64_dispatch_c(wn_wow64_thread *wt, uint64_t *frame)
 
 
     uint32_t esp = (uint32_t)(uintptr_t)frame + 8 + ent->cleanup * 4;
+    wt->dispatch32 = saved_disp32;
     wt->exit_blk[0] = ret;
     wt->exit_blk[1] = esp;
     wt->exit_blk[2] = ret32;
@@ -672,6 +732,14 @@ static int fs_emulate(ucontext_t *uc, unsigned long fault_addr)
     if (!wt) return -1;
     uint8_t *teb = wt->teb32;
     (void)fault_addr;
+
+    /* A NULL/garbage EIP (jump through a bad pointer) is not an fs access:
+     * decoding "the instruction at 0" would fault inside this handler and
+     * the kernel kills the process with no diagnostic. Validate first. */
+    if ((uint64_t)(uintptr_t)rip < 0x10000)
+        return 0;
+    if (msync((void *)((uintptr_t)rip & ~0xFFFULL), 0x1000, MS_ASYNC) != 0)
+        return 0;               /* instruction page unmapped */
 
     int o = 0, op16 = 0, has_fs = 0;
     for (;;) {
@@ -803,6 +871,11 @@ static int fs_emulate(ucontext_t *uc, unsigned long fault_addr)
         *esp -= 4;
         uint32_t dst = *esp;
         if (dst < 0x10000) return 0;
+        if ((uint64_t)lin == (uint64_t)(uintptr_t)teb)
+            wn_log(WN_LOG_DEBUG, "wow64: push fs:[0] = %x rip=%x esp->%x",
+                   (uint32_t)val,
+                   (uint32_t)uc->uc_mcontext.gregs[REG_RIP],
+                   (uint32_t)*esp - 4);
         *(uint32_t *)(uintptr_t)dst = (uint32_t)val;
     } else if (is_pop) {
         uint32_t *esp = greg32(uc, XESP);
@@ -820,6 +893,11 @@ static int fs_emulate(ucontext_t *uc, unsigned long fault_addr)
         } else {
             v = *greg32(uc, reg);
         }
+        if ((uint64_t)lin == (uint64_t)(uintptr_t)teb)
+            wn_log(WN_LOG_DEBUG, "wow64: fs:[0] write %x (was %x) rip=%x esp=%x",
+                   (uint32_t)v, *(uint32_t *)lin,
+                   (uint32_t)uc->uc_mcontext.gregs[REG_RIP],
+                   (uint32_t)uc->uc_mcontext.gregs[REG_RSP]);
         if (size == 1) *(uint8_t *)lin = (uint8_t)v;
         else if (size == 2) *(uint16_t *)lin = (uint16_t)v;
         else *(uint32_t *)lin = (uint32_t)v;
@@ -878,11 +956,9 @@ int wn_wow64_fault_hook(void *uc_, void *fault_addr_v, int si_code, int sig)
     if (sig == SIGSEGV || sig == SIGBUS) {
         int r = fs_emulate(uc, (unsigned long)(uintptr_t)fault_addr_v);
         if (r == 1) {
-            static uint32_t emu_count;
-            emu_count++;
-            if ((emu_count & 0xFFFF) == 1)
-                wn_log(WN_LOG_DEBUG, "wow64: fs emulation #%u at rip=%p",
-                       emu_count, (void *)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+            wn_log(WN_LOG_TRACE, "wow64: fs emu rip=%p esp=%x",
+                   (void *)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP],
+                   (uint32_t)uc->uc_mcontext.gregs[REG_RSP]);
             return 1;
         }
     }
@@ -895,6 +971,23 @@ int wn_wow64_fault_hook(void *uc_, void *fault_addr_v, int si_code, int sig)
     wn_module_describe_addr((const void *)(uintptr_t)
                             uc->uc_mcontext.gregs[REG_RIP], w, sizeof w);
     wn_log(WN_LOG_ERR, "wow64: faulting ip: %s", w);
+    wn_log(WN_LOG_ERR, "wow64: state: seh_chain=%x teb_self=%x",
+           *(uint32_t *)(wt->teb32 + TEB32_EXCLIST),
+           *(uint32_t *)(wt->teb32 + TEB32_SELF));
+    {
+        uint32_t esp = (uint32_t)uc->uc_mcontext.gregs[REG_RSP];
+        for (int i = 0; i < 8; i++) {
+            uint32_t v = 0;
+            if (esp + i * 4 > 0x10000 &&
+                msync((void *)(uintptr_t)((esp + i * 4) & ~0xFFFULL),
+                      0x1000, MS_ASYNC) == 0)
+                v = *(uint32_t *)(uintptr_t)(esp + i * 4);
+            char w2[96];
+            wn_module_describe_addr((const void *)(uintptr_t)v, w2, sizeof w2);
+            wn_log(WN_LOG_ERR, "wow64:   [esp+0x%x] = 0x%08x  %s",
+                   i * 4, v, w2);
+        }
+    }
     {
         uint32_t r[8];
         static const int gr[] = { REG_RAX, REG_RBX, REG_RCX, REG_RDX,
@@ -923,7 +1016,8 @@ uint32_t wn_wow64_init(void)
 
     wn_wow64_thread *wt = wn_wow64_thread_attach();
     if (!wt) { g_wow64_active = 0; return WN_ERR_GEN_FAILURE; }
-    wt->stack_low = wn_low_mmap(0x101000, PROT_READ | PROT_WRITE, 0);
+    wt->stack_low = wn_low_mmap(0x101000, PROT_READ | PROT_WRITE,
+                                 WOW64_STACK_HINT);
     if (wt->stack_low == MAP_FAILED) {
         g_wow64_active = 0;
         return WN_ERR_GEN_FAILURE;
@@ -956,3 +1050,162 @@ int wn_wow64_is_gate_addr(const void *addr)
     return g_gates && (uint8_t *)addr >= g_gates &&
            (uint8_t *)addr < g_gates + 0x100000;
 }
+
+int wn_wow64_guest32(void)
+{
+    if (!g_wow64_active)
+        return 0;
+    wn_wow64_thread *wt = wn_wow64_thread_current();
+    return wt && wt->dispatch32;
+}
+
+void wn_wow64_out_handle(void *slot, uint64_t val)
+{
+    if (wn_wow64_guest32())
+        *(uint32_t *)(void *)slot = (uint32_t)val;
+    else
+        *(uint64_t *)(void *)slot = val;
+}
+
+#else  /* !__x86_64__ : the i386 (winnux32) build ------------------------------- */
+
+/* The process itself is 32-bit. There is no compat-mode switch, no low
+ * arena, no thunk gates. The interface below exists because the rest of
+ * the runtime calls these symbols unconditionally (seh.c installs the
+ * fault hook first on every SIGSEGV; layout-sensitive builtins consult
+ * wn_wow64_guest32(); g_wow64_active-guarded low-heap users in kernel32
+ * must link). Semantics:
+ *  - every builtin call serves a 32-bit guest, so guest32() is TRUE and
+ *    out_handle() stores 4 bytes (matching the natural width here);
+ *  - fault_hook() claims nothing (native %fs means no fs emulation);
+ *  - the execution/thunk/PEB32 functions are never reached (loader.c and
+ *    main.c guard them with __x86_64__), but must exist for the link. */
+
+void *wn_low_mmap(size_t size, int prot, uint64_t hint)
+{
+    (void)hint;               /* the whole address space is below 4GB */
+    void *p = mmap(NULL, size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+void *wn_low_malloc(size_t n)
+{
+    return malloc(n ? n : 1);
+}
+
+void wn_low_free(void *p)
+{
+    free(p);
+}
+
+void *wn_low_realloc(void *p, size_t n)
+{
+    return realloc(p, n);
+}
+
+size_t wn_low_usable(void *p)
+{
+    return p ? malloc_usable_size(p) : 0;
+}
+
+int wn_wow64_ready(void)
+{
+    return 0;                 /* the wow64 layer never initializes here */
+}
+
+uint32_t wn_wow64_init(void)
+{
+    return WN_ERR_GEN_FAILURE; /* loader.c only calls this on x86-64 */
+}
+
+wn_wow64_thread *wn_wow64_thread_current(void)
+{
+    return NULL;
+}
+
+wn_wow64_thread *wn_wow64_thread_attach(void)
+{
+    return NULL;
+}
+
+void wn_wow64_build_peb32(void)
+{
+    /* i386 build: the native PEB (g_proc.peb) IS the 32-bit PEB. */
+}
+
+void wn_wow64_ldr_add_module(struct wn_module *m)
+{
+    (void)m;                  /* the native PEB LDR lists are the real ones */
+}
+
+uint32_t wn_wow64_thunk_for(void *fn, const char *dll_name, const char *name)
+{
+    (void)fn;
+    wn_log(WN_LOG_ERR, "wow64: thunk_for(%s!%s) on an i386 build - builtin "
+           "should have been IAT-called directly",
+           dll_name ? dll_name : "?", name ? name : "?");
+    return 0;
+}
+
+uint32_t wn_wow64_stub32_for(const char *dll_name, const char *name)
+{
+    wn_log(WN_LOG_ERR, "wow64: stub32_for(%s!%s) on an i386 build - use the "
+           "i386 stub trampoline",
+           dll_name ? dll_name : "?", name ? name : "?");
+    return 0;
+}
+
+uint32_t wn_wow64_data32_for(const void *obj)
+{
+    return (uint32_t)(uintptr_t)obj;   /* already guest-addressable */
+}
+
+int wn_wow64_call32(uint32_t target, uint32_t *esp_io, uint32_t regs_io[7])
+{
+    (void)target;
+    (void)esp_io;
+    (void)regs_io;
+    wn_log(WN_LOG_ERR, "wow64: call32 on an i386 build (native code needs "
+           "no crossing)");
+    return -1;
+}
+
+void wn_wow64_run_exe(uint32_t entry)
+{
+    wn_log(WN_LOG_ERR, "wow64: run_exe(0x%x) on an i386 build - the native "
+           "entry shim should have been used", entry);
+    wn_process_exit(1);
+}
+
+int wn_wow64_fault_hook(void *uc_, void *fault_addr_v, int si_code, int sig)
+{
+    /* Not ours by definition: %fs holds the real TEB, so no fs fault can
+     * originate from WinNux translation. Return 0 so seh.c runs its normal
+     * native crash/SEH path as fast as possible. */
+    (void)uc_;
+    (void)fault_addr_v;
+    (void)si_code;
+    (void)sig;
+    return 0;
+}
+
+int wn_wow64_is_gate_addr(const void *addr)
+{
+    (void)addr;                /* no gate mapping exists */
+    return 0;
+}
+
+int wn_wow64_guest32(void)
+{
+    /* Every caller is 32-bit on this build. VirtualQuery's dwLength check,
+     * GetSystemInfo's 36-byte layout, Interlocked*Pointer's 4-byte atomics,
+     * lpFilePart/HKEY/PAINTSTRUCT.hdc stores all depend on this. */
+    return 1;
+}
+
+void wn_wow64_out_handle(void *slot, uint64_t val)
+{
+    *(uint32_t *)(void *)slot = (uint32_t)val;
+}
+
+#endif  /* __x86_64__ */

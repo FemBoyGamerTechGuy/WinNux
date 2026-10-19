@@ -58,6 +58,14 @@ uint32_t wn_wait_single(wn_handle h, uint32_t timeout_ms);
 uint32_t wn_wait_multiple(uint32_t count, const wn_handle *handles,
                           int wait_all, uint32_t timeout_ms);
 
+/* Critical sections (guest-visible in-place objects). x86 (32-bit) layout
+ * variants for the wow64 layer: RTL_CRITICAL_SECTION is 24 bytes on i386. */
+void wn_critsect32_init(void *cs, uint32_t spin);
+void wn_critsect32_enter(void *cs);
+int  wn_critsect32_try(void *cs);
+void wn_critsect32_leave(void *cs);
+void wn_critsect32_delete(void *cs);
+
 /* Critical sections operate on guest in-place structures. */
 void wn_critsect_init(wn_critsect *cs, uint32_t spin);
 void wn_critsect_enter(wn_critsect *cs);

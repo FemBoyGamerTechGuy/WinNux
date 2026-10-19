@@ -152,6 +152,12 @@ static int try_object(wn_object *o)
         wn_thread *t = o->ptr;
         return __atomic_load_n(&t->exited, __ATOMIC_ACQUIRE) != 0;
     }
+    case WN_HTYPE_PROCESS: {
+        /* fork/exec'd child: kernel32 owns the object layout; call its
+         * poll helper (declared in wn_process.h). */
+        extern int wn_child_process_try(void *p);
+        return wn_child_process_try(o->ptr);
+    }
     default:
         wn_last_error_set(WN_ERR_INVALID_HANDLE);
         return -1;
@@ -343,6 +349,66 @@ void wn_critsect_leave(wn_critsect *cs)
 }
 
 void wn_critsect_delete(wn_critsect *cs)
+{
+    (void)cs;
+}
+
+/* --- 32-bit (i386) RTL_CRITICAL_SECTION: 24 bytes, x86 offsets ------------------
+ * DebugInfo@0(4) LockCount@4 RecursionCount@8 OwningThread@0xc LockSemaphore
+ * @0x10 SpinCount@0x14. The 64-bit layout is 40 bytes: writing it into a
+ * 32-bit guest's object clobbers 16 bytes of neighboring guest data (found
+ * via the LuaForWindows installer: Delphi heap state corrupted). */
+void wn_critsect32_init(void *cs, uint32_t spin)
+{
+    memset(cs, 0, 24);
+    *(int32_t *)((uint8_t *)cs + 4) = -1;
+    *(uint32_t *)((uint8_t *)cs + 0x14) = spin;
+}
+
+void wn_critsect32_enter(void *cs)
+{
+    uint8_t *p = cs;
+    uint32_t me = wn_teb_current()->client_id_thread;
+    for (;;) {
+        int32_t cur = -1;
+        if (__atomic_compare_exchange_n((int32_t *)(p + 4), &cur, 0,
+                                        0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            *(uint32_t *)(p + 0xc) = me;
+            *(uint32_t *)(p + 8) = 1;
+            return;
+        }
+        if (*(uint32_t *)(p + 0xc) == me) {
+            (*(uint32_t *)(p + 8))++;
+            return;
+        }
+        wn_futex_wait((uint32_t *)(p + 4), (uint32_t)cur, NULL);
+    }
+}
+
+int wn_critsect32_try(void *cs)
+{
+    uint8_t *p = cs;
+    int32_t cur = -1;
+    if (__atomic_compare_exchange_n((int32_t *)(p + 4), &cur, 0,
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        *(uint32_t *)(p + 0xc) = wn_teb_current()->client_id_thread;
+        *(uint32_t *)(p + 8) = 1;
+        return 1;
+    }
+    return 0;
+}
+
+void wn_critsect32_leave(void *cs)
+{
+    uint8_t *p = cs;
+    if (--*(int32_t *)(p + 8) > 0)
+        return;
+    *(uint32_t *)(p + 0xc) = 0;
+    __atomic_store_n((int32_t *)(p + 4), -1, __ATOMIC_RELEASE);
+    wn_futex_wake((uint32_t *)(p + 4), 1);
+}
+
+void wn_critsect32_delete(void *cs)
 {
     (void)cs;
 }

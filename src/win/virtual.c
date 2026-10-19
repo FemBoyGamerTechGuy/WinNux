@@ -4,6 +4,7 @@
  * addresses (guest-foreign regions) are answered from /proc/self/maps.
  */
 #include "wn_process.h"
+#include "wn_wow64.h"
 #include "wn_log.h"
 #include "wn_util.h"
 
@@ -81,7 +82,19 @@ static void region_remove(uint64_t s, uint64_t e)
 
 /* --- public API used by kernel32 ------------------------------------------- */
 
+static void *wn_virtual_alloc_inner(void *hint, uint64_t size, uint32_t type,
+                                    uint32_t prot);
+
 void *wn_virtual_alloc(void *hint, uint64_t size, uint32_t type, uint32_t prot)
+{
+    void *res = wn_virtual_alloc_inner(hint, size, type, prot);
+    wn_log(WN_LOG_DEBUG, " valloc addr=%p size=0x%llx type=0x%x prot=0x%x "
+           "-> %p", hint, (unsigned long long)size, type, prot, res);
+    return res;
+}
+
+static void *wn_virtual_alloc_inner(void *hint, uint64_t size, uint32_t type,
+                                    uint32_t prot)
 {
     if (size == 0 || size > 0x100000000ULL) {
         wn_log(WN_LOG_WARN, "virtual: VirtualAlloc size 0x%llx rejected",
@@ -107,10 +120,23 @@ void *wn_virtual_alloc(void *hint, uint64_t size, uint32_t type, uint32_t prot)
          * then faulted on the still-PROT_NONE reserve. */
         uint64_t page_a = a & ~0xFFFULL;
         uint64_t usize = (size + 0xFFF) & ~0xFFFULL;
+        /* Extend to the 64KB allocation-granularity boundary (Windows 9x
+         * committed whole granules; the old Delphi/Inno heap manager READS
+         * its pool-end sentinel 4 bytes past the requested commit —
+         * LuaForWindows: SEGV reading [commit_end] during block coalescing
+         * without this). Never past the reservation end. */
         pthread_mutex_lock(&g_reg_lock);
         vregion *r = g_regions;
         while (r && !(r->start <= page_a && r->end > page_a))
             r = r->next;
+        if (r) {
+            uint64_t end = page_a + usize;
+            uint64_t g64 = (end + 0xFFFF) & ~0xFFFFULL;
+            if (g64 > r->end)
+                g64 = r->end;
+            if (g64 > end)
+                usize = g64 - page_a;
+        }
         if (r && r->end - page_a >= usize &&
             mprotect((void *)(uintptr_t)page_a, usize, p) == 0) {
             r->state = WN_MEM_COMMIT;
@@ -126,7 +152,8 @@ void *wn_virtual_alloc(void *hint, uint64_t size, uint32_t type, uint32_t prot)
         if ((a & 0xFFF) == 0) {
             void *base = mmap(hint, usize, p,
                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-                                  | MAP_FIXED_NOREPLACE,
+                                  | MAP_FIXED_NOREPLACE
+                                  | (g_wow64_active ? MAP_32BIT : 0),
                               -1, 0);
             if (base == MAP_FAILED) {
                 wn_log(WN_LOG_WARN, "virtual: MEM_COMMIT at %p (size 0x%llx) "
@@ -145,15 +172,27 @@ void *wn_virtual_alloc(void *hint, uint64_t size, uint32_t type, uint32_t prot)
         return NULL;
     }
 
-    /* Reserve (+ same-call commit): 64K granularity like Windows. */
+    /* Reserve (+ same-call commit): 64K granularity like Windows. NOTE:
+     * MEM_COMMIT without MEM_RESERVE and lpAddress==NULL is legal on
+     * Windows - the system implicitly reserves AND commits. The old
+     * `commit && reserve` test mapped such requests PROT_NONE while
+     * tagging them COMMIT (LZMA state in the NSIS installer: SEGV_ACCERR
+     * write fault at the returned buffer). */
     uint64_t usize = (size + 0xFFFF) & ~0xFFFFULL;
     if (usize == 0)
         usize = 0x10000;
-    int want = (commit && reserve) ? p : PROT_NONE;
+    int want = commit ? p : PROT_NONE;
     void *base = mmap(hint, usize, want,
                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-                          | ((a != 0) ? MAP_FIXED_NOREPLACE : 0),
+                          | ((a != 0) ? MAP_FIXED_NOREPLACE : 0)
+                          | (g_wow64_active ? MAP_32BIT : 0),
                       -1, 0);
+    if (base == MAP_FAILED && g_wow64_active && a == 0) {
+        /* low space fragmented: retry without the hint constraint */
+        base = mmap(NULL, usize, want,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_32BIT,
+                    -1, 0);
+    }
     if (base == MAP_FAILED) {
         wn_log(WN_LOG_WARN, "virtual: reserve of 0x%llx bytes at %p failed",
                (unsigned long long)usize, hint);
@@ -172,6 +211,8 @@ void *wn_virtual_alloc(void *hint, uint64_t size, uint32_t type, uint32_t prot)
 
 int wn_virtual_free(void *addr, uint64_t size, uint32_t type)
 {
+    wn_log(WN_LOG_DEBUG, " vfree addr=%p size=0x%llx type=0x%x",
+           addr, (unsigned long long)size, type);
     if (type & 0x8000 /* MEM_RELEASE */) {
         if (size == 0) {
             /* Windows: release the entire allocation. Find its region. */

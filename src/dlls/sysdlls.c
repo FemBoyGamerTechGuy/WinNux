@@ -16,6 +16,7 @@
 #include "wn_dll.h"
 #include "wn_log.h"
 #include "wn_util.h"
+#include "wn_process.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -153,5 +154,77 @@ const wn_export_entry wn_comres_exports[] = {
 };
 
 const wn_export_entry wn_clbcatq_exports[] = {
+    { NULL, NULL },
+};
+
+/* --- mpr.dll - Windows networking (WNet*) -------------------------------
+ * Inno Setup links mpr.dll for network-path handling. No network here:
+ * every WNet call fails cleanly with ERROR_NOT_CONNECTED (2250). One
+ * wrapper per real arity - the wow64 signature table derives its stack
+ * cleanup from the parameter count. */
+static WN_API uint32_t mpr_w0(wn_abiword a1, wn_abiword a2, wn_abiword a3) { (void)a1; (void)a2; (void)a3; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w1(wn_abiword a1, wn_abiword a2, wn_abiword a3) { (void)a1; (void)a2; (void)a3; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w2(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4) { (void)a1; (void)a2; (void)a3; (void)a4; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w3(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4) { (void)a1; (void)a2; (void)a3; (void)a4; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w4(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4, wn_abiword a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w5(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4, wn_abiword a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w6(wn_abiword a1, wn_abiword a2, wn_abiword a3) { (void)a1; (void)a2; (void)a3; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w7(wn_abiword a1, wn_abiword a2, wn_abiword a3) { (void)a1; (void)a2; (void)a3; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w8(wn_abiword a1, wn_abiword a2) { (void)a1; (void)a2; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w9(wn_abiword a1, wn_abiword a2) { (void)a1; (void)a2; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w10(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4, wn_abiword a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w11(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4, wn_abiword a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w12(wn_abiword a1) { (void)a1; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w13(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4) { (void)a1; (void)a2; (void)a3; (void)a4; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w14(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4) { (void)a1; (void)a2; (void)a3; (void)a4; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w15(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4, wn_abiword a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w16(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4, wn_abiword a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w17(wn_abiword a1, wn_abiword a2, wn_abiword a3) { (void)a1; (void)a2; (void)a3; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w18(wn_abiword a1, wn_abiword a2, wn_abiword a3) { (void)a1; (void)a2; (void)a3; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w19(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4, wn_abiword a5, wn_abiword a6, wn_abiword a7, wn_abiword a8) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; wn_last_error_set(2250); return 2250; }
+static WN_API uint32_t mpr_w20(wn_abiword a1, wn_abiword a2, wn_abiword a3, wn_abiword a4, wn_abiword a5, wn_abiword a6, wn_abiword a7, wn_abiword a8) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; wn_last_error_set(2250); return 2250; }
+
+const wn_export_entry wn_mpr_exports[] = {
+    { "WNetGetConnectionA", mpr_w0 },
+    { "WNetGetConnectionW", mpr_w1 },
+    { "WNetAddConnection2A", mpr_w2 },
+    { "WNetAddConnection2W", mpr_w3 },
+    { "WNetAddConnection3A", mpr_w4 },
+    { "WNetAddConnection3W", mpr_w5 },
+    { "WNetCancelConnection2A", mpr_w6 },
+    { "WNetCancelConnection2W", mpr_w7 },
+    { "WNetCancelConnectionA", mpr_w8 },
+    { "WNetCancelConnectionW", mpr_w9 },
+    { "WNetOpenEnumA", mpr_w10 },
+    { "WNetOpenEnumW", mpr_w11 },
+    { "WNetCloseEnum", mpr_w12 },
+    { "WNetEnumResourceA", mpr_w13 },
+    { "WNetEnumResourceW", mpr_w14 },
+    { "WNetGetLastErrorA", mpr_w15 },
+    { "WNetGetLastErrorW", mpr_w16 },
+    { "WNetGetUserA", mpr_w17 },
+    { "WNetGetUserW", mpr_w18 },
+    { "WNetUseConnectionA", mpr_w19 },
+    { "WNetUseConnectionW", mpr_w20 },
+    { NULL, NULL },
+};
+
+/* --- msimg32.dll - GDI image helpers -----------------------------------------
+ * Inno links it for AlphaBlend/GradientFill (progress graphics). The
+ * functions fail cleanly (return 0); drawing falls back to solid fills. */
+static WN_API int32_t ms_fail(wn_abiword a, wn_abiword b, wn_abiword c,
+                              wn_abiword d, wn_abiword e, wn_abiword f,
+                              wn_abiword g, wn_abiword h)
+{
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;
+    wn_last_error_set(1 /* ERROR_INVALID_FUNCTION */);
+    return 0;
+}
+
+const wn_export_entry wn_msimg32_exports[] = {
+    { "AlphaBlend", ms_fail },
+    { "GradientFill", ms_fail },
+    { "TransparentBlt", ms_fail },
+    { "vSetDIBitsToDevice", ms_fail },
     { NULL, NULL },
 };

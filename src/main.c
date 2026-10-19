@@ -40,8 +40,12 @@ static struct {
 
 /* --- guest entry ------------------------------------------------------------ */
 
-/* 32-bit guest entry: run TLS callbacks, then the exe entry on the wow64
- * stack. Never returns. */
+#if defined(__x86_64__)
+/* 32-bit guest entry (x86-64 build only): run TLS callbacks, then the exe
+ * entry on the wow64 stack. The i386 build runs PE32 guests natively and
+ * uses guest_entry_shim directly (below) — WN_API is stdcall there, so the
+ * same typedefs scale down and shim32 (compat-mode stack, wow64 attach,
+ * wn_wow64_call32) has no meaning. Never returns. */
 static WN_API uint64_t guest_entry_shim32(uint64_t unused)
 {
     (void)unused;
@@ -53,7 +57,12 @@ static WN_API uint64_t guest_entry_shim32(uint64_t unused)
     }
     if (!wt->stack_low) {
         extern void *wn_low_mmap(size_t, int, uint64_t);
-        wt->stack_low = wn_low_mmap(0x101000, PROT_READ | PROT_WRITE, 0);
+        {
+            extern void *wn_low_mmap(size_t, int, uint64_t);
+            extern uint64_t wow64_stack_hint(void);
+            wt->stack_low = wn_low_mmap(0x101000, PROT_READ | PROT_WRITE,
+                                        0x60000000);
+        }
         if (wt->stack_low == MAP_FAILED) {
             wn_log(WN_LOG_ERR, "wow64: guest stack alloc failed");
             wn_process_exit(1);
@@ -65,6 +74,13 @@ static WN_API uint64_t guest_entry_shim32(uint64_t unused)
     *(uint32_t *)(wt->teb32 + 4) = (uint32_t)(uintptr_t)
         (wt->stack_low + wt->stack_size);
     *(uint32_t *)(wt->teb32 + 8) = (uint32_t)(uintptr_t)wt->stack_low;
+
+    /* Static TLS blocks: the generic thread start ran wn_tls_thread_init
+     * BEFORE this attach (the TEB32 back-pointer did not exist yet), so
+     * blocks were skipped. Re-run it now — idempotent per slot. This is
+     * the exe+0x4325 crash: guest reads fs:[0x2C][index] -> NULL and
+     * writes [block+4]. */
+    wn_tls_thread_init(wn_teb_current());
 
     /* TLS callbacks (32-bit: array of u32 VAs, NULL-terminated) */
     if (exe->kind == WN_MOD_PE && !exe->pe.is_64) {
@@ -102,6 +118,7 @@ static WN_API uint64_t guest_entry_shim32(uint64_t unused)
     wn_wow64_run_exe((uint32_t)(uintptr_t)(exe->base + exe->pe.entry_rva));
     return 0;   /* not reached */
 }
+#endif  /* __x86_64__ */
 
 /* Run the exe's TLS callbacks (if any), then its entry point. */
 static WN_API uint64_t guest_entry_shim(uint64_t unused)
@@ -400,14 +417,26 @@ static int cmd_run(int argc, char **argv)
     wn_process_set_cmdline(g_argc, g_argv);
     wn_ms_set_args(g_argc, g_argv);
 
-    /* 32-bit exe: the x86 PEB skeleton needs the final command line. */
+    /* 32-bit exe: the x86 PEB skeleton needs the final command line — but
+     * only on the x86-64 build (in-process wow64). The i386 build's native
+     * PEB (g_proc.peb, built in process.c) IS the 32-bit PEB; calling the
+     * wow64 builder here would build a second, never-read PEB from the
+     * uninitialized low heap. */
+#if defined(__x86_64__)
     if (!exe->pe.is_64)
         wn_wow64_build_peb32();
+#endif
 
     /* Guest main thread. */
     wn_thread *th;
     if (!wn_thread_create(exe->pe.stack_reserve,
+#if defined(__x86_64__)
                           exe->pe.is_64 ? guest_entry_shim : guest_entry_shim32,
+#else
+                          /* i386 build: PE32 runs natively through the
+                           * stdcall entry shim; shim32 is not compiled. */
+                          guest_entry_shim,
+#endif
                           0, 0, &th, NULL))
         return 1;
     pthread_join(th->pthread, NULL);

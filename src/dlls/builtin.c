@@ -96,6 +96,8 @@ const wn_builtin_dll wn_builtin_table[] = {
     { "profapi.dll",    wn_profapi_exports,   NULL },
     { "comres.dll",     wn_comres_exports,    NULL },
     { "clbcatq.dll",    wn_clbcatq_exports,   NULL },
+    { "mpr.dll",        wn_mpr_exports,       NULL },
+    { "msimg32.dll",    wn_msimg32_exports,   NULL },
     { NULL, NULL, NULL },
 };
 

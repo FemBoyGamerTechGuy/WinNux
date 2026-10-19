@@ -9,7 +9,7 @@ DEFS    := -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 OPT     ?= -O2 -g
 INC     := -Iinclude
 
-CFLAGS  := $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) -fno-pic -no-pie \
+CFLAGS  := $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) \
            -fstack-protector-strong -MMD -MP
 LDLIBS  := -lpthread -ldl -lm
 
@@ -65,6 +65,17 @@ DBGOBJS := $(patsubst src/%.c,$(DBGOBJ)/%.o,$(SRCS)) $(DBGOBJ)/win/wow64_gates.o
 $(DBGOBJ)/win/wow64_gates.o: src/win/wow64_gates.S | $(DBGOBJ)
 	@mkdir -p $(dir $@)
 	$(CC) -c -o $@ $<
+
+
+# Signal-context files: no stack protector in ANY build (canary fs:0x28
+# reads fault when handlers are entered from compat mode, FS base 0).
+$(DBGOBJ)/win/wow64.o: src/win/wow64.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-stack-protector -c -o $@ $<
+
+$(DBGOBJ)/win/seh.o: src/win/seh.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-stack-protector -c -o $@ $<
 
 debug: $(DBGTGT)
 

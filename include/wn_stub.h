@@ -16,4 +16,9 @@ void *wn_stub_for(const char *dll, const char *name);
 /* Total number of distinct stubs created (for stats). */
 unsigned wn_stub_count(void);
 
+/* Curated stack WORDS a missing stdcall import pops, or -1 when unknown.
+ * Callers translating stubs for 32-bit guests use this to keep their stacks
+ * balanced (a missing stdcall import still cleans its own arg frame). */
+int wn_stub_pop_words_for(const char *dll, const char *name);
+
 #endif /* WN_STUB_H */

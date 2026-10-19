@@ -46,4 +46,11 @@ uint32_t wn_reg_enum_key(wn_reg_key *k, uint32_t idx, char *name, size_t cap);
 uint32_t wn_reg_enum_value(wn_reg_key *k, uint32_t idx, char *name, size_t cap,
                            uint32_t *type);
 
+/* Deletes (uninstaller support). delete_key removes an EMPTY subkey of
+ * `parent` (Windows semantics: non-empty keys fail with ACCESS_DENIED). */
+uint32_t wn_reg_delete_value(wn_reg_key *key, const char *name);
+uint32_t wn_reg_delete_key(wn_reg_key *parent, const char *name);
+uint32_t wn_reg_query_info(wn_reg_key *k, uint32_t *nsub, uint32_t *maxsub,
+                           uint32_t *nval, uint32_t *maxvn, uint32_t *maxvl);
+
 #endif /* WN_REGISTRY_H */

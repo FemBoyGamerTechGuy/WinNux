@@ -9,6 +9,7 @@
 #include "wn_backend.h"
 #include "wn_process.h"
 #include "wn_handle.h"
+#include "wn_wow64.h"
 #include "wn_log.h"
 #include "wn_util.h"
 #include "wn_font.h"
@@ -354,7 +355,12 @@ WN_API wn_handle g32_BeginPaint(wn_abiword hwnd, void *ps)
     wn_handle hdc = gdi_new(dc);
 
     memset(ps, 0, 68);
-    *(wn_handle *)(void *)ps = hdc;
+    /* PAINTSTRUCT.hdc is CALLER-width (4 bytes for an i386 guest): the
+     * 8-byte host handle store smashed fErase + rc fields. */
+    if (wn_wow64_guest32())
+        *(uint32_t *)(void *)ps = (uint32_t)(uintptr_t)hdc;
+    else
+        *(wn_handle *)(void *)ps = hdc;
     *(uint32_t *)(void *)((uint8_t *)ps + 8) = 1;   /* fErase */
     int32_t *rc = (int32_t *)((uint8_t *)ps + 0xC);
     rc[0] = l; rc[1] = t; rc[2] = r; rc[3] = b;
@@ -754,14 +760,17 @@ static WN_API int32_t g32_BitBlt(wn_handle dst, int dx0, int dy0, int w, int h,
     return 1;
 }
 
-/* SetDIBitsToDevice: app-provided DIB (usually bottom-up) -> DC. */
+/* SetDIBitsToDevice: app-provided DIB (usually bottom-up) -> DC.
+ * TWELVE stack words (StartScan was missing - it sits between YSrc and
+ * NumScans and the wow64 cleanup counts from this arity). */
 static WN_API int32_t g32_SetDIBitsToDevice(wn_handle hdc, int xdst, int ydst,
                                             uint32_t w, uint32_t h, int xsrc,
-                                            int ysrc, uint32_t lines,
+                                            int ysrc, uint32_t startscan,
+                                            uint32_t lines,
                                             const void *bits, const void *bmi,
                                             uint32_t usage)
 {
-    (void)usage; (void)lines;
+    (void)usage; (void)lines; (void)startscan;
     gdi_obj *d = gdi_get(hdc, GDI_DC_WINDOW);
     if (!d || !bits || !bmi)
         return 0;

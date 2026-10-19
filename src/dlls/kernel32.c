@@ -28,6 +28,8 @@
 #include <string.h>
 #include <sys/statvfs.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -215,18 +217,19 @@ static WN_API int32_t k32_GetModuleHandleExW(uint32_t flags,
         wn_module *m = wn_module_from_addr(name /* the address */, NULL);
         if (!m) {
             wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
-            *out = NULL;
+            wn_wow64_out_handle(out, 0);
             return 0;
         }
-        *out = (wn_handle)(uintptr_t)m->base;
+        wn_wow64_out_handle(out, (uint64_t)(uintptr_t)m->base);
         return 1;
     }
     if (!name) {
-        *out = (wn_handle)(uintptr_t)g_proc.exe->base;
+        wn_wow64_out_handle(out, (uint64_t)(uintptr_t)g_proc.exe->base);
         return 1;
     }
-    *out = k32_GetModuleHandleW(name);
-    return *out != NULL;
+    wn_handle r = k32_GetModuleHandleW(name);
+    wn_wow64_out_handle(out, (uint64_t)(uintptr_t)r);
+    return r != NULL;
 }
 
 static WN_API int32_t k32_GetModuleHandleExA(uint32_t flags, const char *name,
@@ -238,18 +241,19 @@ static WN_API int32_t k32_GetModuleHandleExA(uint32_t flags, const char *name,
         wn_module *m = wn_module_from_addr((const void *)(uintptr_t)name, NULL);
         if (!m) {
             wn_last_error_set(WN_ERR_MOD_NOT_FOUND);
-            *out = NULL;
+            wn_wow64_out_handle(out, 0);
             return 0;
         }
-        *out = (wn_handle)(uintptr_t)m->base;
+        wn_wow64_out_handle(out, (uint64_t)(uintptr_t)m->base);
         return 1;
     }
     if (!name) {
-        *out = (wn_handle)(uintptr_t)g_proc.exe->base;
+        wn_wow64_out_handle(out, (uint64_t)(uintptr_t)g_proc.exe->base);
         return 1;
     }
-    *out = k32_GetModuleHandleA(name);
-    return *out != NULL;
+    wn_handle r = k32_GetModuleHandleA(name);
+    wn_wow64_out_handle(out, (uint64_t)(uintptr_t)r);
+    return r != NULL;
 }
 
 static WN_API uint32_t k32_GetModuleFileNameA(wn_handle mod, char *out, uint32_t cap)
@@ -267,7 +271,7 @@ static WN_API uint32_t k32_GetModuleFileNameA(wn_handle mod, char *out, uint32_t
     size_t n = strlen(w);
     if (cap < n + 1) {
         wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
-        return (uint32_t)n;
+        return (uint32_t)n + 1;   /* required size incl NUL */
     }
     memcpy(out, w, n + 1);
     return (uint32_t)n;
@@ -287,7 +291,7 @@ static WN_API uint32_t k32_GetModuleFileNameW(wn_handle mod, uint16_t *out, uint
     if (cap < l + 1) {
         free(w);
         wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
-        return (uint32_t)l;
+        return (uint32_t)l + 1;   /* required size incl NUL */
     }
     memcpy(out, w, (l + 1) * 2);
     free(w);
@@ -616,15 +620,30 @@ static WN_API void *k32_GetProcAddress(wn_handle mod, const char *name)
         wn_last_error_set(WN_ERR_INVALID_HANDLE);
         return NULL;
     }
-    void *fn;
+    char namebuf[160];
+    const char *key = name;
     if ((uintptr_t)name & 0xFFFF0000ULL)
-        fn = wn_module_get_proc(m, name, 0, 0);
-    else
-        fn = wn_module_get_proc_ordinal(m, (uint32_t)(uintptr_t)name);
+        key = name;
+    else {
+        snprintf(namebuf, sizeof namebuf, "#%u", (uint32_t)(uintptr_t)name);
+        key = namebuf;
+    }
+    void *fn = ((uintptr_t)name & 0xFFFF0000ULL)
+        ? wn_module_get_proc(m, name, 0, 0)
+        : wn_module_get_proc_ordinal(m, (uint32_t)(uintptr_t)name);
     if (!fn) {
+        wn_log(WN_LOG_DEBUG, "gp: %s!%s -> NULL", m->name, key);
         wn_last_error_set(WN_ERR_PROC_NOT_FOUND);
         return NULL;
     }
+    wn_log(WN_LOG_DEBUG, "gp: %s!%s -> %p", m->name, key, fn);
+#if defined(__x86_64__)
+    if (g_wow64_active && m->kind == WN_MOD_BUILTIN) {
+        /* 32-bit caller: the raw impl pointer is a 64-bit host address the
+         * guest cannot call. Hand back the wow64 thunk stub. */
+        return (void *)(uintptr_t)wn_wow64_thunk_for(fn, m->name, key);
+    }
+#endif
     return fn;
 }
 
@@ -780,12 +799,231 @@ static WN_API int32_t k32_GetExitCodeThread(wn_handle h, uint32_t *code)
     return 1;
 }
 
+/* --- child processes ----------------------------------------------------------
+ * CreateProcess: the child is a full WinNux self-relaunch (exe = a PE inside
+ * the same prefix): fork + execv(/proc/self/exe, {run, exe, args...}). The
+ * process object wraps the pid so WaitForSingleObject/GetExitCodeProcess
+ * (used by every installer's [Run] step) work for real. */
+typedef struct {
+    pid_t pid;
+    int    reaped;
+    int    exit_code;
+} wn_child_proc;
+
+int wn_child_process_try(void *cp)
+{
+    wn_child_proc *c = cp;
+    if (!c || c->pid < 0)
+        return c && c->pid < 0 ? 0 : 0;
+    if (c->reaped)
+        return 1;
+    int st = 0;
+    pid_t r = waitpid(c->pid, &st, WNOHANG);
+    if (r == c->pid) {
+        c->reaped = 1;
+        c->exit_code = WIFEXITED(st) ? WEXITSTATUS(st)
+                    : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Split a Win32 command line (quote-aware) into argv. */
+static int split_cmdline(char *s, char *argv[], int max)
+{
+    int n = 0;
+    while (s && *s && n < max - 1) {
+        while (*s == ' ' || *s == '\t')
+            s++;
+        if (!*s)
+            break;
+        char *out = s, *cur = s;
+        int quoted = 0;
+        while (*s) {
+            if (*s == '"') {
+                quoted = !quoted;
+                s++;
+                continue;
+            }
+            if (!quoted && (*s == ' ' || *s == '\t'))
+                break;
+            /* collapse doubled quotes inside a quoted region */
+            *cur++ = *s++;
+        }
+        (void)out;
+        *cur = '\0';
+        argv[n++] = out;
+        if (*s)
+            s++;
+    }
+    argv[n] = NULL;
+    return n;
+}
+
+static int32_t create_process_common(const char *app_name, char *cmd_line,
+                                      uint32_t creation, const char *cur_dir,
+                                      const void *si, void *pi,
+                                      int wide)
+{
+    (void)creation;
+    if (!si || !pi) {
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+        return 0;
+    }
+    /* Resolve the image: lpApplicationName wins, else the first cmdline
+     * token. */
+    char exe_win[1024];
+    char *tokens[128];
+    int ntok = 0;
+    if (cmd_line)
+        ntok = split_cmdline(cmd_line, tokens, 128);
+    const char *img = app_name;
+    int img_tok = -1;
+    if (!img) {
+        if (ntok == 0) {
+            wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
+            return 0;
+        }
+        img = tokens[0];
+        img_tok = 0;
+    }
+    snprintf(exe_win, sizeof exe_win, "%s", img);
+
+    /* Windows appends .exe when the name has no extension. */
+    char host[1024];
+    if (wn_path_resolve_ci(exe_win, host, sizeof host) != 0) {
+        const char *dot = strrchr(exe_win, '.');
+        if (!dot || strchr(dot, '\\') || strchr(dot, '/')) {
+            size_t el = strlen(exe_win);
+            if (el + 5 <= sizeof exe_win) {
+                memcpy(exe_win + el, ".exe", 5);
+                if (wn_path_resolve_ci(exe_win, host, sizeof host) != 0) {
+                    wn_log(WN_LOG_WARN, "kernel32: CreateProcess '%s' not "
+                           "found", exe_win);
+                    wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
+                    return 0;
+                }
+            }
+        } else {
+            wn_log(WN_LOG_WARN, "kernel32: CreateProcess '%s' not found",
+                   exe_win);
+            wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
+            return 0;
+        }
+    }
+    char self[512];
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (sl <= 0) {
+        wn_last_error_set(WN_ERR_GEN_FAILURE);
+        return 0;
+    }
+    self[sl] = '\0';
+
+    char dir_host[1024];
+    dir_host[0] = '\0';
+    if (cur_dir) {
+        if (wn_path_resolve_ci(cur_dir, dir_host, sizeof dir_host) != 0)
+            dir_host[0] = '\0';
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        wn_last_error_set(WN_ERR_GEN_FAILURE);
+        return 0;
+    }
+    if (pid == 0) {
+        /* child: chdir, then exec our own loader with the guest args */
+        if (dir_host[0])
+            chdir(dir_host);
+        char *cargv[136];
+        int ca = 0;
+        cargv[ca++] = (char *)"winnux";
+        cargv[ca++] = (char *)"run";
+        cargv[ca++] = exe_win;
+        for (int i = 0; i < ntok; i++) {
+            if (img_tok == i)
+                continue;   /* the image token is the exe itself */
+            cargv[ca++] = tokens[i];
+        }
+        cargv[ca] = NULL;
+        execv(self, cargv);
+        _exit(127);
+    }
+
+    wn_child_proc *c = wn_xmalloc(sizeof *c);
+    c->pid = pid;
+    c->reaped = 0;
+    c->exit_code = 0;
+    wn_handle hp = wn_handle_alloc(WN_HTYPE_PROCESS, c);
+    wn_child_proc *tp = wn_xmalloc(sizeof *tp);
+    tp->pid = -1;
+    tp->reaped = 1;
+    tp->exit_code = 0;
+    wn_handle ht = wn_handle_alloc(WN_HTYPE_PROCESS, tp);
+
+    /* PROCESS_INFORMATION: caller-width layout (16 bytes for an i386
+     * caller: hProcess@0, hThread@4, pid@8, tid@0xc - all dwords). */
+    if (wn_wow64_guest32() || !wide) {
+        uint8_t *p = pi;
+        memset(p, 0, 16);
+        *(uint32_t *)(p + 0) = (uint32_t)(uintptr_t)hp;
+        *(uint32_t *)(p + 4) = (uint32_t)(uintptr_t)ht;
+        *(uint32_t *)(p + 8) = (uint32_t)pid;
+        *(uint32_t *)(p + 12) = (uint32_t)pid;
+    } else {
+        uint8_t *p = pi;
+        memset(p, 0, 24);
+        *(uint64_t *)(p + 0) = (uint64_t)(uintptr_t)hp;
+        *(uint64_t *)(p + 8) = (uint64_t)(uintptr_t)ht;
+        *(uint32_t *)(p + 16) = (uint32_t)pid;
+        *(uint32_t *)(p + 20) = (uint32_t)pid;
+    }
+    wn_log(WN_LOG_INFO, "kernel32: CreateProcess('%s') pid %d", exe_win,
+           (int)pid);
+    return 1;
+}
+
+static WN_API int32_t k32_CreateProcessA(
+    const char *app, char *cmd, void *pa, void *ta, uint32_t inherit,
+    uint32_t creation, const char *env, const char *dir, const void *si,
+    void *pi)
+{
+    (void)pa; (void)ta; (void)inherit; (void)env;
+    return create_process_common(app, cmd, creation, dir, si, pi, 0);
+}
+
+static WN_API int32_t k32_CreateProcessW(
+    const uint16_t *app, uint16_t *cmd, void *pa, void *ta, uint32_t inherit,
+    uint32_t creation, const uint16_t *env, const uint16_t *dir,
+    const void *si, void *pi)
+{
+    (void)pa; (void)ta; (void)inherit; (void)env;
+    char *a = app ? wn_utf16_to_utf8(app, 1024) : NULL;
+    char *c = cmd ? wn_utf16_to_utf8(cmd, 8192) : NULL;
+    char *d = dir ? wn_utf16_to_utf8(dir, 1024) : NULL;
+    int r = create_process_common(a, c, creation, d, si, pi, 1);
+    free(a); free(c); free(d);
+    return r;
+}
+
 static WN_API int32_t k32_GetExitCodeProcess(wn_handle h, uint32_t *code)
 {
-    (void)h;
-    if (!code)
+    wn_object *o = wn_handle_acquire(h, 0);
+    if (!o || o->type != WN_HTYPE_PROCESS) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
         return 0;
-    *code = 259;
+    }
+    wn_child_proc *c = o->ptr;
+    if (c->pid < 0) {
+        if (code)
+            *code = 0;
+        wn_handle_release(o);
+        return 1;
+    }
+    wn_child_process_try(c);
+    if (code)
+        *code = c->reaped ? (uint32_t)(int32_t)c->exit_code : 259;
+    wn_handle_release(o);
     return 1;
 }
 
@@ -826,6 +1064,50 @@ static WN_API void k32_GetSystemTimeAsFileTime(wn_filetime *ft)
                + WN_FILETIME_UNIX_OFFSET;
     ft->lo = (uint32_t)v;
     ft->hi = (uint32_t)(v >> 32);
+}
+
+/* Local <-> UTC FILETIME: one hour offset keeps timestamps ordered; real
+ * zone handling needs tzset(). CompareFileTime: -1/0/+1. */
+static WN_API int32_t k32_FileTimeToLocalFileTime(const wn_filetime *in,
+                                                  wn_filetime *out)
+{
+    if (!in || !out)
+        return 0;
+    uint64_t v = (uint64_t)in->lo | ((uint64_t)in->hi << 32);
+    long tz = 0;
+    tzset();
+    tz = -timezone / 60;   /* minutes east (timezone is seconds west) */
+    v += (uint64_t)(int64_t)tz * 600000000LL;
+    out->lo = (uint32_t)v;
+    out->hi = (uint32_t)(v >> 32);
+    return 1;
+}
+
+static WN_API int32_t k32_LocalFileTimeToFileTime(const wn_filetime *in,
+                                                  wn_filetime *out)
+{
+    if (!in || !out)
+        return 0;
+    uint64_t v = (uint64_t)in->lo | ((uint64_t)in->hi << 32);
+    long tz = 0;
+    tzset();
+    tz = -timezone / 60;
+    v -= (uint64_t)(int64_t)tz * 600000000LL;
+    out->lo = (uint32_t)v;
+    out->hi = (uint32_t)(v >> 32);
+    return 1;
+}
+
+static WN_API int32_t k32_CompareFileTime(const wn_filetime *a,
+                                          const wn_filetime *b)
+{
+    if (!a || !b)
+        return 0;
+    if (a->hi != b->hi)
+        return a->hi < b->hi ? -1 : 1;
+    if (a->lo != b->lo)
+        return a->lo < b->lo ? -1 : 1;
+    return 0;
 }
 
 static WN_API uint32_t k32_GetTickCount(void)
@@ -909,17 +1191,42 @@ static WN_API int32_t k32_VirtualProtect(void *addr, wn_abiword size, uint32_t p
     return 1;
 }
 
-static WN_API uint32_t k32_VirtualQuery(void *addr, void *mbi)
+static WN_API uint32_t k32_VirtualQuery(void *addr, void *mbi,
+                                         uint32_t length)
 {
-    /* MEMORY_BASIC_INFORMATION: 48 bytes on x64, 28 on i386 (4-byte fields,
-     * 7 of them — NOT sizeof(void*)*6 which gives 24 on i386). */
-    if (!wn_virtual_query(addr, mbi))
+    /* VirtualQuery(addr, mbi, dwLength) - THREE stack words. The wow64
+     * thunk derives its cleanup from this arity; a mismatch corrupts the
+     * 32-bit guest stack (LuaForWindows installer crash).
+     * MEMORY_BASIC_INFORMATION: 48 bytes on x64, 28 on i386 (4-byte fields,
+     * 7 of them). The GUEST's bitness picks the layout - detected from
+     * dwLength when possible, and from the dispatch flag otherwise. */
+    int guest32 = wn_wow64_guest32();
+    if (length != 0 && length < (guest32 ? 28u : 48u))
         return 0;
+    if (!guest32) {
+        if (!wn_virtual_query(addr, mbi))
+            return 0;
 #if defined(__x86_64__)
-    return 48;
+        return 48;
 #else
-    return 28;
+        return 28;
 #endif
+    }
+    /* i386 caller: query into a host-layout buffer, translate down. */
+    uint8_t host[48];
+    if (!wn_virtual_query(addr, host))
+        return 0;
+    /* x64 MBI: base@0(8), alloc_base@8(8), alloc_prot@16(4), region_size
+     * @24(8), state@32(4), protect@36(4), type@40(4) -> i386: 4-byte fields. */
+    uint8_t *o = mbi;
+    *(uint32_t *)(o + 0)  = (uint32_t)*(uint64_t *)(host + 0);
+    *(uint32_t *)(o + 4)  = (uint32_t)*(uint64_t *)(host + 8);
+    *(uint32_t *)(o + 8)  = *(uint32_t *)(host + 16);
+    *(uint32_t *)(o + 12) = (uint32_t)*(uint64_t *)(host + 24);
+    *(uint32_t *)(o + 16) = *(uint32_t *)(host + 32);
+    *(uint32_t *)(o + 20) = *(uint32_t *)(host + 36);
+    *(uint32_t *)(o + 24) = *(uint32_t *)(host + 40);
+    return 28;
 }
 
 static WN_API wn_handle k32_GetProcessHeap(void)
@@ -999,8 +1306,16 @@ static WN_API int32_t k32_HeapDestroy(wn_handle h)
 /* Global/Local: fixed allocations only (documented limitation). */
 static WN_API void *k32_GlobalAlloc(uint32_t flags, wn_abiword size)
 {
-    void *p = (flags & 0x40 /* GMEM_ZEROINIT */) ? calloc(1, (size_t)size)
-                                                 : malloc((size_t)size);
+    void *p;
+    if (g_wow64_active) {
+        /* 32-bit guests: low arena only (host pointers truncate) */
+        p = wn_low_malloc((size_t)size);
+        if (p && (flags & 0x40))
+            memset(p, 0, (size_t)size);
+    } else {
+        p = (flags & 0x40 /* GMEM_ZEROINIT */) ? calloc(1, (size_t)size)
+                                               : malloc((size_t)size);
+    }
     if (!p)
         wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
     return p;
@@ -1019,15 +1334,17 @@ static WN_API int32_t k32_GlobalUnlock(wn_handle h)
 
 static WN_API uint64_t k32_GlobalSize(wn_handle h)
 {
-    {   if (g_wow64_active)
+    if (g_wow64_active)
         return (uint64_t)wn_low_usable((void *)(uintptr_t)h);
     return malloc_usable_size((void *)(uintptr_t)h);
-}
 }
 
 static WN_API wn_handle k32_GlobalFree(wn_handle h)
 {
-    free((void *)(uintptr_t)h);
+    if (g_wow64_active)
+        wn_low_free((void *)(uintptr_t)h);
+    else
+        free((void *)(uintptr_t)h);
     return 0;
 }
 
@@ -1419,6 +1736,45 @@ static WN_API int32_t k32_MoveFileA(const char *from, const char *to)
     return 1;
 }
 
+static WN_API int32_t k32_MoveFileExA(const char *from, const char *to,
+                                      uint32_t flags)
+{
+    if (!to) {
+        /* MOVEFILE_DELAY...: not supported; DELETE_ON_WRITE-through is
+         * approximated by unlink (installers use it for restart-delete). */
+        char hf[1024];
+        if (wn_path_resolve_ci(from, hf, sizeof hf) != 0)
+            return 0;
+        return unlink(hf) == 0;
+    }
+    char hf[1024], ht[1024];
+    if (wn_path_resolve_ci(from, hf, sizeof hf) != 0 ||
+        wn_path_win_to_host(to, ht, sizeof ht) != 0) {
+        wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
+        return 0;
+    }
+    if (!(flags & 0x1 /* MOVEFILE_REPLACE_EXISTING */))
+        if (access(ht, F_OK) == 0) {
+            wn_last_error_set(WN_ERR_ALREADY_EXISTS);
+            return 0;
+        }
+    if (rename(hf, ht) != 0) {
+        wn_last_error_set(WN_ERR_ACCESS_DENIED);
+        return 0;
+    }
+    return 1;
+}
+
+static WN_API int32_t k32_MoveFileExW(const uint16_t *from, const uint16_t *to,
+                                      uint32_t flags)
+{
+    char *f = from ? wn_utf16_to_utf8(from, 4096) : NULL;
+    char *t = to ? wn_utf16_to_utf8(to, 4096) : NULL;
+    int32_t r = k32_MoveFileExA(f, t, flags);
+    free(f); free(t);
+    return r;
+}
+
 static WN_API int32_t k32_CopyFileA(const char *from, const char *to,
                                     int32_t fail_exists)
 {
@@ -1466,6 +1822,7 @@ static WN_API int32_t k32_CopyFileA(const char *from, const char *to,
 static WN_API int32_t k32_CreateDirectoryA(const char *name, void *sa)
 {
     (void)sa;
+    wn_log(WN_LOG_DEBUG, "mkdir A: \"%s\"", name ? name : "(null)");
     char host[1024];
     if (wn_path_resolve_ci(name, host, sizeof host) == 0) {
         wn_last_error_set(WN_ERR_ALREADY_EXISTS);
@@ -1509,11 +1866,14 @@ static WN_API uint32_t k32_GetFileAttributesA(const char *name)
 {
     char host[1024];
     if (wn_path_resolve_ci(name, host, sizeof host) != 0) {
+        wn_log(WN_LOG_DEBUG, "gfa A miss: \"%s\" -> %u", name ? name : "(null)",
+               wn_last_error_get());
         wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
         return 0xFFFFFFFF;
     }
     struct stat st;
     if (stat(host, &st) != 0) {
+        wn_log(WN_LOG_DEBUG, " gfa A stat-fail \"%s\"", name ? name : "(null)");
         wn_last_error_set(WN_ERR_ACCESS_DENIED);
         return 0xFFFFFFFF;
     }
@@ -1555,7 +1915,7 @@ static WN_API uint32_t k32_GetCurrentDirectoryA(uint32_t cap, char *buf)
     size_t n = strlen(cwd);
     if (!buf || cap < n + 1) {
         wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
-        return (uint32_t)n;
+        return (uint32_t)n + 1;   /* required size incl NUL */
     }
     memcpy(buf, cwd, n + 1);
     return (uint32_t)n;
@@ -1640,16 +2000,29 @@ static uint32_t full_path_name(const char *name, uint32_t cap, char *buf,
     clean[oi] = 0;
 
     /* The Windows contract: if the buffer is too small, return the needed
-     * size WITHOUT writing. */
+     * size INCLUDING the terminating null (success returns it WITHOUT).
+     * Returning the no-null length here is indistinguishable from success
+     * and left Inno Setup's temp-dir walk with an empty path. */
     size_t need = oi + 1;
     if (!buf || cap < need) {
+        wn_log(WN_LOG_DEBUG, " gfpn TOO-SMALL need=%u cap=%u buf=%p",
+               (unsigned)need, cap, buf);
         wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
-        return (uint32_t)need - 1;
+        return (uint32_t)need;
     }
     memcpy(buf, clean, need);
     if (part) {
         char *last = strrchr(buf, '\\');
-        *part = last ? last + 1 : buf;
+        char *val = last ? last + 1 : buf;
+        /* lpFilePart is a POINTER out-param: write it with the CALLER's
+         * pointer width. A 32-bit guest passes &lpFilePart adjacent to
+         * its buffer (Inno: part == buf-4); the 8-byte host write smashes
+         * the first 4 buffer bytes with the high zero dword, turning the
+         * normalized path into an empty string. */
+        if (wn_wow64_guest32())
+            *(uint32_t *)(void *)part = (uint32_t)(uintptr_t)val;
+        else
+            *part = val;
     }
     return (uint32_t)oi;
 }
@@ -1657,7 +2030,13 @@ static uint32_t full_path_name(const char *name, uint32_t cap, char *buf,
 static WN_API uint32_t k32_GetFullPathNameA(const char *name, uint32_t cap,
                                             char *buf, char **part)
 {
-    return full_path_name(name, cap, buf, part);
+    uint32_t r = full_path_name(name, cap, buf, part);
+    wn_log(WN_LOG_DEBUG, " gfpn A name=%p cap=%u buf=%p part=%p -> "
+           "hex=%02x%02x%02x%02x \"%s\" (r=%u)", name, cap, buf, part,
+           buf ? (uint8_t)buf[0] : 0, buf ? (uint8_t)buf[1] : 0,
+           buf ? (uint8_t)buf[2] : 0, buf ? (uint8_t)buf[3] : 0,
+           buf ? buf : "", r);
+    return r;
 }
 
 static WN_API uint32_t k32_GetFullPathNameW(const uint16_t *name, uint32_t cap,
@@ -1695,7 +2074,11 @@ static WN_API uint32_t k32_GetFullPathNameW(const uint16_t *name, uint32_t cap,
         for (uint16_t *q = buf; *q; q++)
             if (*q == '\\')
                 last = q + 1;
-        *part = last;
+        /* Caller-width pointer store (see the A variant note). */
+        if (wn_wow64_guest32())
+            *(uint32_t *)(void *)part = (uint32_t)(uintptr_t)last;
+        else
+            *part = last;
     }
     return (uint32_t)units;
 }
@@ -1706,7 +2089,7 @@ static WN_API uint32_t k32_GetTempPathA(uint32_t cap, char *buf)
     size_t n = strlen(t);
     if (cap < n + 1) {
         wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
-        return (uint32_t)n;
+        return (uint32_t)n + 1;   /* required size incl NUL */
     }
     memcpy(buf, t, n + 1);
     return (uint32_t)n;
@@ -2147,34 +2530,49 @@ static WN_API uint32_t k32_WaitForMultipleObjectsEx(uint32_t count,
 
 static WN_API void k32_InitializeCriticalSection(wn_critsect *cs)
 {
-    wn_critsect_init(cs, 0);
+    if (g_wow64_active)
+        wn_critsect32_init(cs, 0);
+    else
+        wn_critsect_init(cs, 0);
 }
 
 static WN_API int32_t k32_InitializeCriticalSectionAndSpinCount(wn_critsect *cs,
                                                                 uint32_t spin)
 {
-    wn_critsect_init(cs, spin);
+    if (g_wow64_active)
+        wn_critsect32_init(cs, spin);
+    else
+        wn_critsect_init(cs, spin);
     return 1;
 }
 
 static WN_API void k32_EnterCriticalSection(wn_critsect *cs)
 {
-    wn_critsect_enter(cs);
+    if (g_wow64_active)
+        wn_critsect32_enter(cs);
+    else
+        wn_critsect_enter(cs);
 }
 
 static WN_API void k32_LeaveCriticalSection(wn_critsect *cs)
 {
-    wn_critsect_leave(cs);
+    if (g_wow64_active)
+        wn_critsect32_leave(cs);
+    else
+        wn_critsect_leave(cs);
 }
 
 static WN_API int32_t k32_TryEnterCriticalSection(wn_critsect *cs)
 {
-    return wn_critsect_try(cs);
+    return g_wow64_active ? wn_critsect32_try(cs) : wn_critsect_try(cs);
 }
 
 static WN_API void k32_DeleteCriticalSection(wn_critsect *cs)
 {
-    wn_critsect_delete(cs);
+    if (g_wow64_active)
+        wn_critsect32_delete(cs);
+    else
+        wn_critsect_delete(cs);
 }
 
 /* --- strings / codepages ------------------------------------------------------------ */
@@ -2221,6 +2619,76 @@ static WN_API int32_t k32_lstrcmpA(const char *a, const char *b)
     return (r > 0) - (r < 0);
 }
 
+/* CompareStringA(Locale, dwCmpFlags, s1, cch1, s2, cch2): CSTR_EQUAL 2,
+ * CSTR_LESS_THAN 1, CSTR_GREATER_THAN 3. Inno compares paths/versions. */
+static WN_API int32_t k32_CompareStringA(uint32_t locale, uint32_t flags,
+                                         const char *s1, int32_t n1,
+                                         const char *s2, int32_t n2)
+{
+    (void)locale;
+    if (n1 < 0)
+        n1 = s1 ? (int32_t)strlen(s1) : 0;
+    if (n2 < 0)
+        n2 = s2 ? (int32_t)strlen(s2) : 0;
+    size_t n = (size_t)(n1 < n2 ? n1 : n2);
+    for (size_t i = 0; i < n; i++) {
+        int ca = (unsigned char)s1[i], cb = (unsigned char)s2[i];
+        if (flags & 0x1 /* NORM_IGNORECASE */) {
+            ca = tolower(ca);
+            cb = tolower(cb);
+        }
+        if (ca != cb)
+            return ca < cb ? 1 : 3;
+    }
+    if (n1 == n2)
+        return 2;
+    return n1 < n2 ? 1 : 3;
+}
+
+static WN_API int32_t k32_CompareStringW(uint32_t locale, uint32_t flags,
+                                         const uint16_t *s1, int32_t n1,
+                                         const uint16_t *s2, int32_t n2)
+{
+    (void)locale;
+    if (n1 < 0) {
+        n1 = 0;
+        if (s1)
+            while (s1[n1])
+                n1++;
+    }
+    if (n2 < 0) {
+        n2 = 0;
+        if (s2)
+            while (s2[n2])
+                n2++;
+    }
+    size_t n = (size_t)(n1 < n2 ? n1 : n2);
+    for (size_t i = 0; i < n; i++) {
+        int ca = s1[i], cb = s2[i];
+        if (flags & 0x1) {
+            ca = tolower(ca);
+            cb = tolower(cb);
+        }
+        if (ca != cb)
+            return ca < cb ? 1 : 3;
+    }
+    if (n1 == n2)
+        return 2;
+    return n1 < n2 ? 1 : 3;
+}
+
+/* OpenProcess: the child-wait surface needs a usable pseudo handle. */
+static WN_API wn_handle k32_OpenProcess(uint32_t access, int32_t inherit,
+                                        uint32_t pid)
+{
+    (void)access; (void)inherit;
+    wn_child_proc *c = wn_xmalloc(sizeof *c);
+    c->pid = (pid_t)pid;
+    c->reaped = 0;
+    c->exit_code = 0;
+    return wn_handle_alloc(WN_HTYPE_PROCESS, c);
+}
+
 static WN_API int32_t k32_lstrcmpiA(const char *a, const char *b)
 {
     for (const char *p = a ? a : "", *q = b ? b : ""; ; p++, q++) {
@@ -2253,7 +2721,16 @@ static WN_API int32_t k32_lstrcmpiW(const uint16_t *a, const uint16_t *b)
 }
 
 /* GetStringTypeW: per-character Windows classes. info[] gets one WORD per
- * character (not flags-ORed together - see MSDN: "array of 16-bit values"). */
+ * character (not flags-ORed together - see MSDN: "array of 16-bit values").
+ *
+ * ABI FACT (verified against mingw-w64's winnls.h and real kernel32.dll):
+ * the PLAIN GetStringTypeW has NO Locale parameter - only the A and Ex
+ * variants are locale-first (the W one works on code points, so the SDK
+ * ships a 4-parameter prototype). A 5-parameter implementation here
+ * shifted every argument right by one slot: info_type received the lpSrcStr
+ * POINTER, count received the lpCharType pointer, and callers read untouched
+ * buffers (t15: every ctype check failed). Locale-first callers must use
+ * GetStringTypeExW below - that is what the SDK's Ex names are for. */
 static WN_API int32_t k32_GetStringTypeW(uint32_t info_type,
                                          const uint16_t *src, int32_t count,
                                          uint16_t *info)
@@ -2281,6 +2758,18 @@ static WN_API int32_t k32_GetStringTypeW(uint32_t info_type,
         }
     }
     return 1;
+}
+
+/* GetStringTypeExW/A: the locale-first, SDK-recommended spellings
+ * (Locale, dwInfoType, lpSrcStr, cchSrc, lpCharType). W ignores Locale
+ * (code points); A needs it only for the code page, which we do not use. */
+static WN_API int32_t k32_GetStringTypeExW(uint32_t locale,
+                                           uint32_t info_type,
+                                           const uint16_t *src, int32_t count,
+                                           uint16_t *info)
+{
+    (void)locale;
+    return k32_GetStringTypeW(info_type, src, count, info);
 }
 
 static WN_API int32_t k32_GetStringTypeA(uint32_t locale, uint32_t info_type,
@@ -2602,6 +3091,8 @@ static WN_API uint32_t k32_GetEnvironmentVariableA(const char *name, char *buf,
                                                    uint32_t cap)
 {
     char *v = env_lookup(name);
+    wn_log(WN_LOG_DEBUG, " getenv A \"%s\" -> %s", name ? name : "(null)",
+           v ? v : "(missing)");
     if (!v) {
         wn_last_error_set(203 /* ERROR_ENVVAR_NOT_FOUND */);
         return 0;
@@ -2609,7 +3100,7 @@ static WN_API uint32_t k32_GetEnvironmentVariableA(const char *name, char *buf,
     size_t n = strlen(v);
     if (!buf || cap < n + 1) {
         wn_last_error_set(WN_ERR_INSUFFICIENT_BUFFER);
-        return (uint32_t)n;
+        return (uint32_t)n + 1;   /* required size incl NUL */
     }
     memcpy(buf, v, n + 1);
     return (uint32_t)n;
@@ -2711,6 +3202,28 @@ static WN_API uint32_t k32_SetThreadAffinityMask(wn_handle h, wn_abiword mask)
 
 static WN_API void k32_GetSystemInfo(void *si)
 {
+    /* Layout depends on the CALLER's bitness, not the host build: the
+     * in-process wow64 layer serves i386 guests from this x86-64 binary
+     * (LuaForWindows installer: the x64 layout overflowed the 36-byte
+     * guest struct and misaligned every field after dwPageSize). */
+    if (wn_wow64_guest32()) {
+        /* SYSTEM_INFO i386: 36 bytes, pointers 4.
+         * oemId@0, pageSize@4, lpMin@8, lpMax@12, mask@16, nprocs@20,
+         * procType@24, granularity@28, level@32, rev@34. */
+        memset(si, 0, 36);
+        uint8_t *p = si;
+        *(uint32_t *)(p + 0) = 0;               /* arch 0 = x86           */
+        *(uint32_t *)(p + 4) = 4096;            /* dwPageSize             */
+        *(uint32_t *)(p + 8) = 0x10000;         /* lpMinimumAppAddress    */
+        *(uint32_t *)(p + 12) = 0x7FFEFFFF;     /* lpMaximumAppAddress    */
+        *(uint32_t *)(p + 16) = 1;              /* dwActiveProcessorMask  */
+        *(uint32_t *)(p + 20) = 1;              /* dwNumberOfProcessors   */
+        *(uint32_t *)(p + 24) = 586;            /* PROCESSOR_INTEL_PENTIUM */
+        *(uint32_t *)(p + 28) = 0x10000;        /* granularity            */
+        *(uint16_t *)(p + 32) = 6;              /* wProcessorLevel        */
+        *(uint16_t *)(p + 34) = 0;              /* wProcessorRevision     */
+        return;
+    }
 #if defined(__x86_64__)
     /* SYSTEM_INFO x64: 48 bytes, pointers 8.
      * arch@0, pageSize@4, lpMin@8, lpMax@16, mask@24, nprocs@32,
@@ -2726,24 +3239,17 @@ static WN_API void k32_GetSystemInfo(void *si)
     *(uint32_t *)(p + 36) = 8664;             /* PROCESSOR_AMD_X8664         */
     *(uint32_t *)(p + 40) = 0x10000;          /* allocation granularity      */
 #else
-    /* SYSTEM_INFO i386: 36 bytes, pointers 4.
-     * oemId@0, pageSize@4, lpMin@8, lpMax@12, mask@16, nprocs@20,
-     * procType@24, granularity@28, level@32, rev@34. The old code wrote the
-     * 48-byte x64 layout here, overflowing guest locals and putting
-     * dwNumberOfProcessors/dwAllocationGranularity at offsets the 32-bit
-     * struct doesn't have — Delphi's VirtualQuery walker then computed
-     * its region steps from zeroed fields and walked off the map. */
     memset(si, 0, 36);
     uint8_t *p = si;
-    *(uint32_t *)(p + 4) = 4096;              /* dwPageSize                   */
-    *(uint32_t *)(p + 8) = 0x10000;           /* lpMinimumApplicationAddress  */
-    *(uint32_t *)(p + 12) = 0x7FFEFFFF;       /* lpMaximumApplicationAddress  */
-    *(uint32_t *)(p + 16) = 1;                /* dwActiveProcessorMask        */
-    *(uint32_t *)(p + 20) = 1;                /* dwNumberOfProcessors         */
-    *(uint32_t *)(p + 24) = 586;              /* PROCESSOR_INTEL_PENTIUM      */
-    *(uint32_t *)(p + 28) = 0x10000;          /* dwAllocationGranularity      */
-    *(uint16_t *)(p + 32) = 6;                /* wProcessorLevel              */
-    *(uint16_t *)(p + 34) = 0;                /* wProcessorRevision           */
+    *(uint32_t *)(p + 4) = 4096;
+    *(uint32_t *)(p + 8) = 0x10000;
+    *(uint32_t *)(p + 12) = 0x7FFEFFFF;
+    *(uint32_t *)(p + 16) = 1;
+    *(uint32_t *)(p + 20) = 1;
+    *(uint32_t *)(p + 24) = 586;
+    *(uint32_t *)(p + 28) = 0x10000;
+    *(uint16_t *)(p + 32) = 6;
+    *(uint16_t *)(p + 34) = 0;
 #endif
 }
 
@@ -2900,7 +3406,14 @@ static uint32_t res_find_in_dir(wn_module *m, const uint8_t *dirbase,
 
 static wn_res_handle *res_make(wn_module *m, uint32_t rva, uint32_t size)
 {
-    wn_res_handle *h = wn_xmalloc(sizeof *h);
+    /* HRSRC is an opaque POINTER handed to the guest and passed back in
+     * later SizeofResource/LockResource calls. A 32-bit guest truncates it
+     * to 32 bits, so under wow64 it MUST live below 4GB (LuaForWindows
+     * installer: truncated host-heap pointer -> SizeofResource segfault). */
+    wn_res_handle *h = g_wow64_active
+        ? wn_low_malloc(sizeof *h) : wn_xmalloc(sizeof *h);
+    if (!h)
+        return NULL;
     h->magic = WN_RES_MAGIC;
     h->mod = m;
     h->rva = rva;
@@ -3003,6 +3516,107 @@ static WN_API int32_t k32_Beep(uint32_t freq, uint32_t dur)
     (void)freq;
     (void)dur;
     return 1;
+}
+
+/* --- Interlocked family -------------------------------------------------------
+ * The 32-bit (LONG) variants operate on 4-byte objects regardless of the
+ * guest's bitness; the *Pointer variants are pointer-sized (4 bytes for an
+ * i386 caller even on this x86-64 host build). NSIS calls Interlocked*
+ * for its init-once/CRC guards and REQUIRES the real old-value semantics. */
+static WN_API int32_t k32_InterlockedIncrement(int32_t *p)
+{
+    return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST);
+}
+
+static WN_API int32_t k32_InterlockedDecrement(int32_t *p)
+{
+    return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST);
+}
+
+static WN_API int32_t k32_InterlockedExchange(int32_t *p, int32_t v)
+{
+    int32_t old;
+    __atomic_exchange(p, &v, &old, __ATOMIC_SEQ_CST);
+    return old;
+}
+
+static WN_API int32_t k32_InterlockedExchangeAdd(int32_t *p, int32_t v)
+{
+    return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST);
+}
+
+static WN_API int32_t k32_InterlockedCompareExchange(int32_t *p, int32_t exch,
+                                                     int32_t comp)
+{
+    int32_t expected = comp;
+    __atomic_compare_exchange(p, &expected, &exch, 0,
+                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expected;
+}
+
+/* 64-bit variants (also serve *Pointer for 64-bit callers). */
+static WN_API int64_t k32_InterlockedExchange64(int64_t *p, int64_t v)
+{
+    int64_t old;
+    __atomic_exchange(p, &v, &old, __ATOMIC_SEQ_CST);
+    return old;
+}
+
+static WN_API int64_t k32_InterlockedCompareExchange64(int64_t *p,
+                                                       int64_t exch,
+                                                       int64_t comp)
+{
+    int64_t expected = comp;
+    __atomic_compare_exchange(p, &expected, &exch, 0,
+                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expected;
+}
+
+static WN_API int64_t k32_InterlockedIncrement64(int64_t *p)
+{
+    return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST);
+}
+
+static WN_API int64_t k32_InterlockedDecrement64(int64_t *p)
+{
+    return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST);
+}
+
+static WN_API int64_t k32_InterlockedExchangeAdd64(int64_t *p, int64_t v)
+{
+    return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST);
+}
+
+/* Interlocked[Compare]Exchange[Add]Pointer: pointer-sized - an i386 caller
+ * gets 4-byte semantics even on the x86-64 host build (wow64 in-process). */
+static WN_API wn_abiword k32_InterlockedExchangePointer(wn_abiword *p,
+                                                        wn_abiword v)
+{
+    if (wn_wow64_guest32()) {
+        int32_t *p32 = (int32_t *)(uintptr_t)p, old;
+        int32_t v32 = (int32_t)v;
+        __atomic_exchange(p32, &v32, &old, __ATOMIC_SEQ_CST);
+        return (wn_abiword)(uint32_t)old;
+    }
+    wn_abiword old;
+    __atomic_exchange(p, &v, &old, __ATOMIC_SEQ_CST);
+    return old;
+}
+
+static WN_API wn_abiword k32_InterlockedCompareExchangePointer(
+    wn_abiword *p, wn_abiword exch, wn_abiword comp)
+{
+    if (wn_wow64_guest32()) {
+        int32_t *p32 = (int32_t *)(uintptr_t)p, expected = (int32_t)comp,
+                 exch32 = (int32_t)exch;
+        __atomic_compare_exchange(p32, &expected, &exch32, 0,
+                                  __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        return (wn_abiword)(uint32_t)expected;
+    }
+    wn_abiword expected = comp;
+    __atomic_compare_exchange(p, &expected, &exch, 0,
+                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expected;
 }
 
 /* --- locale ----------------------------------------------------------------- */
@@ -3257,6 +3871,16 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "CreateFileW", k32_CreateFileW },
     { "CreateMutexA", k32_CreateMutexA },
     { "CreateMutexW", k32_CreateMutexW },
+    { "CreateProcessA", k32_CreateProcessA },
+    { "CompareFileTime", k32_CompareFileTime },
+    { "CompareStringA", k32_CompareStringA },
+    { "CompareStringW", k32_CompareStringW },
+    { "FileTimeToLocalFileTime", k32_FileTimeToLocalFileTime },
+    { "LocalFileTimeToFileTime", k32_LocalFileTimeToFileTime },
+    { "MoveFileExA", k32_MoveFileExA },
+    { "MoveFileExW", k32_MoveFileExW },
+    { "OpenProcess", k32_OpenProcess },
+    { "CreateProcessW", k32_CreateProcessW },
     { "CreateSemaphoreA", k32_CreateSemaphoreA },
     { "CreateThread", k32_CreateThread },
     { "DecodePointer", k32_DecodePointer },
@@ -3323,6 +3947,18 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "GetTempPathA", k32_GetTempPathA },
     { "GetTickCount", k32_GetTickCount },
     { "GetTickCount64", k32_GetTickCount64 },
+    { "InterlockedCompareExchange", k32_InterlockedCompareExchange },
+    { "InterlockedCompareExchange64", k32_InterlockedCompareExchange64 },
+    { "InterlockedCompareExchangePointer", k32_InterlockedCompareExchangePointer },
+    { "InterlockedDecrement", k32_InterlockedDecrement },
+    { "InterlockedDecrement64", k32_InterlockedDecrement64 },
+    { "InterlockedExchange", k32_InterlockedExchange },
+    { "InterlockedExchange64", k32_InterlockedExchange64 },
+    { "InterlockedExchangeAdd", k32_InterlockedExchangeAdd },
+    { "InterlockedExchangeAdd64", k32_InterlockedExchangeAdd64 },
+    { "InterlockedExchangePointer", k32_InterlockedExchangePointer },
+    { "InterlockedIncrement", k32_InterlockedIncrement },
+    { "InterlockedIncrement64", k32_InterlockedIncrement64 },
     { "GetVersion", k32_GetVersion },
     { "GetVersionExA", k32_GetVersionExA },
     { "GetVersionExW", k32_GetVersionExW },
@@ -3359,6 +3995,8 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "lstrcmpiW", k32_lstrcmpiW },
     { "lstrcmpW", k32_lstrcmpW },
     { "GetStringTypeA", k32_GetStringTypeA },
+    { "GetStringTypeExA", k32_GetStringTypeA },
+    { "GetStringTypeExW", k32_GetStringTypeExW },
     { "GetStringTypeW", k32_GetStringTypeW },
     { "LCMapStringA", k32_LCMapStringA },
     { "LCMapStringW", k32_LCMapStringW },

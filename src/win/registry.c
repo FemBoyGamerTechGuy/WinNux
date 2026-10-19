@@ -325,3 +325,73 @@ void wn_registry_init(void)
     set_str(WN_HKEY_CURRENT_USER, "Environment", "TEMP", "C:\\windows\\temp");
     set_str(WN_HKEY_CURRENT_USER, "Environment", "TMP", "C:\\windows\\temp");
 }
+
+/* --- deletes (uninstaller support) --------------------------------------------
+ * Inno's uninstaller removes its own keys and values one by one; without
+ * these the prefix never returns to a clean state. */
+uint32_t wn_reg_delete_value(wn_reg_key *key, const char *name)
+{
+    if (!key)
+        return WN_ERR_INVALID_HANDLE;
+    wn_reg_value **pp = &key->first_value;
+    for (wn_reg_value *v = *pp; v; pp = &v->next, v = v->next) {
+        if (wn_strcaseeq(v->name, name)) {
+            *pp = v->next;
+            free(v->name);
+            free(v->data);
+            free(v);
+            return WN_ERR_SUCCESS;
+        }
+    }
+    return WN_ERR_FILE_NOT_FOUND;
+}
+
+uint32_t wn_reg_delete_key(wn_reg_key *parent, const char *name)
+{
+    if (!parent)
+        return WN_ERR_INVALID_HANDLE;
+    wn_reg_key **pp = &parent->first_child;
+    for (wn_reg_key *c = *pp; c; pp = &c->next_sibling, c = c->next_sibling) {
+        const char *leaf = strrchr(c->path, '\\');
+        leaf = leaf ? leaf + 1 : c->path;
+        if (wn_strcaseeq(leaf, name) || wn_strcaseeq(c->path, name)) {
+            if (c->first_child)
+                return WN_ERR_ACCESS_DENIED;  /* Windows refuses non-empty keys */
+            *pp = c->next_sibling;
+            free(c->path);
+            free(c);
+            return WN_ERR_SUCCESS;
+        }
+    }
+    return WN_ERR_FILE_NOT_FOUND;
+}
+
+/* Key statistics for RegQueryInfoKey. */
+uint32_t wn_reg_query_info(wn_reg_key *k, uint32_t *nsub, uint32_t *maxsub,
+                           uint32_t *nval, uint32_t *maxvn, uint32_t *maxvl)
+{
+    if (!k)
+        return WN_ERR_INVALID_HANDLE;
+    uint32_t a = 0, b = 0, c = 0, d = 0, e = 0;
+    for (wn_reg_key *ch = k->first_child; ch; ch = ch->next_sibling) {
+        a++;
+        const char *leaf = strrchr(ch->path, '\\');
+        size_t l = strlen(leaf ? leaf + 1 : ch->path);
+        if (l > b)
+            b = (uint32_t)l;
+    }
+    for (wn_reg_value *v = k->first_value; v; v = v->next) {
+        c++;
+        size_t l = strlen(v->name);
+        if (l > d)
+            d = (uint32_t)l;
+        if (v->size > e)
+            e = v->size;
+    }
+    if (nsub) *nsub = a;
+    if (maxsub) *maxsub = b;
+    if (nval) *nval = c;
+    if (maxvn) *maxvn = d;
+    if (maxvl) *maxvl = e;
+    return WN_ERR_SUCCESS;
+}

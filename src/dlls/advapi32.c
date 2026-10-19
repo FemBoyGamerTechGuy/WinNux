@@ -5,6 +5,7 @@
 #include "wn_log.h"
 #include "wn_process.h"
 #include "wn_util.h"
+#include "wn_wow64.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -28,7 +29,9 @@ static WN_API int32_t adv_RegOpenKeyExA(uint32_t root, const char *path,
         wn_last_error_set(r);
         return 2;   /* ERROR_FILE_NOT_FOUND */
     }
-    *out = regkey_handle(k);
+    /* phkResult: CALLER-width store (a 32-bit caller's HKEY slot is 4
+     * bytes; the 8-byte host write corrupted the Inno heap). */
+    wn_wow64_out_handle(out, (uint64_t)(uintptr_t)regkey_handle(k));
     return 0;
 }
 
@@ -56,7 +59,7 @@ static WN_API int32_t adv_RegCreateKeyExA(uint32_t root, const char *sub,
         wn_last_error_set(r);
         return r;
     }
-    *out = regkey_handle(k);
+    wn_wow64_out_handle(out, (uint64_t)(uintptr_t)regkey_handle(k));
     if (disposition)
         *disposition = 1; /* REG_CREATED_NEW_KEY (approximation) */
     return 0;
@@ -87,6 +90,75 @@ static WN_API int32_t adv_RegQueryValueExA(wn_handle h, const char *name,
     uint32_t r = wn_reg_query_value(o->ptr, name, type, data, size);
     if (r != WN_ERR_SUCCESS)
         return r == WN_ERR_MORE_DATA ? 234 /* ERROR_MORE_DATA */ : 2;
+    return 0;
+}
+
+static WN_API int32_t adv_RegDeleteValueA(wn_handle h, const char *name)
+{
+    wn_object *o = wn_handle_get(h, WN_HTYPE_REGKEY);
+    if (!o)
+        return 2;
+    uint32_t r = wn_reg_delete_value(o->ptr, name ? name : "");
+    if (r != WN_ERR_SUCCESS) {
+        wn_last_error_set(r);
+        return 2;
+    }
+    return 0;
+}
+
+static WN_API int32_t adv_RegDeleteValueW(wn_handle h, const uint16_t *name)
+{
+    char *a = name ? wn_utf16_to_utf8(name, 4096) : wn_xstrdup("");
+    int32_t r = adv_RegDeleteValueA(h, a);
+    free(a);
+    return r;
+}
+
+static WN_API int32_t adv_RegDeleteKeyA(wn_handle h, const char *sub)
+{
+    wn_object *o = wn_handle_get(h, WN_HTYPE_REGKEY);
+    if (!o)
+        return 2;
+    uint32_t r = wn_reg_delete_key(o->ptr, sub ? sub : "");
+    if (r != WN_ERR_SUCCESS) {
+        wn_last_error_set(r);
+        return r == WN_ERR_ACCESS_DENIED ? 5 /* ERROR_ACCESS_DENIED */ : 2;
+    }
+    return 0;
+}
+
+static WN_API int32_t adv_RegDeleteKeyW(wn_handle h, const uint16_t *sub)
+{
+    char *a = sub ? wn_utf16_to_utf8(sub, 4096) : wn_xstrdup("");
+    int32_t r = adv_RegDeleteKeyA(h, a);
+    free(a);
+    return r;
+}
+
+static WN_API int32_t adv_RegQueryInfoKeyA(
+    wn_handle h, char *class_, uint32_t *class_len, uint32_t *reserved,
+    uint32_t *subkeys, uint32_t *max_subkey_len, uint32_t *max_class_len,
+    uint32_t *values, uint32_t *max_value_name_len, uint32_t *max_value_len,
+    uint32_t *security_desc, void *last_write)
+{
+    (void)class_; (void)class_len; (void)reserved; (void)security_desc;
+    wn_object *o = wn_handle_get(h, WN_HTYPE_REGKEY);
+    if (!o)
+        return 2;
+    uint32_t nsub = 0, nval = 0;
+    uint32_t maxsub = 0, maxvn = 0, maxvl = 0;
+    wn_reg_query_info(o->ptr, &nsub, &maxsub, &nval, &maxvn, &maxvl);
+    if (subkeys) *subkeys = nsub;
+    if (max_subkey_len) *max_subkey_len = maxsub;
+    if (max_class_len) *max_class_len = 0;
+    if (values) *values = nval;
+    if (max_value_name_len) *max_value_name_len = maxvn;
+    if (max_value_len) *max_value_len = maxvl;
+    if (last_write) {
+        /* FILETIME-ish nonzero (regedit sorting). */
+        *(uint32_t *)(void *)((uint8_t *)last_write) = 0x01D00000;
+        *(uint32_t *)(void *)((uint8_t *)last_write + 4) = 0x12345678;
+    }
     return 0;
 }
 
@@ -259,6 +331,11 @@ const wn_export_entry wn_advapi32_exports[] = {
     { "RegCreateKeyExW", adv_RegCreateKeyExW },
     { "RegEnumKeyExA", adv_RegEnumKeyExA },
     { "RegEnumValueA", adv_RegEnumValueA },
+    { "RegDeleteKeyA", adv_RegDeleteKeyA },
+    { "RegDeleteKeyW", adv_RegDeleteKeyW },
+    { "RegDeleteValueA", adv_RegDeleteValueA },
+    { "RegDeleteValueW", adv_RegDeleteValueW },
+    { "RegQueryInfoKeyA", adv_RegQueryInfoKeyA },
     { "RegOpenKeyExA", adv_RegOpenKeyExA },
     { "RegOpenKeyExW", adv_RegOpenKeyExW },
     { "RegQueryValueExA", adv_RegQueryValueExA },

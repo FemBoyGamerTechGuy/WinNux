@@ -52,6 +52,8 @@ extern const wn_export_entry wn_oleacc_exports[];
 extern const wn_export_entry wn_profapi_exports[];
 extern const wn_export_entry wn_comres_exports[];
 extern const wn_export_entry wn_clbcatq_exports[];
+extern const wn_export_entry wn_mpr_exports[];
+extern const wn_export_entry wn_msimg32_exports[];
 
 /* The full builtin table (name -> exports). */
 extern const wn_builtin_dll wn_builtin_table[];
