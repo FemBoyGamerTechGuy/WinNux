@@ -3,6 +3,38 @@
 Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
+
+## P0 — installer bring-up (session 11's handoff, applies to the same goal)
+
+The reported PeekMessage pump bug is FIXED+verified; the LuaForWindows /S run
+now: outer instance extracts + spawns the is-*.tmp engine, the engine reads
+its payload byte-perfect, and the parent reaps/cleans up/exits on failure.
+Remaining, in evidence order:
+
+1. ENGINE DATA CORRUPTION: the .tmp crashes writing a Delphi list node with
+   edx=0x40a998 (a READ-ONLY CODE-section address; would fault on Windows
+   too — so the value is CORRUPTED, not a mapping issue). eax=0x2e ('.'),
+   ebp=0x49d470 (a .DATA global, Delphi uses ebp-as-register), the crash
+   stack carries "...\LuaForWindows_v5.1.5-52.tmp\4000" — Inno language/
+   setup-table parsing after the LZMA decompress. Reads are proven clean
+   (CreateFileA path-logging + ReadFile size/pos logging added at DEBUG);
+   next: instrument WHO writes the object pointer (the list comes from
+   GlobalNameSpace/Classes registration), and compare against qemu-i386
+   (winnux32, once the root32 sysroot is rebuilt — the sandbox reset wiped
+   it again).
+2. NESTED FAULT DURING SEH UNWIND: the walk hangs in the 4th frame (the
+   finally body raises again inside the unwind — seh32_dispatch re-enters
+   without depth accounting). Add a nested-walk guard (pending-unwind
+   reuse + recursion cap) in seh.c's seh32_dispatch.
+3. GetSystemMenu/DeleteMenu (stub32) — implement real menu-object stubs so
+   Inno's TApplication setup path is faithful; EnumFontsA (gdi32 stub)
+   likely harmless (installer proceeded past it).
+4. Session-11 wow64 width-bug pattern: audit the REMAINING struct
+   readers/writers in user32.c/gdi32.c/shell32.c for compile-time
+   `#if __x86_64__` layout picks (the same class caused: MSG stack smash,
+   RegisterClass garbage name, WFMO zombie hang, GWL_WNDPROC host-ptr
+   jump). grep __x86_64__ per file and check each against wn_wow64_guest32.
+
 ## P0 — 32-bit (i386): real-hardware bring-up (user priority)
 
 Console-class PE32 now runs end-to-end (session 7: modify_ldt check,

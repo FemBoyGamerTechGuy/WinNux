@@ -1,4 +1,102 @@
 
+## Date: 2026-10-19 (session 11)
+
+### The reported PeekMessageA infinite pump: root cause + fix (VERIFIED)
+
+User report: `WINNUX_WOW64=1 ... ./bin/winnux run ~/test/LuaForWindows_v5.1.5-52.exe /S`
+spammed millions of lines — the same `PeekMessageA / TranslateMessage /
+DispatchMessageA` returning `hwnd=101 msg=1 (WM_CREATE) wp=0 lp=0` forever,
+then timeout. Reproduced exactly (21.5M log lines in 40s with X11 up).
+
+Root cause 1 (the loop): `u32_PeekMessageA` had the PM constants INVERTED —
+`remove & 1 /* PM_NOREMOVE */` gated `queue_peek` (leave it queued) for
+PM_REMOVE=1. Inno's silent pump peeked the same message forever.
+Root cause 2 (the garbage message): WM_CREATE was POSTED into the queue by
+CreateWindowEx (Windows sends NCCREATE/NCCALCSIZE/CREATE synchronously,
+inside the call, with a real CREATESTRUCT; the posted lp=0 form is also a
+VCL data-init break). Both fixed; CreateWindowEx now delivers the full
+create sequence through the new 64->32 callback bridge with a guest-layout
+CREATESTRUCT in low memory, honoring the -1 creation-rejected verdict.
+
+### The systemic wow64 width-bug harvest (all found via this installer)
+
+Every layout decision that used compile-time `#if __x86_64__` was WRONG for
+the in-process 32-bit guest path; the runtime query `wn_wow64_guest32()`
+(already used by some writers) is the correct pattern and is now applied to:
+- guest MSG (28-byte i386 layout vs 48-byte x64 — the x64 shape smashed 20
+  bytes of guest stack per PeekMessage);
+- WNDCLASSA/W reads in RegisterClassA/W (the TApplication class registered
+  a GARBAGE name read at x64 offsets from an i386 struct -> "class does not
+  exist" -> the Delphi exception that killed the child);
+- new GetClassInfoA/W (the missing API: Inno checks-before-registering),
+  CharLower/CharUpper(+Buff), OemToChar/CharToOem family, and kernel32's
+  GlobalAddAtom/Find/Delete + GetAtomName (all were returning-0 stubs that
+  Delphi read as NULL strings / "atom table full");
+- RaiseException's ExceptionInformation (DWORD array for i386 callers);
+- WaitForMultipleObjects/Ex + MsgWaitForMultipleObjects handle ARRAYS
+  (DWORD entries for i386 callers): the parent polled garbage handles and
+  never reaped its dead child — the zombie that hung every run (verified:
+  the parent now calls GetExitCodeProcess, DeleteFileA, RemoveDirectoryA,
+  DestroyWindow and ExitProcess cleanly after a child failure);
+- GetWindowLong(GWLP_WNDPROC) on builtin-class windows returned a HOST
+  function pointer; the 32-bit outer instance jumped to its low 32 bits
+  (0x487a1ce0 = a host heap pointer's low half) via CallWindowProc.
+
+### The 64->32 callback bridge (wow64)
+
+32-bit guests hand us raw i386 code addresses as callbacks; calling them
+as host functions executes i386 code in 64-bit mode. New:
+- `wn_wow64_call_wndproc32[_base]`: stdcall 4-arg guest-callback invoker
+  via wn_wow64_call32, scratch spaced by call-depth below the live guest esp;
+- wndprocs (RegisterClass stores proc32, never a callable host pointer),
+  dialog procs, timer procs, CallWindowProc and REAL SetWindowLong
+  subclassing all route through it — the Inno child's TApplication wndproc
+  and VCL MakeObjectInstance subclass (0x419caXXX) now execute correctly
+  (verified in-log: the guest proc pushes SEH frames, calls
+  DefWindowProcA, returns through the bridge).
+
+### 32-bit frame-based SEH (new, wow64)
+
+Before this session every guest exception fell straight to "unhandled":
+Delphi's fs:[0] chain was never walked, so NO guest try/except/finally ever
+ran (Delphi raises 0xEEDFACE constantly as flow control). seh.c now has the
+full i386 frame-SEH engine:
+- search pass over TEB32 fs:[0] frames with guest-layout EXCEPTION_RECORD
+  (0x50) + CONTEXT (0x2CC) built in low memory;
+- verdicts: 0 continue, -1 continue-execution (context written back to the
+  ucontext), 1 unwind-to-me;
+- return-1 frames (decoded from the installer's System unit: the Borland
+  __finally handler runs the body when flags&6 and returns 1 on both
+  passes) run inner finally bodies, pop frames, and the search continues
+  OUTWARD — the Delphi "finally bodies run as the exception flies outward"
+  model;
+- RtlUnwind (kernel32+ntdll) branches to `wn_seh_rtl_unwind_32` for i386
+  callers: walks+pops frames, then the continuation lands with
+  [esp]=ReturnValue [esp+4]=Record ESP=TargetFrame (decoded from the
+  4030cc handler: the Delphi continuation reads the record at [esp+4]);
+  a walk-level longjmp chain aborts the unwound handler invocation
+  cleanly (depth restored, no C-stack leak);
+- verified in-log: the child's setup-data AV walks 3 finally frames,
+  runs their bodies (CloseHandle etc. inside the handler), and the outer
+  installer instance completes its whole failure lifecycle.
+
+### The installer state after all of this
+
+The process TREE now works end-to-end: outer exe extracts -> spawns the
+is-*.tmp engine (713KB, reads the compressed payload from the ORIGINAL exe
+by path — verified opens + byte-perfect sequential 4KB reads to EOF) ->
+engine decompresses -> on any failure the parent notices, cleans up the temp
+dir and exits with a code. What still fails: the engine's Inno setup-data
+processing crashes writing a Delphi list node whose pointer is garbage
+(edx=0x40a998 — an address inside the READ-ONLY CODE section, verified not
+writable on Windows either, so it is a corrupted value, not a mapping bug;
+reads are proven clean, so the corruption is produced by the engine's own
+decompression/consumption path — eax=0x2e ('.') and a "tmp\4000" path string
+on the crash stack point at Inno's language/setup-table parsing). The SEH
+walk then hangs inside the 4th frame's handler (another nested exception
+inside the unwind is the likely cause — nested-fault-in-unwind is not yet
+handled). 16/16 tests green throughout.
+
 ## Date: 2026-10-18 (session 10)
 
 ### The LuaForWindows entry crash: the first guest AV, root-caused to a NULL static-TLS block

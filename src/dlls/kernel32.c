@@ -1537,6 +1537,8 @@ static WN_API wn_handle k32_CreateFileA(const char *name, uint32_t access,
         wn_last_error_set(WN_ERR_INVALID_PARAMETER);
         return WN_INVALID_HANDLE_VALUE;
     }
+    wn_log(WN_LOG_DEBUG, "kernel32: CreateFileA('%s') disp=%u", name,
+           disposition);
     wn_file *f = wn_xcalloc(1, sizeof *f);
     if (!wn_file_open(name, access, disposition, share, f)) {
         free(f);
@@ -1587,6 +1589,10 @@ static WN_API int32_t k32_ReadFile(wn_handle h, void *buf, uint32_t n,
     int r = wn_file_read(f, buf, n);
     if (r < 0)
         return 0;
+    if (n >= 4096 || r == 0 || (uint32_t)r != n)
+        wn_log(WN_LOG_DEBUG, "kernel32: ReadFile n=%u r=%u pos=%lld",
+               n, (uint32_t)r,
+               (long long)lseek(f->fd >= 0 ? f->fd : -1, 0, SEEK_CUR));
     if (done)
         *done = (uint32_t)r;
     return 1;
