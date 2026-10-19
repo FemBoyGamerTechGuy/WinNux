@@ -21,6 +21,7 @@
 #include <string.h>
 #include <ucontext.h>
 #include <execinfo.h>
+#include <sys/mman.h>
 
 /* --- guest-visible exception structures (Windows x64 layout) ---------------- */
 
@@ -265,6 +266,282 @@ static int dispatch_veh(wn_exc_record *rec, wn_context64 *ctx, ucontext_t *uc)
     }
     return 0;
 }
+
+/* ============================================================================
+ * 32-bit frame-based SEH (i386 guests under wow64) — fs:[0] chain walk.
+ *
+ * Before this, every guest exception (fault or RaiseException, including
+ * Delphi's flow-control 0xEEDFACE) fell straight to "unhandled": the 32-bit
+ * frame chain in the emulated TEB was never walked, so no guest try/except
+ * ever ran (found via the Inno Setup installer: Delphi raises constantly).
+ *
+ * Contract notes (decoded from the installer's own System-unit SEH code):
+ *  - frame = {uint32 next, uint32 handler} on the guest stack, chain head at
+ *    TEB32+0 (fs:[0]);
+ *  - handler(record32, frame, ctx32, 0) is a 4-arg stdcall guest proc;
+ *  - verdicts: 0 keep searching, 0xFFFFFFFF continue execution, 1 unwind to
+ *    this frame (the Borland/Delphi except handler then CALLS RtlUnwind
+ *    itself and never returns normally — see wn_seh_rtl_unwind_32);
+ *  - i386 EXCEPTION_RECORD: code@0 flags@4 rec@8 addr@0xC nparams@0x10
+ *    info@0x14 (0x50 bytes); i386 CONTEXT is 0x2CC (Ebp@0xB4, Eip@0xB8,
+ *    EFlags@0xC0, Esp@0xC4);
+ *  - RtlUnwind(TargetFrame, TargetIp, Record, ReturnValue): walk to the
+ *    frame calling handlers with EH_UNWINDING, pop frames, then the guest
+ *    resumes at TargetIp with ESP=TargetFrame carrying [esp]=ReturnValue,
+ *    [esp+4]=Record (the Delphi continuation reads the record at [esp+4]).
+ * ==========================================================================*/
+
+#if defined(__x86_64__)
+#include <setjmp.h>
+
+/* Walk-level longjmp chain: rtl_unwind_32 aborts the handler invocation it
+ * was called from, so the abandoned call32 frame unwinds cleanly (depth
+ * restored here; no C-stack leak per exception). */
+typedef struct seh32_jmp {
+    jmp_buf jb;
+    struct seh32_jmp *prev;
+    int    depth;          /* wt->depth to restore after the longjmp */
+} seh32_jmp;
+static __thread seh32_jmp *g_seh32_jmp;
+
+static int seh32_mapped(uint32_t addr, uint32_t len)
+{
+    if (addr < 0x10000)
+        return 0;
+    if (addr + len < addr)
+        return 0;
+    return msync((void *)(uintptr_t)(addr & ~0xFFFULL), 0x1000, MS_ASYNC) == 0;
+}
+
+/* i386 CONTEXT (0x2CC) from the host view. */
+static void seh32_fill_ctx(uint8_t *ctx32, const wn_context64 *c)
+{
+    memset(ctx32, 0, 0x2CC);
+    *(uint32_t *)(void *)(ctx32 + 0x00) = 0x10007;   /* CONTEXT_FULL */
+    *(uint32_t *)(void *)(ctx32 + 0x8C) = 0x2B;      /* SegGs */
+    *(uint32_t *)(void *)(ctx32 + 0x90) = 0x50;      /* SegFs: emulated TEB sel */
+    *(uint32_t *)(void *)(ctx32 + 0x94) = 0x2B;      /* SegEs */
+    *(uint32_t *)(void *)(ctx32 + 0x98) = 0x2B;      /* SegDs */
+    *(uint32_t *)(void *)(ctx32 + 0x9C) = (uint32_t)c->rdi;
+    *(uint32_t *)(void *)(ctx32 + 0xA0) = (uint32_t)c->rsi;
+    *(uint32_t *)(void *)(ctx32 + 0xA4) = (uint32_t)c->rbx;
+    *(uint32_t *)(void *)(ctx32 + 0xA8) = (uint32_t)c->rdx;
+    *(uint32_t *)(void *)(ctx32 + 0xAC) = (uint32_t)c->rcx;
+    *(uint32_t *)(void *)(ctx32 + 0xB0) = (uint32_t)c->rax;
+    *(uint32_t *)(void *)(ctx32 + 0xB4) = (uint32_t)c->rbp;
+    *(uint32_t *)(void *)(ctx32 + 0xB8) = (uint32_t)c->rip;
+    *(uint32_t *)(void *)(ctx32 + 0xBC) = 0x23;      /* SegCs */
+    *(uint32_t *)(void *)(ctx32 + 0xC0) = (uint32_t)c->eflags;
+    *(uint32_t *)(void *)(ctx32 + 0xC4) = (uint32_t)c->rsp;
+    *(uint32_t *)(void *)(ctx32 + 0xC8) = 0x2B;      /* SegSs */
+}
+
+/* Walk the 32-bit frame chain and dispatch the exception.
+ *   uc != NULL  → signal path: uc gets patched on unwind / continue-exec;
+ *                 the handler scratch anchors below the FAULTING esp.
+ *   uc == NULL  → RaiseException path (runs inside the RaiseException
+ *                 thunk dispatch): a pending unwind is applied by the
+ *                 dispatch layer's exit path; anchor = the raise args.
+ * Returns 1 when handled (or an unwind is pending), 0 = unhandled. */
+static int seh32_dispatch(wn_exc_record *rec, wn_context64 *ctx, void *uc_)
+{
+    ucontext_t *uc = uc_;
+    wn_wow64_thread *wt = wn_wow64_thread_current();
+    if (!wt || !g_wow64_active)
+        return 0;
+    uint32_t teb32 = (uint32_t)(uintptr_t)wt->teb32;
+    if (!seh32_mapped(teb32, 4))
+        return 0;
+    uint32_t head = *(uint32_t *)(uintptr_t)teb32;
+    if (!seh32_mapped(head, 8))
+        return 0;
+
+    /* anchor: below the deepest live guest stack we know of */
+    uint32_t anchor = uc
+        ? (uint32_t)uc->uc_mcontext.gregs[REG_RSP]
+        : wt->args32;
+
+    /* build the guest-shaped EXCEPTION_RECORD + CONTEXT in low memory */
+    uint8_t *blk = wn_low_malloc(0x50 + 0x2CC);
+    if (!blk)
+        return 0;
+    uint8_t *rec32 = blk;
+    uint8_t *ctx32 = blk + 0x50;
+    memset(rec32, 0, 0x50);
+    *(uint32_t *)(void *)(rec32 + 0x00) = rec->exception_code;
+    *(uint32_t *)(void *)(rec32 + 0x04) = rec->exception_flags;
+    *(uint32_t *)(void *)(rec32 + 0x08) = 0;        /* nested chain */
+    *(uint32_t *)(void *)(rec32 + 0x0C) = (uint32_t)rec->exception_address;
+    *(uint32_t *)(void *)(rec32 + 0x10) =
+        rec->number_parameters > 15 ? 15 : rec->number_parameters;
+    for (uint32_t i = 0; i < rec->number_parameters && i < 15; i++)
+        *(uint32_t *)(void *)(rec32 + 0x14 + 4 * i) =
+            (uint32_t)rec->exception_information[i];
+    seh32_fill_ctx(ctx32, ctx);
+
+    int handled = 0;
+    uint32_t walked[128];      /* frames already searched (for the
+                                 * return-1 unwind-to-me pass) */
+    int n_walked = 0;
+    wn_log(WN_LOG_DEBUG, "seh32: dispatch code=%08x addr=%x head=%x "
+           "anchor=%x uc=%d", rec->exception_code,
+           (uint32_t)rec->exception_address, head, anchor, uc ? 1 : 0);
+    for (int i = 0; i < 128 && seh32_mapped(head, 8); i++) {
+        uint32_t next = *(uint32_t *)(uintptr_t)head;
+        uint32_t handler = *(uint32_t *)(uintptr_t)(head + 4);
+        wn_log(WN_LOG_DEBUG, "seh32: frame %x handler %x (next %x)",
+               head, handler, next);
+        if (next && next < 0x10000)
+            break;
+        if (!seh32_mapped(handler, 16))
+            break;
+        seh32_jmp j;
+        j.prev = g_seh32_jmp;
+        j.depth = wt->depth;
+        g_seh32_jmp = &j;
+        uint64_t r;
+        if (setjmp(j.jb) == 0)
+            r = wn_wow64_call_wndproc32_base(anchor, handler,
+                    (uint32_t)(uintptr_t)rec32, head,
+                    (uint32_t)(uintptr_t)ctx32, 0);
+        else
+            r = (uint64_t)-2;    /* RtlUnwind ran inside the handler */
+        g_seh32_jmp = j.prev;
+        wt->depth = j.depth;      /* longjmp skipped call32's restore */
+        wn_log(WN_LOG_DEBUG, "seh32: handler %x verdict %llx", handler,
+               (unsigned long long)r);
+
+        if ((uint32_t)r == 0xFFFFFFFFu) {
+            /* EXCEPTION_CONTINUE_EXECUTION: copy (possibly modified)
+             * guest context back and resume. */
+            if (uc) {
+                uc->uc_mcontext.gregs[REG_RAX] = *(uint32_t *)(void *)(ctx32 + 0xB0);
+                uc->uc_mcontext.gregs[REG_RCX] = *(uint32_t *)(void *)(ctx32 + 0xAC);
+                uc->uc_mcontext.gregs[REG_RDX] = *(uint32_t *)(void *)(ctx32 + 0xA8);
+                uc->uc_mcontext.gregs[REG_RBX] = *(uint32_t *)(void *)(ctx32 + 0xA4);
+                uc->uc_mcontext.gregs[REG_RSP] = *(uint32_t *)(void *)(ctx32 + 0xC4);
+                uc->uc_mcontext.gregs[REG_RBP] = *(uint32_t *)(void *)(ctx32 + 0xB4);
+                uc->uc_mcontext.gregs[REG_RSI] = *(uint32_t *)(void *)(ctx32 + 0xA0);
+                uc->uc_mcontext.gregs[REG_RDI] = *(uint32_t *)(void *)(ctx32 + 0x9C);
+                uc->uc_mcontext.gregs[REG_RIP] = *(uint32_t *)(void *)(ctx32 + 0xB8);
+            }
+            handled = 1;
+            break;
+        }
+        if ((int64_t)r == -2 || wn_wow64_unwind32_pending()) {
+            if (uc) {
+                uint32_t t, e, a;
+                if (wn_wow64_unwind32_take(&t, &e, &a)) {
+                    uc->uc_mcontext.gregs[REG_RIP] = t;
+                    uc->uc_mcontext.gregs[REG_RSP] = e;
+                    uc->uc_mcontext.gregs[REG_RAX] = a;
+                }
+            }
+            handled = 1;
+            break;
+        }
+        if ((uint32_t)r == 1) {
+            /* ExceptionExecuteHandler. For Borland/Delphi __finally frames
+             * (decoded from the installer's System unit: the handler runs
+             * the finally body when called with the UNWINDING flags and
+             * returns 1 on BOTH passes; the real except handler claims the
+             * exception by calling RtlUnwind itself): unwind to this frame
+             * — run every inner frame's finally body with EH_UNWINDING,
+             * run THIS frame's with EH_UNWINDING|EH_TARGET_UNWINDING — pop
+             * them all, then CONTINUE THE SEARCH OUTWARD with the same
+             * record. */
+            *(uint32_t *)(void *)(rec32 + 0x04) |= 2;   /* EH_UNWINDING */
+            for (int k = 0; k < n_walked; k++) {
+                uint32_t fh = *(uint32_t *)(uintptr_t)(walked[k] + 4);
+                if (seh32_mapped(fh, 16))
+                    wn_wow64_call_wndproc32_base(anchor, fh,
+                            (uint32_t)(uintptr_t)rec32, walked[k],
+                            (uint32_t)(uintptr_t)ctx32, 0);
+                *(uint32_t *)(uintptr_t)teb32 =
+                    *(uint32_t *)(uintptr_t)walked[k];   /* pop */
+            }
+            *(uint32_t *)(void *)(rec32 + 0x04) |= 4; /* EH_TARGET_UNWINDING */
+            if (seh32_mapped(handler, 16))
+                wn_wow64_call_wndproc32_base(anchor, handler,
+                        (uint32_t)(uintptr_t)rec32, head,
+                        (uint32_t)(uintptr_t)ctx32, 0);
+            /* pop the target frame; the search resumes from its next */
+            *(uint32_t *)(uintptr_t)teb32 = next;
+            n_walked = 0;
+            head = next;
+            wn_log(WN_LOG_DEBUG, "seh32: finally-frame unwound, "
+                   "search continues at %x", head);
+            continue;
+        }
+        if ((uint32_t)r != 0)
+            wn_log(WN_LOG_DEBUG, "seh32: handler %x returned %llx", handler,
+                   (unsigned long long)r);
+        if (n_walked < 128)
+            walked[n_walked++] = head;
+        head = next;
+    }
+    wn_low_free(blk);
+    return handled;
+}
+
+/* kernel32/ntdll RtlUnwind for a 32-bit caller (Borland/Delphi SEH).
+ * Never returns normally when a walk is active: longjmps back to the walk,
+ * which reports "handled" and lets the dispatch/signal layer resume the
+ * guest at the continuation. Without a walk (direct guest abort path),
+ * leaves a pending unwind for the dispatch layer. */
+void wn_seh_rtl_unwind_32(uint32_t target_frame, uint32_t target_ip,
+                         uint32_t rec32, uint32_t retval)
+{
+    wn_wow64_thread *wt = wn_wow64_thread_current();
+    if (!wt)
+        return;
+    wn_log(WN_LOG_DEBUG, "seh32: RtlUnwind(frame=%x ip=%x rec=%x rv=%x)",
+           target_frame, target_ip, rec32, retval);
+    uint32_t teb32 = (uint32_t)(uintptr_t)wt->teb32;
+    if (!seh32_mapped(teb32, 4) || !seh32_mapped(target_frame, 8))
+        return;
+
+    /* intermediate frames: run finally bodies with EH_UNWINDING */
+    if (rec32 && seh32_mapped(rec32, 4))
+        *(uint32_t *)(uintptr_t)(rec32 + 4) |= 2;
+    uint32_t head = *(uint32_t *)(uintptr_t)teb32;
+    for (int i = 0; i < 256 && seh32_mapped(head, 8); i++) {
+        if (head == target_frame)
+            break;
+        uint32_t next = *(uint32_t *)(uintptr_t)head;
+        uint32_t handler = *(uint32_t *)(uintptr_t)(head + 4);
+        if (!next || next < 0x10000)
+            break;
+        if (seh32_mapped(handler, 16))
+            wn_wow64_call_wndproc32(handler, rec32, head, 0, 0);
+        *(uint32_t *)(uintptr_t)teb32 = next;    /* pop the frame */
+        head = next;
+    }
+    if (head != target_frame)
+        wn_log(WN_LOG_WARN, "seh32: RtlUnwind target %x not on chain "
+               "(at %x) — unwinding anyway", target_frame, head);
+
+    /* pop the target frame too */
+    *(uint32_t *)(uintptr_t)teb32 =
+        *(uint32_t *)(uintptr_t)target_frame;
+
+    /* Continuation: [esp]=ReturnValue, [esp+4]=Record, ESP=TargetFrame —
+     * the two popped frame dwords are reused (decoded from the Delphi
+     * System handler: its continuation reads the record at [esp+4]). */
+    *(uint32_t *)(uintptr_t)(target_frame + 4) = rec32;
+    *(uint32_t *)(uintptr_t)target_frame = retval;
+    wn_wow64_unwind32_set(target_ip, target_frame, retval);
+
+    if (g_seh32_jmp) {
+        seh32_jmp *j = g_seh32_jmp;
+        g_seh32_jmp = j->prev;
+        wt->depth = j->depth;     /* unwound handler frames never returned */
+        longjmp(j->jb, 1);
+    }
+    /* no walk: the dispatch layer applies the pending unwind */
+}
+#endif  /* __x86_64__ */
+
 
 static void fill_context(wn_context64 *ctx, const ucontext_t *uc)
 {
@@ -522,6 +799,16 @@ static void signal_handler(int sig, siginfo_t *si, void *uc_)
     if (dispatch_veh(&rec, &ctx, uc))
         return;   /* VEH continued execution */
 
+#if defined(__x86_64__)
+    if (g_wow64_active) {
+        /* 32-bit frame-based SEH: give the guest's fs:[0] chain a chance
+         * before declaring the exception unhandled (Delphi's try/except
+         * runs here — it is also Inno Setup's main flow-control path). */
+        if (seh32_dispatch(&rec, &ctx, uc))
+            return;   /* handled or unwind patched into uc */
+    }
+#endif
+
     crash_report(&rec, &ctx);
 }
 
@@ -572,6 +859,14 @@ void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
 
     if (dispatch_veh(&rec, &ctx, &uc))
         return;   /* VEH continued: exception swallowed (logged) */
+
+#if defined(__x86_64__)
+    if (g_wow64_active) {
+        if (seh32_dispatch(&rec, &ctx, NULL))
+            return;   /* handled (or unwind pending: the dispatch layer
+                        * resumes the guest at the continuation) */
+    }
+#endif
 
     crash_report(&rec, &ctx);
 }

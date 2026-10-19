@@ -26,4 +26,11 @@ void *wn_seh_set_unhandled_filter(void *filter);
 /* Route UnhandledExceptionFilter(ep) to the app's installed filter. */
 int64_t wn_seh_call_unhandled_filter(void *exception_pointers);
 
+/* 32-bit frame-based SEH (wow64): RtlUnwind for an i386 guest caller —
+ * kernel32/ntdll RtlUnwind branch here when serving 32-bit code. Never
+ * returns to the caller when a seh.c walk is active (longjmps out); with
+ * no walk it leaves a pending unwind applied by the dispatch layer. */
+void wn_seh_rtl_unwind_32(uint32_t target_frame, uint32_t target_ip,
+                         uint32_t rec32, uint32_t retval);
+
 #endif /* WN_SEH_H */

@@ -2624,18 +2624,46 @@ static WN_API uint32_t k32_WaitForSingleObjectEx(wn_handle h, uint32_t ms,
 }
 
 static WN_API uint32_t k32_WaitForMultipleObjects(uint32_t count,
-                                                  const wn_handle *hs,
+                                                  const void *hs_raw,
                                                   uint32_t wait_all, uint32_t ms)
 {
+    /* The handle ARRAY is DWORD-sized for 32-bit callers (QWORD for x64):
+     * reading 64-bit entries from a 32-bit array handed the sync engine
+     * garbage handles — the Inno parent never saw its child exit and
+     * hung forever (found via the un-reaped zombie). */
+    wn_handle hs[64];
+    if (count > 64)
+        count = 64;
+    if (wn_wow64_guest32()) {
+        const uint32_t *p = hs_raw;
+        for (uint32_t i = 0; i < count; i++)
+            hs[i] = (wn_handle)(uintptr_t)p[i];
+    } else {
+        const wn_handle *p = hs_raw;
+        for (uint32_t i = 0; i < count; i++)
+            hs[i] = (wn_handle)(uintptr_t)p[i];
+    }
     return wn_wait_multiple(count, hs, (int)wait_all, ms);
 }
 
 static WN_API uint32_t k32_WaitForMultipleObjectsEx(uint32_t count,
-                                                    const wn_handle *hs,
+                                                    const void *hs_raw,
                                                     uint32_t wait_all, uint32_t ms,
                                                     uint32_t alertable)
 {
     (void)alertable;
+    wn_handle hs[64];
+    if (count > 64)
+        count = 64;
+    if (wn_wow64_guest32()) {
+        const uint32_t *p = hs_raw;
+        for (uint32_t i = 0; i < count; i++)
+            hs[i] = (wn_handle)(uintptr_t)p[i];
+    } else {
+        const wn_handle *p = hs_raw;
+        for (uint32_t i = 0; i < count; i++)
+            hs[i] = (wn_handle)(uintptr_t)p[i];
+    }
     return wn_wait_multiple(count, hs, (int)wait_all, ms);
 }
 
@@ -3069,7 +3097,15 @@ static void *k32_RtlVirtualUnwind(uint32_t t, uint64_t ib, uint64_t tip,
                                   uint32_t *ef, void *cp)
 { return seh_RtlVirtualUnwind(t, ib, tip, fe, ctx, hd, ef, cp); }
 static void k32_RtlUnwind(uint64_t tf, uint64_t tip, void *er, uint64_t rv)
-{ seh_RtlUnwind(tf, tip, er, rv); }
+{
+    if (wn_wow64_guest32()) {
+        /* i386 caller: frame-based unwind (see seh.c). The args are the
+         * guest's 32-bit values (frame address, target ip, record ptr,
+         * ReturnValue) — never returns when an SEH walk is active. */
+        wn_seh_rtl_unwind_32((uint32_t)tf, (uint32_t)tip,
+                            (uint32_t)(uintptr_t)er, (uint32_t)rv);
+        return;
+    } seh_RtlUnwind(tf, tip, er, rv); }
 
 static WN_API char *k32_lstrcpyA(char *dst, const char *src)
 {
@@ -3890,9 +3926,25 @@ static WN_API int32_t k32_GetLocaleInfoW(uint32_t lcid, uint32_t lctype,
 }
 
 static WN_API void k32_RaiseException(uint32_t code, uint32_t flags,
-                                      uint32_t nparams, const uint64_t *params)
+                                      uint32_t nparams, const void *params)
 {
-    wn_seh_raise(code, flags, nparams, params);
+    /* The ExceptionInformation array is DWORD-sized for 32-bit callers
+     * (Delphi passes the exception object + address there) and QWORD-
+     * sized for x64 callers. */
+    uint64_t p[15] = { 0 };
+    if (params && nparams) {
+        uint32_t n = nparams > 15 ? 15 : nparams;
+        if (wn_wow64_guest32()) {
+            const uint32_t *p32 = params;
+            for (uint32_t i = 0; i < n; i++)
+                p[i] = p32[i];
+        } else {
+            const uint64_t *p64 = params;
+            for (uint32_t i = 0; i < n; i++)
+                p[i] = p64[i];
+        }
+    }
+    wn_seh_raise(code, flags, nparams, p);
 }
 
 static WN_API int32_t k32_DuplicateHandle(wn_handle src_proc, wn_handle src,

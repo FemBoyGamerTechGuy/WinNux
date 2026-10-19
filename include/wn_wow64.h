@@ -60,6 +60,14 @@ typedef struct wn_wow64_thread {
     uint8_t *seh_low;              /* 200 low SEH scratch (0x400)        */
     uint32_t dispatch32;           /* 208 builtin serves a 32-bit caller */
     uint32_t args32;               /* 212 guest esp at the args (debug)  */
+    /* --- pending 64->32 unwind (32-bit RtlUnwind; see seh.c). No .S deps.
+     *     After rtl_unwind_32 sets these, the guest resumes at target
+     *     with the given esp/eax at the dispatch level that entered the
+     *     walk (or via the signal-path ucontext). */
+    uint32_t unwind32_target;      /* 216 continuation EIP               */
+    uint32_t unwind32_esp;         /* 220 continuation ESP                */
+    uint32_t unwind32_eax;         /* 224 ReturnValue in EAX             */
+    uint32_t unwind32_pending;     /* 228 set while unwinding             */
 } wn_wow64_thread;
 
 /* scratch layout (low, 0x100): 0x00 exit_blk (4 u64: retval, new_esp32,
@@ -160,5 +168,27 @@ void wn_wow64_out_handle(void *slot, uint64_t val);
  * build (native guests) this calls the proc directly. */
 uint64_t wn_wow64_call_wndproc32(uint32_t proc32, uint32_t a0, uint32_t a1,
                                 uint32_t a2, uint32_t a3);
+
+/* Same, anchored to an explicit guest stack watermark (the SEH walk
+ * passes the faulting esp; everything below it is dead stack). */
+uint64_t wn_wow64_call_wndproc32_base(uint32_t esp_anchor, uint32_t proc32,
+                                      uint32_t a0, uint32_t a1,
+                                      uint32_t a2, uint32_t a3);
+
+/* ---- 32-bit frame-based SEH (i386 guests; dispatch in seh.c) ---------- */
+
+/* The current thread's TEB32 guest address (0 when not wow64-attached). */
+uint32_t wn_wow64_teb32_addr(void);
+
+/* Record a pending 64->32 unwind (32-bit RtlUnwind). The guest resumes at
+ * target with esp/eax; consumed by the seh.c walk (or the dispatch layer
+ * when no walk is active). */
+void wn_wow64_unwind32_set(uint32_t target, uint32_t esp, uint32_t eax);
+
+/* Returns 1 and clears the pending unwind (out-params may be NULL). */
+int  wn_wow64_unwind32_take(uint32_t *target, uint32_t *esp, uint32_t *eax);
+
+/* Query without clearing. */
+int  wn_wow64_unwind32_pending(void);
 
 #endif /* WN_WOW64_H */

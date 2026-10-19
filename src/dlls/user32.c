@@ -840,13 +840,19 @@ static int64_t winlong_get(wn_window *w, int32_t idx)
     if (idx == GWLP_WNDPROC) {
         /* Real subclassing: return the CURRENT proc (subclass if set,
          * else the class proc — the raw i386 address for a 32-bit guest's
-         * class; Delphi stores it and later calls it via CallWindowProc). */
+         * class; Delphi stores it and later calls it via CallWindowProc).
+         * BUILTIN control classes have only a HOST proc — never hand a
+         * host pointer to a 32-bit guest (it jumps to the pointer's low
+         * 32 bits and dies; found via the Inno outer instance calling
+         * CallWindowProc(OldProc) after WM_DESTROY). */
         if (w->subclass32)
             return (int64_t)(uint64_t)w->subclass32;
         if (w->subclass)
             return (int64_t)w->subclass;
         if (w->cls && w->cls->proc32)
             return (int64_t)(uint64_t)w->cls->proc32;
+        if (u32_guest32())
+            return 0;          /* builtin/host proc: not expressible */
         return w->cls ? (int64_t)(uintptr_t)w->cls->proc : 0;
     }
     wn_log(WN_LOG_WARN, "user32: GetWindowLong unknown index %d", idx);
@@ -2017,6 +2023,8 @@ static WN_API uint64_t u32_CallWindowProcA(wn_abiword proc, wn_abiword hwnd,
                                           uint32_t msg, wn_abiword wp,
                                           wn_abiword_s lp)
 {
+    if (!proc)
+        return u32_DefWindowProcA(hwnd, msg, wp, lp);   /* NULL = default */
     if (u32_guest32())
         return wn_wow64_call_wndproc32((uint32_t)(uint64_t)proc,
                                        (uint32_t)(uint64_t)hwnd, msg,
@@ -2024,8 +2032,6 @@ static WN_API uint64_t u32_CallWindowProcA(wn_abiword proc, wn_abiword hwnd,
                                        (uint32_t)(uint64_t)lp);
     typedef WN_API uint64_t (*p4)(wn_abiword, uint32_t, wn_abiword,
                                   wn_abiword_s);
-    if (!proc)
-        return 0;
     return ((p4)(uintptr_t)proc)(hwnd, msg, wp, lp);
 }
 
@@ -4837,13 +4843,28 @@ static WN_API int32_t u32_SetCaretPos(int32_t x, int32_t y)
 /* --- MsgWaitForMultipleObjects (queue-aware approximation) ---------------------- */
 
 static WN_API uint32_t u32_MsgWaitForMultipleObjects(uint32_t count,
-                                                     const uint64_t *handles,
+                                                     const void *hs_raw,
                                                      uint32_t wait_all,
                                                      uint32_t ms,
                                                      uint32_t wake_mask)
 {
     (void)wait_all; (void)wake_mask;
     uint64_t t0 = wn_monotonic_ns() / 1000000;
+    /* Handle arrays are DWORD-sized for 32-bit callers (the Inno parent
+     * hung forever waiting for a child that had already died: 64-bit reads
+     * of its 32-bit handle array never matched the child's handle). */
+    wn_handle hs[64];
+    if (count > 64)
+        count = 64;
+    if (wn_wow64_guest32()) {
+        const uint32_t *p = hs_raw;
+        for (uint32_t i = 0; i < count; i++)
+            hs[i] = (wn_handle)(uintptr_t)p[i];
+    } else {
+        const wn_handle *p = hs_raw;
+        for (uint32_t i = 0; i < count; i++)
+            hs[i] = (wn_handle)(uintptr_t)p[i];
+    }
     for (;;) {
         if (g_q_count)
             return count;          /* WAIT_OBJECT_0 + n: message arrived */
@@ -4851,9 +4872,7 @@ static WN_API uint32_t u32_MsgWaitForMultipleObjects(uint32_t count,
         if (count) {
             extern uint32_t wn_wait_multiple(uint32_t, const wn_handle *,
                                              int, uint32_t);
-            uint32_t wr = wn_wait_multiple(count,
-                                           (const wn_handle *)handles,
-                                           (int)wait_all, 0);
+            uint32_t wr = wn_wait_multiple(count, hs, (int)wait_all, 0);
             if (wr != 0xFFFFFFFF /*FAILED*/ && wr != 0x102 /*TIMEOUT*/ &&
                 wr != 0x80 /*ABANDONED*/)
                 return wr & 0xFF;     /* WAIT_OBJECT_0 + index */

@@ -3,6 +3,7 @@
 #include "wn_process.h"
 #include "wn_sync.h"
 #include "wn_seh.h"
+#include "wn_wow64.h"
 #include "wn_log.h"
 
 #include <stdlib.h>
@@ -94,6 +95,14 @@ static WN_API uint64_t nt_RtlZeroMemory(void *dst, wn_abiword n)
 
 static WN_API int32_t nt_RtlUnwind(void *frame, void *target, void *rec, void *ret)
 {
+    if (wn_wow64_guest32()) {
+        /* i386 caller: frame-based unwind (see seh.c). */
+        wn_seh_rtl_unwind_32((uint32_t)(uintptr_t)frame,
+                            (uint32_t)(uintptr_t)target,
+                            (uint32_t)(uintptr_t)rec,
+                            (uint32_t)(uintptr_t)ret);
+        return 0;
+    }
     wn_log(WN_LOG_ERR, "ntdll: RtlUnwind not implemented (x64 table-based "
            "unwinding pending; see STATUS.md)");
     (void)frame; (void)target; (void)rec; (void)ret;

@@ -610,6 +610,20 @@ void wow64_dispatch_c(wn_wow64_thread *wt, uint64_t *frame)
 
     uint32_t esp = (uint32_t)(uintptr_t)frame + 8 + ent->cleanup * 4;
     wt->dispatch32 = saved_disp32;
+    if (wt->unwind32_pending) {
+        /* A 32-bit RtlUnwind completed inside a handler that this dispatch
+         * (or the walk above it) invoked: resume the guest at the unwind
+         * continuation. Covers the fallback case (no seh.c walk active —
+         * the guest called RtlUnwind directly); when the walk IS active it
+         * longjmps out of the handler before this runs (seh.c). */
+        wn_log(WN_LOG_DEBUG, "wow64: unwind32 -> eip=%x esp=%x eax=%x",
+               wt->unwind32_target, wt->unwind32_esp, wt->unwind32_eax);
+        esp = wt->unwind32_esp;
+        ret = wt->unwind32_eax;          /* ReturnValue arrives in EAX */
+        ret32 = wt->unwind32_target;
+        ret_hi = 0;
+        wt->unwind32_pending = 0;
+    }
     wt->exit_blk[0] = ret;
     wt->exit_blk[1] = esp;
     wt->exit_blk[2] = ret32;
@@ -666,6 +680,18 @@ uint64_t wn_wow64_call_wndproc32(uint32_t proc32, uint32_t a0, uint32_t a1,
                                  uint32_t a2, uint32_t a3)
 {
     wn_wow64_thread *wt = wn_wow64_thread_current();
+    return wn_wow64_call_wndproc32_base(wt ? wt->args32 : 0, proc32,
+                                        a0, a1, a2, a3);
+}
+
+/* esp-anchored variant: callers that know a safer guest stack watermark
+ * (e.g. the SEH walk anchoring below the FAULTING esp, not a stale
+ * dispatch's args32) pass it here. */
+uint64_t wn_wow64_call_wndproc32_base(uint32_t esp_anchor, uint32_t proc32,
+                                      uint32_t a0, uint32_t a1,
+                                      uint32_t a2, uint32_t a3)
+{
+    wn_wow64_thread *wt = wn_wow64_thread_current();
     if (!wt || !proc32) {
         wn_log(WN_LOG_ERR, "wow64: wndproc32 without attached thread");
         return 0;
@@ -674,11 +700,11 @@ uint64_t wn_wow64_call_wndproc32(uint32_t proc32, uint32_t a0, uint32_t a1,
         wn_log(WN_LOG_ERR, "wow64: wndproc32 depth overflow");
         return 0;
     }
-    if (wt->args32 < 0x10000) {
-        wn_log(WN_LOG_ERR, "wow64: wndproc32 with no guest esp (args32=0)");
+    if (esp_anchor < 0x10000) {
+        wn_log(WN_LOG_ERR, "wow64: wndproc32 with no guest esp (anchor 0)");
         return 0;
     }
-    uint32_t esp32 = (wt->args32 - (uint32_t)(wt->depth + 1) * 0x2000u) & ~15u;
+    uint32_t esp32 = (esp_anchor - (uint32_t)(wt->depth + 1) * 0x2000u) & ~15u;
     esp32 -= 0x10;
     uint32_t *stk = (uint32_t *)(uintptr_t)esp32;
     stk[0] = a0;            /* hwnd  */
@@ -1262,4 +1288,60 @@ uint64_t wn_wow64_call_wndproc32(uint32_t proc32, uint32_t a0, uint32_t a1,
     return ((p4)(uintptr_t)proc32)(a0, a1, a2, a3);
 }
 
+
+
 #endif  /* __x86_64__ */
+
+/* -------------------------------------------------- unwind32 (both builds) */
+
+uint32_t wn_wow64_teb32_addr(void)
+{
+#if defined(__x86_64__)
+    wn_wow64_thread *wt = wn_wow64_thread_current();
+    return wt ? (uint32_t)(uintptr_t)wt->teb32 : 0;
+#else
+    return 0;    /* native i386: no TEB32 in low memory (its fs is real) */
+#endif
+}
+
+void wn_wow64_unwind32_set(uint32_t target, uint32_t esp, uint32_t eax)
+{
+#if defined(__x86_64__)
+    wn_wow64_thread *wt = wn_wow64_thread_current();
+    if (!wt)
+        return;
+    wt->unwind32_target = target;
+    wt->unwind32_esp = esp;
+    wt->unwind32_eax = eax;
+    wt->unwind32_pending = 1;
+#else
+    (void)target; (void)esp; (void)eax;   /* native: nothing to unwind */
+#endif
+}
+
+int wn_wow64_unwind32_take(uint32_t *target, uint32_t *esp, uint32_t *eax)
+{
+#if defined(__x86_64__)
+    wn_wow64_thread *wt = wn_wow64_thread_current();
+    if (!wt || !wt->unwind32_pending)
+        return 0;
+    wt->unwind32_pending = 0;
+    if (target) *target = wt->unwind32_target;
+    if (esp) *esp = wt->unwind32_esp;
+    if (eax) *eax = wt->unwind32_eax;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int wn_wow64_unwind32_pending(void)
+{
+#if defined(__x86_64__)
+    wn_wow64_thread *wt = wn_wow64_thread_current();
+    return wt && wt->unwind32_pending;
+#else
+    return 0;
+#endif
+}
+
