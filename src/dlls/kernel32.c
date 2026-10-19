@@ -1303,6 +1303,117 @@ static WN_API int32_t k32_HeapDestroy(wn_handle h)
     return 1;
 }
 
+/* --- global atom table ---------------------------------------------------
+ * Delphi/VCL and Inno-style installers tag window data with string atoms.
+ * Returning 0 from GlobalAddAtomA read as "atom table full" and broke the
+ * class registration path; keep a simple string table, atoms from 0xC000. */
+#define WN_ATOMS 512
+static struct {
+    int    used;
+    char   name[256];        /* canonical UTF-8 */
+} g_atoms[WN_ATOMS];
+
+static uint16_t atom_find_slot(const char *name)
+{
+    for (int i = 0; i < WN_ATOMS; i++)
+        if (g_atoms[i].used && wn_strcaseeq(g_atoms[i].name, name))
+            return (uint16_t)(0xC000 + i);
+    return 0;
+}
+
+static WN_API uint16_t k32_GlobalAddAtomA(const char *name)
+{
+    if (!name || !name[0])
+        return 0;
+    uint16_t ex = atom_find_slot(name);
+    if (ex)
+        return ex;
+    for (int i = 0; i < WN_ATOMS; i++) {
+        if (!g_atoms[i].used) {
+            g_atoms[i].used = 1;
+            snprintf(g_atoms[i].name, sizeof g_atoms[i].name, "%s", name);
+            return (uint16_t)(0xC000 + i);
+        }
+    }
+    wn_log(WN_LOG_WARN, "kernel32: global atom table full");
+    return 0;
+}
+
+static WN_API uint16_t k32_GlobalAddAtomW(const uint16_t *name)
+{
+    if (!name)
+        return 0;
+    char *a = wn_utf16_to_utf8(name, 256);
+    if (!a)
+        return 0;
+    uint16_t r = k32_GlobalAddAtomA(a);
+    free(a);
+    return r;
+}
+
+static WN_API uint16_t k32_GlobalFindAtomA(const char *name)
+{
+    if (!name || !name[0])
+        return 0;
+    return atom_find_slot(name);
+}
+
+static WN_API uint16_t k32_GlobalFindAtomW(const uint16_t *name)
+{
+    if (!name)
+        return 0;
+    char *a = wn_utf16_to_utf8(name, 256);
+    if (!a)
+        return 0;
+    uint16_t r = atom_find_slot(a);
+    free(a);
+    return r;
+}
+
+static WN_API int32_t k32_GlobalDeleteAtom(uint16_t atom)
+{
+    if (atom < 0xC000 || atom >= 0xC000 + WN_ATOMS)
+        return 0;
+    g_atoms[atom - 0xC000].used = 0;
+    return 1;
+}
+
+static WN_API uint32_t k32_GetAtomNameA(uint16_t atom, char *buf, uint32_t n)
+{
+    if (!buf || n == 0 || atom < 0xC000 || atom >= 0xC000 + WN_ATOMS)
+        return 0;
+    const char *nm = g_atoms[atom - 0xC000].name;
+    if (!g_atoms[atom - 0xC000].used) {
+        if (n)
+            buf[0] = 0;
+        return 0;
+    }
+    snprintf(buf, n, "%s", nm);
+    return (uint32_t)strlen(buf);
+}
+
+static WN_API uint32_t k32_GetAtomNameW(uint16_t atom, uint16_t *buf, uint32_t n)
+{
+    if (!buf || n == 0 || atom < 0xC000 || atom >= 0xC000 + WN_ATOMS)
+        return 0;
+    if (!g_atoms[atom - 0xC000].used) {
+        buf[0] = 0;
+        return 0;
+    }
+    uint16_t *w = wn_utf8_to_utf16_n(g_atoms[atom - 0xC000].name,
+                                    sizeof g_atoms[0].name);
+    if (!w) {
+        buf[0] = 0;
+        return 0;
+    }
+    uint32_t i = 0;
+    for (; i + 1 < n && w[i]; i++)
+        buf[i] = w[i];
+    buf[i] = 0;
+    free(w);
+    return i;
+}
+
 /* Global/Local: fixed allocations only (documented limitation). */
 static WN_API void *k32_GlobalAlloc(uint32_t flags, wn_abiword size)
 {
@@ -3968,6 +4079,13 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "GlobalLock", k32_GlobalLock },
     { "GlobalSize", k32_GlobalSize },
     { "GlobalUnlock", k32_GlobalUnlock },
+    { "GlobalAddAtomA", k32_GlobalAddAtomA },
+    { "GlobalAddAtomW", k32_GlobalAddAtomW },
+    { "GlobalFindAtomA", k32_GlobalFindAtomA },
+    { "GlobalFindAtomW", k32_GlobalFindAtomW },
+    { "GlobalDeleteAtom", k32_GlobalDeleteAtom },
+    { "GetAtomNameA", k32_GetAtomNameA },
+    { "GetAtomNameW", k32_GetAtomNameW },
     { "HeapAlloc", k32_HeapAlloc },
     { "HeapCreate", k32_HeapCreate },
     { "HeapDestroy", k32_HeapDestroy },

@@ -652,6 +652,46 @@ int wn_wow64_call32(uint32_t target, uint32_t *esp_io, uint32_t regs_io[7])
     return 0;
 }
 
+/* -------------------------------------------------- 64 -> 32 callbacks */
+/* Call a 32-bit guest wndproc/dialogproc/timer-proc (stdcall, 4 dword
+ * args) from the 64-bit side. These procs are raw i386 addresses stored
+ * by 32-side RegisterClass/SetTimer/DialogBoxParam calls — executing
+ * them as host functions would run i386 code in 64-bit mode. The args
+ * are pushed BELOW the guest's current esp (wt->args32, maintained per
+ * dispatch): while the guest is blocked inside a builtin call everything
+ * under its esp is dead stack. Scratch regions are spaced by call32
+ * depth so nested re-entries (wndproc -> SendMessage -> wndproc) cannot
+ * overlap. */
+uint64_t wn_wow64_call_wndproc32(uint32_t proc32, uint32_t a0, uint32_t a1,
+                                 uint32_t a2, uint32_t a3)
+{
+    wn_wow64_thread *wt = wn_wow64_thread_current();
+    if (!wt || !proc32) {
+        wn_log(WN_LOG_ERR, "wow64: wndproc32 without attached thread");
+        return 0;
+    }
+    if (wt->depth >= 15) {
+        wn_log(WN_LOG_ERR, "wow64: wndproc32 depth overflow");
+        return 0;
+    }
+    if (wt->args32 < 0x10000) {
+        wn_log(WN_LOG_ERR, "wow64: wndproc32 with no guest esp (args32=0)");
+        return 0;
+    }
+    uint32_t esp32 = (wt->args32 - (uint32_t)(wt->depth + 1) * 0x2000u) & ~15u;
+    esp32 -= 0x10;
+    uint32_t *stk = (uint32_t *)(uintptr_t)esp32;
+    stk[0] = a0;            /* hwnd  */
+    stk[1] = a1;            /* msg   */
+    stk[2] = a2;            /* wp    */
+    stk[3] = a3;            /* lp    */
+    uint32_t regs[7] = { 0, 0, 0, 0, 0, 0, 0 };
+    uint32_t esp_in = esp32;
+    if (wn_wow64_call32(proc32, &esp_in, regs) != 0)
+        return 0;
+    return regs[0];
+}
+
 /* startup: kernel32-style stack for the exe entry point */
 void wn_wow64_run_exe(uint32_t entry)
 {
@@ -976,15 +1016,18 @@ int wn_wow64_fault_hook(void *uc_, void *fault_addr_v, int si_code, int sig)
            *(uint32_t *)(wt->teb32 + TEB32_SELF));
     {
         uint32_t esp = (uint32_t)uc->uc_mcontext.gregs[REG_RSP];
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 40; i++) {
             uint32_t v = 0;
             if (esp + i * 4 > 0x10000 &&
                 msync((void *)(uintptr_t)((esp + i * 4) & ~0xFFFULL),
                       0x1000, MS_ASYNC) == 0)
                 v = *(uint32_t *)(uintptr_t)(esp + i * 4);
             char w2[96];
-            wn_module_describe_addr((const void *)(uintptr_t)v, w2, sizeof w2);
-            wn_log(WN_LOG_ERR, "wow64:   [esp+0x%x] = 0x%08x  %s",
+            if (v >= 0x400000 && v < 0x4a0000)
+                wn_module_describe_addr((const void *)(uintptr_t)v, w2, sizeof w2);
+            else
+                w2[0] = 0;
+            wn_log(WN_LOG_ERR, "wow64:   [esp+0x%02x] = 0x%08x  %s",
                    i * 4, v, w2);
         }
     }
@@ -1206,6 +1249,17 @@ int wn_wow64_guest32(void)
 void wn_wow64_out_handle(void *slot, uint64_t val)
 {
     *(uint32_t *)(void *)slot = (uint32_t)val;
+}
+
+uint64_t wn_wow64_call_wndproc32(uint32_t proc32, uint32_t a0, uint32_t a1,
+                                 uint32_t a2, uint32_t a3)
+{
+    /* Guest procs are NATIVE code on this build — call directly through a
+     * stdcall function pointer (the 4-arg stdcall shape is WN_API here). */
+    typedef WN_API uint64_t (*p4)(uint32_t, uint32_t, uint32_t, uint32_t);
+    if (!proc32)
+        return 0;
+    return ((p4)(uintptr_t)proc32)(a0, a1, a2, a3);
 }
 
 #endif  /* __x86_64__ */

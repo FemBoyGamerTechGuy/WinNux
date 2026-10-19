@@ -155,4 +155,10 @@ int wn_wow64_guest32(void);
  * the adjacent guest data (registry handles corrupted the Inno heap). */
 void wn_wow64_out_handle(void *slot, uint64_t val);
 
+/* Invoke a 32-bit guest callback (stdcall, 4 dword args: hwnd/msg/wp/lp)
+ * from the 64-bit side: wndprocs, dialog procs, timer procs. On the i386
+ * build (native guests) this calls the proc directly. */
+uint64_t wn_wow64_call_wndproc32(uint32_t proc32, uint32_t a0, uint32_t a1,
+                                uint32_t a2, uint32_t a3);
+
 #endif /* WN_WOW64_H */

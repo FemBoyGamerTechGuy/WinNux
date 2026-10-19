@@ -12,6 +12,7 @@
 #include "wn_log.h"
 #include "wn_util.h"
 #include "wn_format.h"
+#include "wn_wow64.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -40,6 +41,7 @@ typedef struct wn_wndclass {
     char name[64];
     WN_API wn_abiword (*proc)(wn_abiword, uint32_t, wn_abiword,
                               wn_abiword_s);
+    uint32_t proc32;          /* wow64: raw i386 wndproc (never call .proc) */
     uint32_t style;
     uint32_t cb_wnd_extra;      /* bytes of GWLP storage past the fixed area */
     int used;
@@ -51,6 +53,7 @@ typedef struct wn_timer {
     uint64_t period_ms;
     uint64_t next_fire;
     WN_API void (*proc)(wn_abiword, uint32_t, uintptr_t, uint32_t);
+    uint32_t proc32;         /* wow64: raw i386 timer proc (never call .proc) */
     int active;
 } wn_timer;
 
@@ -90,7 +93,12 @@ typedef struct wn_window {
     int dlg_done;
     int64_t dlg_result;
     uint64_t dlgproc;
+    uint32_t dlgproc32;     /* wow64: raw i386 dlgproc (never call dlgproc) */
     uint64_t dlg_param;
+    /* subclassing (SetWindowLong/GWLP_WNDPROC): the NEW proc; messages go
+     * here first, the class proc becomes DefWindowProc-ish fallback. */
+    uint64_t subclass;
+    uint32_t subclass32;    /* wow64: raw i386 subclass proc */
 } wn_window;
 
 /* Documented globals: GUI state (single-GUI-thread model for v1). */
@@ -123,6 +131,24 @@ static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
                                         wn_abiword wp, wn_abiword_s lp);
 static WN_API int32_t u32_MessageBoxW(wn_abiword hwnd, const uint16_t *text,
                                      const uint16_t *caption, uint32_t type);
+
+/* GUEST arch layout query: every layout-sensitive struct read/write in this
+ * file must follow the GUEST'S architecture, not the host build. The x86-64
+ * host runs i386 guests in-process (wow64), so compile-time #if is wrong;
+ * wn_wow64_guest32() answers for the current builtin call. The i386 host
+ * build (winnux32) is always 32-bit. (Systemic bug found via the Inno
+ * Setup installer: RegisterClassA read the 32-bit guest's WNDCLASSA with
+ * x64 offsets and registered a garbage class name -> "class does not
+ * exist" -> Delphi exception.) */
+static int u32_guest32(void)
+{
+#if defined(__x86_64__)
+    return wn_wow64_guest32();
+#else
+    return 1;
+#endif
+}
+
 #define DLG_X(n) ((int)((n) * 4 / 2 + ((n) & 1)))
 #define DLG_Y(n) ((int)((n) * 8 / 2))
 
@@ -812,8 +838,15 @@ static int64_t winlong_get(wn_window *w, int32_t idx)
         return 0;
     }
     if (idx == GWLP_WNDPROC) {
-        wn_log(WN_LOG_WARN, "user32: GetWindowLong(GWLP_WNDPROC) -> class "
-               "proc (subclassing unsupported)");
+        /* Real subclassing: return the CURRENT proc (subclass if set,
+         * else the class proc — the raw i386 address for a 32-bit guest's
+         * class; Delphi stores it and later calls it via CallWindowProc). */
+        if (w->subclass32)
+            return (int64_t)(uint64_t)w->subclass32;
+        if (w->subclass)
+            return (int64_t)w->subclass;
+        if (w->cls && w->cls->proc32)
+            return (int64_t)(uint64_t)w->cls->proc32;
         return w->cls ? (int64_t)(uintptr_t)w->cls->proc : 0;
     }
     wn_log(WN_LOG_WARN, "user32: GetWindowLong unknown index %d", idx);
@@ -843,6 +876,22 @@ static int64_t winlong_set(wn_window *w, int32_t idx, int64_t v)
         }
         wn_log(WN_LOG_WARN, "user32: SetWindowLong index %d beyond "
                "cbWndExtra (%u) - NOT stored", idx, avail);
+        return old;
+    }
+    if (idx == GWLP_WNDPROC) {
+        /* Install the subclass proc (the raw i386 address for a 32-bit
+         * guest). Messages now go to it first; the guest forwards to the
+         * class proc via CallWindowProc. */
+        if (u32_guest32()) {
+            w->subclass32 = (uint32_t)(uint64_t)v;
+            w->subclass = 0;
+        } else {
+            w->subclass = (uint64_t)v;
+            w->subclass32 = 0;
+        }
+        wn_log(WN_LOG_DEBUG, "user32: subclassed hwnd=%llx -> 0x%x/0x%llx",
+               (unsigned long long)(uintptr_t)hwnd_of_window(w),
+               (unsigned)w->subclass32, (unsigned long long)w->subclass);
         return old;
     }
     wn_log(WN_LOG_WARN, "user32: SetWindowLong unknown index %d (ignored)",
@@ -973,25 +1022,20 @@ static WN_API uint64_t u32_RegisterClassA(const void *wc)
     /* WNDCLASSA x64: style@0(4), lpfnWndProc@8(8), cbClsExtra@0x10,
      * cbWndExtra@0x14, hInstance@0x18, ..., lpszClassName@0x40.
      * i386: style@0, lpfnWndProc@4, cbClsExtra@8, cbWndExtra@0xC,
-     * hInstance@0x10, ..., lpszClassName@0x24 (40-byte struct). */
+     * hInstance@0x10, ..., lpszClassName@0x24 (40-byte struct).
+     * WOW64: the guest is i386 while this code is x86-64 — runtime key. */
     const uint8_t *p = wc;
-#if defined(__x86_64__)
-    const char *name = *(const char **)(const void *)(p + 0x40);
+    int g32 = u32_guest32();
+    const char *name = g32 ? *(const char **)(const void *)(p + 0x24)
+                           : *(const char **)(const void *)(p + 0x40);
     WN_API wn_abiword (*proc)(wn_abiword, uint32_t, wn_abiword,
                               wn_abiword_s) =
         (WN_API wn_abiword (*)(wn_abiword, uint32_t, wn_abiword,
                                wn_abiword_s))
-        *(const void **)(const void *)(p + 8);
-    uint32_t cb_wnd_extra = *(const uint32_t *)(const void *)(p + 0x14);
-#else
-    const char *name = *(const char **)(const void *)(p + 0x24);
-    WN_API wn_abiword (*proc)(wn_abiword, uint32_t, wn_abiword,
-                              wn_abiword_s) =
-        (WN_API wn_abiword (*)(wn_abiword, uint32_t, wn_abiword,
-                               wn_abiword_s))
-        *(const void **)(const void *)(p + 4);
-    uint32_t cb_wnd_extra = *(const uint32_t *)(const void *)(p + 0xC);
-#endif
+        (g32 ? *(const void **)(const void *)(p + 4)
+             : *(const void **)(const void *)(p + 8));
+    uint32_t cb_wnd_extra = g32 ? *(const uint32_t *)(const void *)(p + 0xC)
+                                : *(const uint32_t *)(const void *)(p + 0x14);
     if (!name || !proc) {
         wn_last_error_set(WN_ERR_INVALID_PARAMETER);
         return 0;
@@ -1005,12 +1049,20 @@ static WN_API uint64_t u32_RegisterClassA(const void *wc)
     for (int i = 0; i < 32; i++) {
         if (!g_classes[i].used) {
             snprintf(g_classes[i].name, sizeof g_classes[i].name, "%s", name);
-            g_classes[i].proc = proc;
+            if (g32) {
+                /* wow64: the wndproc is a raw i386 address — must re-enter
+                 * 32-bit mode; never store it as a callable host pointer. */
+                g_classes[i].proc = NULL;
+                g_classes[i].proc32 = (uint32_t)(uintptr_t)proc;
+            } else {
+                g_classes[i].proc = proc;
+                g_classes[i].proc32 = 0;
+            }
             g_classes[i].style = *(const uint32_t *)(const void *)p;
             g_classes[i].cb_wnd_extra = cb_wnd_extra;
             g_classes[i].used = 1;
-            wn_log(WN_LOG_DEBUG, "user32: class '%s' registered (proc %p)",
-                   name, (void *)proc);
+            wn_log(WN_LOG_DEBUG, "user32: class '%s' registered (proc %p)"
+                   " 32-bit guest proc 0x%x", name, (void *)proc, (unsigned)g_classes[i].proc32);
             return 0xC000 + (uint64_t)i;
         }
     }
@@ -1020,8 +1072,13 @@ static WN_API uint64_t u32_RegisterClassA(const void *wc)
 
 static WN_API uint64_t u32_RegisterClassW(const void *wc)
 {
+    /* WNDCLASSW: same shape as the A struct but the name pointer at
+     * 0x40(x64)/0x24(i386) is LPCWSTR. WOW64: runtime layout key. */
     const uint8_t *p = wc;
-    const uint16_t *wname = *(const uint16_t **)(const void *)(p + 0x40);
+    int g32 = u32_guest32();
+    const uint16_t *wname = g32
+        ? *(const uint16_t **)(const void *)(p + 0x24)
+        : *(const uint16_t **)(const void *)(p + 0x40);
     char name[128] = "";
     if (wname) {
         char *a = wn_utf16_to_utf8(wname, 256);
@@ -1041,20 +1098,387 @@ static WN_API uint64_t u32_RegisterClassW(const void *wc)
         const char *name;
     } wcA = { 0 };
     wcA.style = *(const uint32_t *)(const void *)p;
-    wcA.proc = *(void **)(const void *)(p + 8);
-    wcA.hinst = *(const uint64_t *)(const void *)(p + 0x18);
+    wcA.proc = g32 ? *(void **)(const void *)(p + 4)
+                   : *(void **)(const void *)(p + 8);
+    wcA.hinst = g32 ? *(const uint64_t *)(const void *)(p + 0x10)
+                    : *(const uint64_t *)(const void *)(p + 0x18);
     wcA.name = name;
     return u32_RegisterClassA(&wcA);
 }
 
+/* --- GetClassInfo + char translation (the Inno Setup class path) ------------
+ * Inno's flow is GetModuleFileName -> OemToChar -> CharLower -> GetClassInfo
+ * -> RegisterClass; every one of these was a returning-0 stub, which Delphi
+ * read as a NULL string / "class missing" and raised an exception. */
+static wn_wndclass *builtin_control_class(const char *name);
+
+static WN_API int32_t u32_GetClassInfoA(wn_abiword hinst, const char *name,
+                                        void *out)
+{
+    if (!name || !out)
+        return 0;
+    wn_wndclass *cls = NULL;
+    for (int i = 0; i < 32; i++)
+        if (g_classes[i].used && wn_strcaseeq(g_classes[i].name, name))
+            cls = &g_classes[i];
+    if (!cls)
+        cls = builtin_control_class(name);
+    if (!cls) {
+        wn_last_error_set(1407 /* ERROR_CLASS_DOES_NOT_EXIST */);
+        return 0;
+    }
+    /* WNDCLASSA: x64 style@0(4) proc@8(8) cbCls@0x10 cbWnd@0x14 hinst@0x18
+     * ... name@0x40 (0x48 bytes); i386 all-dword, proc@4, name@0x24. */
+    uint8_t *o = out;
+    int g32 = u32_guest32();
+    memset(o, 0, g32 ? 0x28 : 0x48);
+    if (g32) {
+        *(uint32_t *)(void *)(o + 0x00) = cls->style;
+        *(uint32_t *)(void *)(o + 0x04) = cls->proc32;
+        *(uint32_t *)(void *)(o + 0x0C) = cls->cb_wnd_extra;
+        *(uint32_t *)(void *)(o + 0x10) = (uint32_t)hinst;
+        *(uint32_t *)(void *)(o + 0x24) = (uint32_t)(uintptr_t)name;
+    } else {
+        *(uint32_t *)(void *)(o + 0x00) = cls->style;
+        *(uint64_t *)(void *)(o + 0x08) =
+            cls->proc32 ? (uint64_t)cls->proc32 : (uint64_t)(uintptr_t)cls->proc;
+        *(uint32_t *)(void *)(o + 0x14) = cls->cb_wnd_extra;
+        *(uint64_t *)(void *)(o + 0x18) = hinst;
+        *(uint64_t *)(void *)(o + 0x40) = (uint64_t)(uintptr_t)name;
+    }
+    return 1;
+}
+
+static WN_API int32_t u32_GetClassInfoW(wn_abiword hinst, const uint16_t *wname,
+                                        void *out)
+{
+    if (!wname || !out)
+        return 0;
+    char *name = wn_utf16_to_utf8(wname, 256);
+    if (!name)
+        return 0;
+    wn_wndclass *cls = NULL;
+    for (int i = 0; i < 32; i++)
+        if (g_classes[i].used && wn_strcaseeq(g_classes[i].name, name))
+            cls = &g_classes[i];
+    if (!cls)
+        cls = builtin_control_class(name);
+    if (!cls) {
+        free(name);
+        wn_last_error_set(1407 /* ERROR_CLASS_DOES_NOT_EXIST */);
+        return 0;
+    }
+    /* fill the W-layout struct ourselves: same offsets as the A struct,
+     * but lpszClassName@0x40(x64)/0x24(i386) is the guest's LPCWSTR. */
+    uint8_t *o = out;
+    int g32 = u32_guest32();
+    memset(o, 0, g32 ? 0x28 : 0x48);
+    if (g32) {
+        *(uint32_t *)(void *)(o + 0x00) = cls->style;
+        *(uint32_t *)(void *)(o + 0x04) = cls->proc32;
+        *(uint32_t *)(void *)(o + 0x0C) = cls->cb_wnd_extra;
+        *(uint32_t *)(void *)(o + 0x10) = (uint32_t)hinst;
+        *(uint32_t *)(void *)(o + 0x24) = (uint32_t)(uintptr_t)wname;
+    } else {
+        *(uint32_t *)(void *)(o + 0x00) = cls->style;
+        *(uint64_t *)(void *)(o + 0x08) =
+            cls->proc32 ? (uint64_t)cls->proc32 : (uint64_t)(uintptr_t)cls->proc;
+        *(uint32_t *)(void *)(o + 0x14) = cls->cb_wnd_extra;
+        *(uint64_t *)(void *)(o + 0x18) = hinst;
+        *(uint64_t *)(void *)(o + 0x40) = (uint64_t)(uintptr_t)wname;
+    }
+    free(name);
+    return 1;
+}
+
+/* CharLower/CharUpper: lowercase/uppercase IN PLACE and return the pointer
+ * (the return value IS a string pointer — returning 0 turned Delphi's
+ * class-name into NULL). Buff variants take a length and return it. */
+static WN_API uint64_t u32_CharLowerA(wn_abiword s)
+{
+    char *p = (char *)(uintptr_t)s;
+    if (!p)
+        return 0;
+    for (; *p; p++)
+        if (*p >= 'A' && *p <= 'Z')
+            *p += 32;
+    return s;
+}
+
+static WN_API uint64_t u32_CharUpperA(wn_abiword s)
+{
+    char *p = (char *)(uintptr_t)s;
+    if (!p)
+        return 0;
+    for (; *p; p++)
+        if (*p >= 'a' && *p <= 'z')
+            *p -= 32;
+    return s;
+}
+
+static WN_API uint64_t u32_CharLowerW(wn_abiword s)
+{
+    uint16_t *p = (uint16_t *)(uintptr_t)s;
+    if (!p)
+        return 0;
+    for (; *p; p++)
+        if (*p >= 'A' && *p <= 'Z')
+            *p += 32;
+        else if (*p >= 0xC380 && *p <= 0xC39A)   /* Latin-1 caps */
+            *p += 32;
+    return s;
+}
+
+static WN_API uint64_t u32_CharUpperW(wn_abiword s)
+{
+    uint16_t *p = (uint16_t *)(uintptr_t)s;
+    if (!p)
+        return 0;
+    for (; *p; p++)
+        if (*p >= 'a' && *p <= 'z')
+            *p -= 32;
+        else if (*p >= 0xC3A0 && *p <= 0xC3B6)
+            *p -= 32;
+    return s;
+}
+
+static WN_API uint32_t u32_CharLowerBuffA(char *s, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+        if (s[i] >= 'A' && s[i] <= 'Z')
+            s[i] += 32;
+    return len;
+}
+
+static WN_API uint32_t u32_CharUpperBuffA(char *s, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+        if (s[i] >= 'a' && s[i] <= 'z')
+            s[i] -= 32;
+    return len;
+}
+
+static WN_API uint32_t u32_CharLowerBuffW(uint16_t *s, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+        if (s[i] >= 'A' && s[i] <= 'Z')
+            s[i] += 32;
+    return len;
+}
+
+static WN_API uint32_t u32_CharUpperBuffW(uint16_t *s, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+        if (s[i] >= 'a' && s[i] <= 'z')
+            s[i] -= 32;
+    return len;
+}
+
+/* OemToChar/CharToOem: OEM and ANSI overlap for the printable ASCII range
+ * (everything installers pass through them), so a byte copy is the right
+ * v1 semantics. W variants widen via UTF-8. In-place use is common
+ * (src == dst) — memmove covers it. */
+static WN_API int32_t u32_OemToCharA(const char *src, char *dst)
+{
+    if (!src || !dst)
+        return 0;
+    memmove(dst, src, strlen(src) + 1);
+    return 1;
+}
+
+static WN_API int32_t u32_CharToOemA(const char *src, char *dst)
+{
+    return u32_OemToCharA(src, dst);
+}
+
+static WN_API int32_t u32_OemToCharBuffA(const char *src, char *dst,
+                                         uint32_t len)
+{
+    if (!src || !dst || !len)
+        return 0;
+    memmove(dst, src, len);
+    return 1;
+}
+
+static WN_API int32_t u32_CharToOemBuffA(const char *src, char *dst,
+                                         uint32_t len)
+{
+    return u32_OemToCharBuffA(src, dst, len);
+}
+
+static WN_API int32_t u32_OemToCharW(const char *src, uint16_t *dst)
+{
+    if (!src || !dst)
+        return 0;
+    /* OEM(ANSI) -> UTF-16 */
+    uint16_t *w = wn_utf8_to_utf16_n(src, strlen(src) + 1);
+    if (!w)
+        return 0;
+    size_t n16 = 0;
+    while (w[n16])
+        n16++;
+    memcpy(dst, w, (n16 + 1) * 2);
+    free(w);
+    return 1;
+}
+
+static WN_API int32_t u32_CharToOemW(const uint16_t *src, char *dst)
+{
+    if (!src || !dst)
+        return 0;
+    char *a = wn_utf16_to_utf8(src, 4096);
+    if (!a)
+        return 0;
+    memmove(dst, a, strlen(a) + 1);
+    free(a);
+    return 1;
+}
+
 static wn_wndclass *builtin_control_class(const char *name);
 static void compose_child(wn_window *child);
+static WN_API int32_t u32_DestroyWindow(wn_abiword hwnd);
 
-static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_name,
-                                           const char *title, uint32_t style,
-                                           int x, int y, int w, int h,
-                                           wn_abiword parent, wn_abiword menu,
-                                           wn_abiword hinst, void *param)
+/* Invoke a window proc with the right width. The window's subclass
+ * (SetWindowLong/GWLP_WNDPROC) runs first; 32-bit (wow64) procs are raw
+ * i386 addresses that must re-enter 32-bit mode — calling them as host
+ * functions would execute i386 code in 64-bit mode. On the i386 build
+ * (and for host builtin classes) .proc is native and called directly. */
+static uint64_t call_guest_wndproc(const wn_window *w, uint64_t hwnd,
+                                   uint32_t msg, uint64_t wp, int64_t lp)
+{
+    if (w->subclass32)
+        return wn_wow64_call_wndproc32(w->subclass32, (uint32_t)hwnd, msg,
+                                       (uint32_t)wp, (uint32_t)lp);
+    if (w->subclass) {
+        typedef WN_API uint64_t (*p4)(wn_abiword, uint32_t, wn_abiword,
+                                      wn_abiword_s);
+        return ((p4)(uintptr_t)w->subclass)((wn_abiword)hwnd, msg,
+                                            (wn_abiword)wp,
+                                            (wn_abiword_s)lp);
+    }
+    const wn_wndclass *cls = w->cls;
+    if (!cls)
+        return 0;
+    if (cls->proc32)
+        return wn_wow64_call_wndproc32(cls->proc32, (uint32_t)hwnd, msg,
+                                       (uint32_t)wp, (uint32_t)lp);
+    if (!cls->proc)
+        return 0;
+    return cls->proc((wn_abiword)hwnd, msg, (wn_abiword)wp,
+                     (wn_abiword_s)lp);
+}
+
+/* Invoke a guest dlgproc (same rules as call_guest_wndproc; w->dlgproc32
+ * is set at dialog creation when the caller is a 32-bit guest). */
+static int64_t call_guest_dlgproc(const wn_window *w, uint64_t hwnd,
+                                  uint32_t msg, uint64_t wp, int64_t lp)
+{
+    if (w->dlgproc32)
+        return (int64_t)wn_wow64_call_wndproc32(w->dlgproc32, (uint32_t)hwnd,
+                                               msg, (uint32_t)wp,
+                                               (uint32_t)lp);
+    typedef WN_API wn_abiword_s (*dlgproc_fn)(wn_abiword, uint32_t,
+                                              wn_abiword, wn_abiword_s);
+    return ((dlgproc_fn)(uintptr_t)w->dlgproc)((wn_abiword)hwnd, msg,
+                                               (wn_abiword)wp,
+                                               (wn_abiword_s)lp);
+}
+
+/* Windows sends the create-message sequence (WM_NCCREATE, WM_NCCALCSIZE,
+ * WM_CREATE) synchronously INSIDE CreateWindowEx, before the handle is
+ * returned — never through the queue (posting WM_CREATE made Inno Setup's
+ * pump dispatch it with lp=NULL forever, and starved the queue of the
+ * messages that actually matter). Delphi/VCL and installer frameworks
+ * hook their per-window data via lpCreateParams inside exactly this
+ * window. The CREATESTRUCT/RECT are laid out for the GUEST arch (wow64:
+ * i386 shapes in low memory) and freed after delivery.
+ * Returns 0 when the proc rejected creation (-1), else 1. */
+static int send_create_msgs(uint64_t hwnd, uint64_t hinst, uint64_t menu,
+                            uint64_t parent, int x, int y, int cw, int ch,
+                            uint32_t style, uint32_t ex_style,
+                            uint64_t lp_create_params,
+                            uint64_t lpsz_name, uint64_t lpsz_class)
+{
+    int g32 = u32_guest32();
+    size_t cs_sz = g32 ? 0x30 : 0x50;
+    size_t rect_off = cs_sz;            /* RECT right after CREATESTRUCT */
+    size_t blk_sz = rect_off + 16;
+    uint8_t *blk;
+#if defined(__x86_64__)
+    blk = g32 ? wn_low_malloc(blk_sz) : wn_xmalloc(blk_sz);
+#else
+    blk = wn_xmalloc(blk_sz);           /* 32-bit host: guest reads host VA */
+#endif
+    memset(blk, 0, blk_sz);
+    uint32_t *rc = (uint32_t *)(void *)(blk + rect_off);
+    rc[0] = (uint32_t)x; rc[1] = (uint32_t)y;
+    rc[2] = (uint32_t)(x + cw); rc[3] = (uint32_t)(y + ch);
+    if (g32) {
+        uint32_t *cs = (uint32_t *)(void *)blk;
+        cs[0]  = (uint32_t)lp_create_params;
+        cs[1]  = (uint32_t)hinst;
+        cs[2]  = (uint32_t)menu;
+        cs[3]  = (uint32_t)parent;
+        cs[4]  = (uint32_t)ch;         /* cy */
+        cs[5]  = (uint32_t)cw;         /* cx */
+        cs[6]  = (uint32_t)y;
+        cs[7]  = (uint32_t)x;
+        cs[8]  = style;
+        cs[9]  = (uint32_t)lpsz_name;
+        cs[10] = (uint32_t)lpsz_class;
+        cs[11] = ex_style;
+    } else {
+        uint64_t *q = (uint64_t *)(void *)blk;
+        q[0] = lp_create_params; q[1] = hinst;
+        q[2] = menu;            q[3] = parent;
+        *(uint32_t *)(void *)(blk + 0x20) = (uint32_t)ch;
+        *(uint32_t *)(void *)(blk + 0x24) = (uint32_t)cw;
+        *(uint32_t *)(void *)(blk + 0x28) = (uint32_t)y;
+        *(uint32_t *)(void *)(blk + 0x2C) = (uint32_t)x;
+        *(uint32_t *)(void *)(blk + 0x30) = style;
+        q[7] = lpsz_name;        /* blk + 0x38 */
+        q[8] = lpsz_class;       /* blk + 0x40 */
+        *(uint32_t *)(void *)(blk + 0x48) = ex_style;
+    }
+    uint64_t r;
+    r = u32_SendMessageA((wn_abiword)hwnd, 0x0081 /* WM_NCCREATE */, 0,
+                         (wn_abiword_s)(int64_t)(uintptr_t)blk);
+    if (r == (uint64_t)-1)
+        goto fail;
+    /* wParam = FALSE: lParam points at a RECT the proc may shrink. */
+    u32_SendMessageA((wn_abiword)hwnd, 0x0083 /* WM_NCCALCSIZE */, 0,
+                     (wn_abiword_s)(int64_t)(uintptr_t)(blk + rect_off));
+    r = u32_SendMessageA((wn_abiword)hwnd, WN_WM_CREATE, 0,
+                         (wn_abiword_s)(int64_t)(uintptr_t)blk);
+    if (r == (uint64_t)-1)
+        goto fail;
+#if defined(__x86_64__)
+    if (g32) wn_low_free(blk); else free(blk);
+#else
+    free(blk);
+#endif
+    return 1;
+fail:
+#if defined(__x86_64__)
+    if (g32) wn_low_free(blk); else free(blk);
+#else
+    free(blk);
+#endif
+    return 0;
+}
+
+/* Core creation path. lpsz_class_orig / lpsz_name_orig are the GUEST's
+ * original class/title pointers (CreateWindowExA: the char* args;
+ * CreateWindowExW: the guest's UTF-16 pointers) handed back inside the
+ * CREATESTRUCT. Internal callers (dialog engine) pass 0 — their strings
+ * are host-side and must not be shown to a 32-bit guest. */
+static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
+                                   const char *title,
+                                   uint64_t lpsz_class_orig,
+                                   uint64_t lpsz_name_orig,
+                                   uint32_t style, int x, int y, int w, int h,
+                                   wn_abiword parent, wn_abiword menu,
+                                   wn_abiword hinst, void *param)
 {
     if (ensure_gui() != 0 && !parent) {
         wn_last_error_set(WN_ERR_NOT_SUPPORTED);
@@ -1111,7 +1535,14 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
         memset(win->bwin->pixels, 0xFF, (size_t)win->cw * win->ch * 4);
         wn_handle hwnd = register_hwnd(win);
         (void)ex_style;
-        post_msg((uint64_t)(uintptr_t)hwnd, WN_WM_CREATE, 0, 0);
+        if (!send_create_msgs((uint64_t)(uintptr_t)hwnd, hinst, menu, parent,
+                              x, y, win->cw, win->ch, style, ex_style,
+                              (uint64_t)(uintptr_t)param,
+                              lpsz_name_orig, lpsz_class_orig)) {
+            u32_DestroyWindow((wn_abiword)(uintptr_t)hwnd);
+            wn_last_error_set(WN_ERR_NOT_SUPPORTED);
+            return 0;
+        }
         wn_log(WN_LOG_DEBUG, "user32: CreateWindow child '%s' id=%llu "
                "hwnd=0x%llx %dx%d at %d,%d", cls_name,
                (unsigned long long)menu, (unsigned long long)(uintptr_t)hwnd,
@@ -1168,13 +1599,35 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
     if (!(style & 0x00040000u /*WS_THICKFRAME*/) && be->win_fixed_size)
         be->win_fixed_size(win->bwin);
 
+    /* Windows order: WM_NCCREATE/WM_NCCALCSIZE/WM_CREATE (sent inside
+     * CreateWindowEx), THEN the show sequence. */
+    if (!send_create_msgs((uint64_t)(uintptr_t)hwnd, hinst, menu, parent,
+                          x, y, w, h, style, ex_style,
+                          (uint64_t)(uintptr_t)param,
+                          lpsz_name_orig, lpsz_class_orig)) {
+        u32_DestroyWindow((wn_abiword)(uintptr_t)hwnd);
+        wn_last_error_set(WN_ERR_NOT_SUPPORTED);
+        return 0;
+    }
+
     if (style & 0x10000000 /* WS_VISIBLE */)
         u32_ShowWindow((uint64_t)(uintptr_t)hwnd, 5);
 
-    post_msg((uint64_t)(uintptr_t)hwnd, WN_WM_CREATE, 0, 0);
     wn_log(WN_LOG_DEBUG, "user32: CreateWindow('%s') hwnd=0x%llx %dx%d",
            cls_name, (unsigned long long)(uintptr_t)hwnd, w, h);
     return (uint64_t)(uintptr_t)hwnd;
+}
+
+static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_name,
+                                           const char *title, uint32_t style,
+                                           int x, int y, int w, int h,
+                                           wn_abiword parent, wn_abiword menu,
+                                           wn_abiword hinst, void *param)
+{
+    return create_window_core(ex_style, cls_name, title,
+                              (uint64_t)(uintptr_t)cls_name,
+                              (uint64_t)(uintptr_t)title,
+                              style, x, y, w, h, parent, menu, hinst, param);
 }
 
 static WN_API uint64_t u32_CreateWindowExW(uint32_t ex, const uint16_t *cls,
@@ -1185,8 +1638,12 @@ static WN_API uint64_t u32_CreateWindowExW(uint32_t ex, const uint16_t *cls,
 {
     char *c = cls ? wn_utf16_to_utf8(cls, 256) : NULL;
     char *t = title ? wn_utf16_to_utf8(title, 256) : NULL;
-    uint64_t r = u32_CreateWindowExA(ex, c ? c : "", t ? t : "", style, x, y,
-                                     w, h, parent, menu, hinst, param);
+    /* The CREATESTRUCT must carry the guest's ORIGINAL UTF-16 pointers. */
+    uint64_t r = create_window_core(ex, c ? c : "", t ? t : "",
+                                    (uint64_t)(uintptr_t)cls,
+                                    (uint64_t)(uintptr_t)title,
+                                    style, x, y, w, h, parent, menu, hinst,
+                                    param);
     if (r) {
         wn_window *ww = win_from_hwnd(r);
         if (ww)
@@ -1212,8 +1669,9 @@ static WN_API int32_t u32_DestroyWindow(wn_abiword hwnd)
             u32_DestroyWindow((uint64_t)(uintptr_t)g_hwnds[i].h);
     }
     /* WM_DESTROY goes through the proc directly (in-order with calls). */
-    if (w->cls && w->cls->proc)
-        w->cls->proc(hwnd, WN_WM_DESTROY, 0, 0);
+    if (w->cls && (w->cls->proc || w->cls->proc32 || w->subclass ||
+                   w->subclass32))
+        call_guest_wndproc(w, hwnd, WN_WM_DESTROY, 0, 0);
     /* control payloads (tree view nodes, list items) */
     if (w->ctl_priv)
         tv_free(w);
@@ -1269,7 +1727,11 @@ static void fire_timers(void)
         if (!g_timers[i].active || g_timers[i].next_fire > now)
             continue;
         g_timers[i].next_fire = now + g_timers[i].period_ms;
-        if (g_timers[i].proc) {
+        if (g_timers[i].proc32) {
+            wn_wow64_call_wndproc32(g_timers[i].proc32,
+                                   (uint32_t)g_timers[i].hwnd, WN_WM_TIMER,
+                                   (uint32_t)g_timers[i].id, 0);
+        } else if (g_timers[i].proc) {
             g_timers[i].proc(g_timers[i].hwnd, WN_WM_TIMER,
                              g_timers[i].id, 0);
         } else {
@@ -1330,42 +1792,54 @@ void wn_user32_paint_rect(uint64_t hwnd, int *l, int *t, int *r, int *b)
     *r = w->dirty.r; *b = w->dirty.b;
 }
 
-/* Fill the guest MSG x64 struct from an internal message:
- * hwnd@0, message@8, wParam@0x10, lParam@0x18, time@0x20, pt@0x24. */
-/* Guest MSG layout (winuser.h): x64 = 48 bytes, i386 = 28 bytes. Writing
- * the x64 shape on i386 smashes the caller's frame past its 28-byte MSG. */
-#if defined(__x86_64__)
-#define WN_MSG_HOFF    0x00
-#define WN_MSG_MSGOFF  0x08
-#define WN_MSG_WPOFF   0x10
-#define WN_MSG_LPOFF   0x18
-#define WN_MSG_TIMEOFF 0x20
-#define WN_MSG_FILL    0x30
-#else
-#define WN_MSG_HOFF    0x00
-#define WN_MSG_MSGOFF  0x04
-#define WN_MSG_WPOFF   0x08
-#define WN_MSG_LPOFF   0x0C
-#define WN_MSG_TIMEOFF 0x10
-#define WN_MSG_FILL    0x1C
-#endif
-
+/* Guest MSG layout (winuser.h): x64 = 48 bytes (hwnd@0, message@8,
+ * wParam@0x10, lParam@0x18, time@0x20, pt@0x24), i386 = 28 bytes
+ * (hwnd@0, message@4, wParam@8, lParam@0xC, time@0x10, pt@0x14).
+ * The layout follows the GUEST's architecture (see u32_guest32 at the
+ * top): the 32-byte shape on an i386 guest smashes the caller's frame
+ * and leaves garbage fields (found via the Inno Setup installer loop). */
 static void fill_msg(void *msg_out, const wn_msg *m)
 {
     uint8_t *o = msg_out;
-    memset(o, 0, WN_MSG_FILL);
-#if defined(__x86_64__)
-    *(uint64_t *)(void *)(o + WN_MSG_HOFF) = m->hwnd;
-    *(uint64_t *)(void *)(o + WN_MSG_WPOFF) = m->wparam;
-    *(int64_t *)(void *)(o + WN_MSG_LPOFF) = m->lparam;
-#else
-    *(uint32_t *)(void *)(o + WN_MSG_HOFF) = (uint32_t)m->hwnd;
-    *(uint32_t *)(void *)(o + WN_MSG_WPOFF) = (uint32_t)m->wparam;
-    *(int32_t *)(void *)(o + WN_MSG_LPOFF) = (int32_t)m->lparam;
-#endif
-    *(uint32_t *)(void *)(o + WN_MSG_MSGOFF) = m->message;
-    *(uint32_t *)(void *)(o + WN_MSG_TIMEOFF) = m->time;
+    if (u32_guest32()) {
+        memset(o, 0, 0x1C);
+        *(uint32_t *)(void *)(o + 0x00) = (uint32_t)m->hwnd;
+        *(uint32_t *)(void *)(o + 0x04) = m->message;
+        *(uint32_t *)(void *)(o + 0x08) = (uint32_t)m->wparam;
+        *(int32_t  *)(void *)(o + 0x0C) = (int32_t)m->lparam;
+        *(uint32_t *)(void *)(o + 0x10) = m->time;
+        *(int32_t  *)(void *)(o + 0x14) = m->pt_x;
+        *(int32_t  *)(void *)(o + 0x18) = m->pt_y;
+    } else {
+        memset(o, 0, 0x30);
+        *(uint64_t *)(void *)(o + 0x00) = m->hwnd;
+        *(uint32_t *)(void *)(o + 0x08) = m->message;
+        *(uint64_t *)(void *)(o + 0x10) = m->wparam;
+        *(int64_t  *)(void *)(o + 0x18) = m->lparam;
+        *(uint32_t *)(void *)(o + 0x20) = m->time;
+        *(int32_t  *)(void *)(o + 0x24) = m->pt_x;
+        *(int32_t  *)(void *)(o + 0x28) = m->pt_y;
+    }
     g_last_msg_time = m->time;    /* GetMessageTime */
+}
+
+/* Parse a guest MSG back out (DispatchMessage/TranslateMessage read the
+ * buffer PeekMessage filled a moment ago — same guest-layout rules). */
+static void msg_read(const void *msg, uint64_t *hwnd, uint32_t *message,
+                     uint64_t *wp, int64_t *lp)
+{
+    const uint8_t *p = msg;
+    if (u32_guest32()) {
+        *hwnd    = *(const uint32_t *)(const void *)(p + 0x00);
+        *message = *(const uint32_t *)(const void *)(p + 0x04);
+        *wp      = *(const uint32_t *)(const void *)(p + 0x08);
+        *lp      = *(const int32_t  *)(const void *)(p + 0x0C);
+    } else {
+        *hwnd    = *(const uint64_t *)(const void *)(p + 0x00);
+        *message = *(const uint32_t *)(const void *)(p + 0x08);
+        *wp      = *(const uint64_t *)(const void *)(p + 0x10);
+        *lp      = *(const int64_t  *)(const void *)(p + 0x18);
+    }
 }
 
 /* One non-blocking pump pass: timers, synthesized paints, backend events.
@@ -1457,7 +1931,12 @@ static WN_API int32_t u32_PeekMessageA(void *msg_out, wn_abiword hwnd,
         fill_msg(msg_out, &q);
         return 0;
     }
-    if (remove & 1 /* PM_NOREMOVE */) {
+    /* wRemoveCmd: PM_NOREMOVE = 0 (leave the message queued), PM_REMOVE = 1
+     * (consume it). This was INVERTED for the project's whole life: Inno
+     * Setup's silent-mode pump (PeekMessage(..., PM_REMOVE)) re-peeked the
+     * same message forever and the installer never progressed (the
+     * "millions of PeekMessageA lines" report). */
+    if (!(remove & 1 /* PM_REMOVE */)) {
         if (!queue_peek(&m))
             return 0;
     } else {
@@ -1470,18 +1949,22 @@ static WN_API int32_t u32_PeekMessageA(void *msg_out, wn_abiword hwnd,
 
 static WN_API uint64_t u32_DispatchMessageA(const void *msg)
 {
-    const uint8_t *p = msg;
-    wn_abiword hwnd = *(const wn_abiword *)(const void *)(p + WN_MSG_HOFF);
-    uint32_t message = *(const uint32_t *)(const void *)(p + WN_MSG_MSGOFF);
-    wn_abiword wp = *(const wn_abiword *)(const void *)(p + WN_MSG_WPOFF);
-    wn_abiword_s lp = *(const wn_abiword_s *)(const void *)(p + WN_MSG_LPOFF);
+    uint64_t hwnd;
+    uint32_t message;
+    uint64_t wp;
+    int64_t lp;
+    msg_read(msg, &hwnd, &message, &wp, &lp);
     wn_window *w = win_from_hwnd(hwnd);
     wn_log(WN_LOG_DEBUG, "dispatch: hwnd=%llx msg=%u wp=%llx lp=%llx w=%p",
            (unsigned long long)hwnd, message, (unsigned long long)wp,
            (unsigned long long)lp, (void *)w);
-    if (w && w->cls && w->cls->proc) {
-        wn_log(WN_LOG_DEBUG, "dispatch: -> proc %p", (void *)(uintptr_t)w->cls->proc);
-        return w->cls->proc(hwnd, message, wp, lp);
+    if (w && ((w->cls && (w->cls->proc || w->cls->proc32)) ||
+              w->subclass || w->subclass32)) {
+        wn_log(WN_LOG_DEBUG, "dispatch: -> proc %p / 32-bit 0x%x subclass 0x%x",
+               w->cls ? (void *)(uintptr_t)w->cls->proc : NULL,
+               w->cls ? (unsigned)w->cls->proc32 : 0u,
+               (unsigned)w->subclass32);
+        return call_guest_wndproc(w, hwnd, message, wp, lp);
     }
     return 0;
 }
@@ -1500,6 +1983,9 @@ static WN_API uint64_t u32_DefWindowProcA(wn_abiword hwnd, uint32_t msg,
             w->dirty.l = -1;
         return 0;
     }
+    case 0x0081 /* WM_NCCREATE */:
+        /* DefWindowProc returns TRUE to let creation proceed. */
+        return 1;
     default:
         return 0;
     }
@@ -1517,9 +2003,37 @@ static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
                                         wn_abiword wp, wn_abiword_s lp)
 {
     wn_window *w = win_from_hwnd(hwnd);
-    if (w && w->cls && w->cls->proc)
-        return w->cls->proc(hwnd, msg, wp, lp);
+    if (w && ((w->cls && (w->cls->proc || w->cls->proc32)) ||
+              w->subclass || w->subclass32))
+        return call_guest_wndproc(w, (uint64_t)hwnd, msg,
+                                  (uint64_t)wp, (int64_t)lp);
     return u32_DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+/* CallWindowProc: subclass chains forward to the ORIGINAL proc through
+ * this. The proc argument is the value GetWindowLong returned — a raw
+ * i386 address for 32-bit guests, callable only via the wow64 bridge. */
+static WN_API uint64_t u32_CallWindowProcA(wn_abiword proc, wn_abiword hwnd,
+                                          uint32_t msg, wn_abiword wp,
+                                          wn_abiword_s lp)
+{
+    if (u32_guest32())
+        return wn_wow64_call_wndproc32((uint32_t)(uint64_t)proc,
+                                       (uint32_t)(uint64_t)hwnd, msg,
+                                       (uint32_t)(uint64_t)wp,
+                                       (uint32_t)(uint64_t)lp);
+    typedef WN_API uint64_t (*p4)(wn_abiword, uint32_t, wn_abiword,
+                                  wn_abiword_s);
+    if (!proc)
+        return 0;
+    return ((p4)(uintptr_t)proc)(hwnd, msg, wp, lp);
+}
+
+static WN_API uint64_t u32_CallWindowProcW(wn_abiword proc, wn_abiword hwnd,
+                                          uint32_t msg, wn_abiword wp,
+                                          wn_abiword_s lp)
+{
+    return u32_CallWindowProcA(proc, hwnd, msg, wp, lp);
 }
 
 static WN_API uintptr_t u32_SetTimer(wn_abiword hwnd, uintptr_t id,
@@ -1535,6 +2049,11 @@ static WN_API uintptr_t u32_SetTimer(wn_abiword hwnd, uintptr_t id,
             g_timers[i].period_ms = ms ? ms : 10;
             g_timers[i].next_fire = wn_monotonic_ns() / 1000000 + ms;
             g_timers[i].proc = proc;
+            /* wow64: a 32-bit guest's TIMERPROC is a raw i386 address. */
+            g_timers[i].proc32 = (proc && u32_guest32())
+                ? (uint32_t)(uintptr_t)proc : 0;
+            if (g_timers[i].proc32)
+                g_timers[i].proc = NULL;
             g_timers[i].active = 1;
             return id;
         }
@@ -2306,7 +2825,7 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
      * background and composing children — the guest dlgproc never paints
      * the face color itself (found via putty: dialog went black after the
      * routing fix). */
-    if (w->is_dialog && w->dlgproc) {
+    if (w->is_dialog && (w->dlgproc || w->dlgproc32)) {
         if (msg == WN_WM_PAINT) {
             wn_handle hdc = g32_GetDC(hwnd);
             if (hdc) {
@@ -2322,9 +2841,7 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
             w->dirty.l = -1;
             w->paint_pending = 0;   /* re-arm generate_paints */
         }
-        typedef WN_API wn_abiword_s (*dlgproc_fn)(
-            wn_abiword, uint32_t, wn_abiword, wn_abiword_s);
-        int64_t r = ((dlgproc_fn)(uintptr_t)w->dlgproc)(hwnd, msg, wp, lp);
+        int64_t r = call_guest_dlgproc(w, hwnd, msg, wp, lp);
         if (r)
             return (uint64_t)r;
         return u32_DefWindowProcA(hwnd, msg, wp, lp);
@@ -3121,7 +3638,9 @@ static uint64_t create_dialog_from_template(uint64_t hinst,
             dy += ow->wy;
         }
     }
-    uint64_t hwnd = u32_CreateWindowExA(ex_style, "#32770", title,
+    /* Dialog frame: internal strings are HOST copies — pass 0 origs so a
+     * 32-bit guest never sees a host pointer inside the CREATESTRUCT. */
+    uint64_t hwnd = create_window_core(ex_style, "#32770", title, 0, 0,
                                         style | (force_visible ? 0x10000000u : 0),
                                         dx, dy,
                                         DLG_X(cx), DLG_Y(cy),
@@ -3131,6 +3650,11 @@ static uint64_t create_dialog_from_template(uint64_t hinst,
     wn_window *dw = win_from_hwnd(hwnd);
     dw->is_dialog = 1;
     dw->dlgproc = dlgproc;
+    /* wow64: a 32-bit guest's DLGPROC is a raw i386 address. */
+    dw->dlgproc32 = (dlgproc && u32_guest32())
+        ? (uint32_t)(uintptr_t)dlgproc : 0;
+    if (dw->dlgproc32)
+        dw->dlgproc = 0;
     dw->dlg_param = param;
 
     /* items */
@@ -3179,18 +3703,20 @@ static uint64_t create_dialog_from_template(uint64_t hinst,
             wn_log(WN_LOG_WARN, "user32: dialog item without class");
             continue;
         }
-        u32_CreateWindowExA(iex, class_name, ititle,
-                            istyle | WN_WS_CHILD | 0x10000000u /*WS_VISIBLE*/,
-                            DLG_X(ix), DLG_Y(iy), DLG_X(icx), DLG_Y(icy),
-                            hwnd, iid, hinst, 0);
+        create_window_core(iex, class_name, ititle, 0, 0,
+                          istyle | WN_WS_CHILD | 0x10000000u /*WS_VISIBLE*/,
+                          DLG_X(ix), DLG_Y(iy), DLG_X(icx), DLG_Y(icy),
+                          hwnd, iid, hinst, 0);
     }
 
     /* WM_INITDIALOG -> guest dlgproc */
     if (dlgproc) {
-        typedef WN_API wn_abiword_s (*dlgproc_fn)(
-            wn_abiword, uint32_t, wn_abiword, wn_abiword_s);
-        ((dlgproc_fn)(uintptr_t)dlgproc)(hwnd, WN_WM_INITDIALOG, 0,
-                                         (int64_t)param);
+        wn_window *dw_tmp = win_from_hwnd(hwnd);
+        if (dw_tmp)
+            call_guest_dlgproc(dw_tmp, hwnd, WN_WM_INITDIALOG, 0,
+                              (int64_t)param);
+        else
+            ((void)dlgproc);   /* unreachable: dw exists if hwnd does */
     }
     compose_children_of(hwnd);
     if (dw->visible)
@@ -3210,9 +3736,12 @@ static int32_t u32_IsDialogMessage_impl(uint64_t hdlg, const uint8_t *msg)
 {
     if (!msg)
         return 0;
-    wn_abiword hwnd = *(const wn_abiword *)(const void *)(msg + WN_MSG_HOFF);
-    uint32_t message = *(const uint32_t *)(const void *)(msg + WN_MSG_MSGOFF);
-    wn_abiword wp = *(const wn_abiword *)(const void *)(msg + WN_MSG_WPOFF);
+    uint64_t hwnd;
+    uint32_t message;
+    uint64_t wp;
+    int64_t lp;
+    msg_read(msg, &hwnd, &message, &wp, &lp);
+    (void)lp;
     (void)hdlg;
     wn_window *dlg = win_from_hwnd(hwnd);
     if (!dlg || !dlg->is_dialog)
@@ -3366,9 +3895,10 @@ static WN_API int32_t u32_SetDlgItemTextA(wn_abiword hwnd, int32_t id,
     if (!c)
         return 0;
     wn_window *w = win_from_hwnd(c);
-    if (w && w->cls && w->cls->proc)
-        return (int32_t)w->cls->proc(c, WN_WM_SETTEXT, 0,
-                                     (int64_t)(uintptr_t)text);
+    if (w && w->cls && (w->cls->proc || w->cls->proc32 ||
+                        w->subclass || w->subclass32))
+        return (int32_t)call_guest_wndproc(w, c, WN_WM_SETTEXT, 0,
+                                          (int64_t)(uintptr_t)text);
     return 0;
 }
 
@@ -4479,7 +5009,26 @@ const wn_export_entry wn_user32_exports[] = {
     { "RegisterClassA", u32_RegisterClassA },
     { "ReleaseDC", g32_ReleaseDC },
     { "RegisterClassW", u32_RegisterClassW },
+    { "GetClassInfoA", u32_GetClassInfoA },
+    { "GetClassInfoW", u32_GetClassInfoW },
+    { "CharLowerA", u32_CharLowerA },
+    { "CharLowerW", u32_CharLowerW },
+    { "CharUpperA", u32_CharUpperA },
+    { "CharUpperW", u32_CharUpperW },
+    { "CharLowerBuffA", u32_CharLowerBuffA },
+    { "CharLowerBuffW", u32_CharLowerBuffW },
+    { "CharUpperBuffA", u32_CharUpperBuffA },
+    { "CharUpperBuffW", u32_CharUpperBuffW },
+    { "OemToCharA", u32_OemToCharA },
+    { "OemToCharBuffA", u32_OemToCharBuffA },
+    { "OemToCharW", u32_OemToCharW },
+    { "CharToOemA", u32_CharToOemA },
+    { "CharToOemBuffA", u32_CharToOemBuffA },
+    { "CharToOemW", u32_CharToOemW },
     { "SendMessageA", u32_SendMessageA },
+    { "SendMessageW", u32_SendMessageW },
+    { "CallWindowProcA", u32_CallWindowProcA },
+    { "CallWindowProcW", u32_CallWindowProcW },
     { "SetTimer", u32_SetTimer },
     { "SetWindowTextA", u32_SetWindowTextA },
     { "SetWindowPos", u32_SetWindowPos },
