@@ -15,6 +15,7 @@
 #include "wn_util.h"
 #include "wn_registry.h"
 #include "wn_module.h"
+#include "wn_wow64.h"
 
 #include <execinfo.h>
 #include <dlfcn.h>
@@ -933,8 +934,15 @@ static WN_API void *k32_HeapAlloc(wn_handle heap, uint32_t flags, wn_abiword siz
         wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
-    void *p = (flags & 8 /* HEAP_ZERO_MEMORY */) ? calloc(1, (size_t)size)
-                                                 : malloc((size_t)size);
+    void *p;
+    if (g_wow64_active) {
+        /* 32-bit guests cannot see host addresses: the low arena heap. */
+        p = wn_low_malloc((size_t)size);
+        if (p && (flags & 8))
+            memset(p, 0, (size_t)size);
+    } else {
+        p = (flags & 8) ? calloc(1, (size_t)size) : malloc((size_t)size);
+    }
     if (!p)
         wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
     return p;
@@ -948,9 +956,15 @@ static WN_API void *k32_HeapReAlloc(wn_handle heap, uint32_t flags, void *ptr,
         wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
-    void *p = realloc(ptr, (size_t)size);
-    if (p && (flags & 8) && ptr == NULL) {
-        memset(p, 0, (size_t)size);
+    void *p;
+    if (g_wow64_active) {
+        p = wn_low_realloc(ptr, (size_t)size);
+        if (p && (flags & 8) && ptr == NULL)
+            memset(p, 0, (size_t)size);
+    } else {
+        p = realloc(ptr, (size_t)size);
+        if (p && (flags & 8) && ptr == NULL)
+            memset(p, 0, (size_t)size);
     }
     if (!p)
         wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
@@ -961,7 +975,10 @@ static WN_API int32_t k32_HeapFree(wn_handle heap, uint32_t flags, void *ptr)
 {
     (void)heap;
     (void)flags;
-    free(ptr);
+    if (g_wow64_active)
+        wn_low_free(ptr);
+    else
+        free(ptr);
     return 1;
 }
 
@@ -1002,7 +1019,10 @@ static WN_API int32_t k32_GlobalUnlock(wn_handle h)
 
 static WN_API uint64_t k32_GlobalSize(wn_handle h)
 {
+    {   if (g_wow64_active)
+        return (uint64_t)wn_low_usable((void *)(uintptr_t)h);
     return malloc_usable_size((void *)(uintptr_t)h);
+}
 }
 
 static WN_API wn_handle k32_GlobalFree(wn_handle h)
@@ -2553,11 +2573,15 @@ static WN_API int32_t k32_WideCharToMultiByte(uint32_t cp, uint32_t flags,
 
 static WN_API char *k32_GetCommandLineA(void)
 {
+    if (g_wow64_active)
+        return (char *)(uintptr_t)g_wow64_cmdline_a32;   /* low mirror */
     return g_proc.cmdline_utf8;
 }
 
 static WN_API const uint16_t *k32_GetCommandLineW(void)
 {
+    if (g_wow64_active)
+        return (const uint16_t *)(uintptr_t)g_wow64_cmdline_w32;
     return g_proc.cmdline_utf16;
 }
 

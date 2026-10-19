@@ -280,6 +280,18 @@ uint32_t wn_pe_map(const uint8_t *f, size_t fs, const char *path,
     if (base == MAP_FAILED) {
         /* Preferred base busy (or image has none): kernel-chosen address;
          * wn_pe_apply_relocations fixes the image up if it carries .reloc. */
+#if defined(__x86_64__) && !defined(WN_W32_SELF)
+        if (!img->is_64) {
+            /* wow64: i386 images MUST stay below 4GB (compat mode can only
+             * reach 32-bit addresses; a plain mmap may go high). */
+            extern void *wn_low_mmap(size_t size, int prot, uint64_t hint);
+            base = wn_low_mmap(map_size, PROT_READ | PROT_WRITE, 0);
+            if (base == MAP_FAILED)
+                base = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+                                | MAP_32BIT, -1, 0);
+        } else
+#endif
         base = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (base == MAP_FAILED) {

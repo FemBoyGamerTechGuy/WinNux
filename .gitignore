@@ -21,3 +21,4 @@ tests/fuzz/crashes/
 *.token
 *.secret
 .env
+core

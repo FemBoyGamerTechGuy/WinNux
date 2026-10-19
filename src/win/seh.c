@@ -6,6 +6,7 @@
  *  - faults in host code are re-raised with the default handler so real
  *    WinNux bugs show up as host crashes (never masked).
  */
+#include "wn_wow64.h"
 #include "wn_seh.h"
 #include "wn_process.h"
 #include "wn_module.h"
@@ -386,6 +387,13 @@ static void signal_handler(int sig, siginfo_t *si, void *uc_)
     /* Fault inside a guarded safe-probe (wn_safe_strnlen etc.): jump back
      * to the probe so callers get a clean "unreadable" answer instead of
      * dying. This must run before any other handling. */
+    /* 32-bit guest faults FIRST: the wow64 hook restores the host %fs base
+     * before any libc/TLS use. Without this, a handler entered from compat
+     * mode (fs base 0) faults on the first __thread access and the kernel
+     * kills the process with no diagnostic at all (found via core dump:
+     * crash inside wn_safe_fault_active). */
+    if (wn_wow64_fault_hook(uc_, si->si_addr, si->si_code, sig))
+        return;
     if (wn_safe_fault_active()) {
         wn_log(WN_LOG_DEBUG, "seh: fault inside safe probe (addr=%p) — "
                "jumping back to caller", si->si_addr);

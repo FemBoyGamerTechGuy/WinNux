@@ -9,6 +9,7 @@
 #include "wn_util.h"
 #include "wn_path.h"
 #include "wn_registry.h"
+#include "wn_wow64.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -153,8 +154,26 @@ wn_thread *wn_thread_current(void)
     return (wn_thread *)(uintptr_t)wn_teb_current()->wn_thread;
 }
 
-uint32_t wn_last_error_get(void)  { return wn_teb_current()->last_error; }
-void wn_last_error_set(uint32_t e) { wn_teb_current()->last_error = e; }
+uint32_t wn_last_error_get(void)
+{
+    if (g_wow64_active) {
+        wn_wow64_thread *wt = wn_wow64_thread_current();
+        if (wt)
+            return *(uint32_t *)(wt->teb32 + 0x34);
+    }
+    return wn_teb_current()->last_error;
+}
+void wn_last_error_set(uint32_t e)
+{
+    if (g_wow64_active) {
+        wn_wow64_thread *wt = wn_wow64_thread_current();
+        if (wt) {
+            *(uint32_t *)(wt->teb32 + 0x34) = e;
+            return;
+        }
+    }
+    wn_teb_current()->last_error = e;
+}
 
 uint32_t wn_alloc_tid(void)
 {

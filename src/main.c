@@ -11,6 +11,7 @@
 #include "wn_process.h"
 #include "wn_path.h"
 #include "wn_registry.h"
+#include "wn_wow64.h"
 #include "wn_dll.h"
 #include "wn_pe.h"
 #include "wn_util.h"
@@ -21,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <time.h>
@@ -37,6 +39,69 @@ static struct {
 } g_cli;
 
 /* --- guest entry ------------------------------------------------------------ */
+
+/* 32-bit guest entry: run TLS callbacks, then the exe entry on the wow64
+ * stack. Never returns. */
+static WN_API uint64_t guest_entry_shim32(uint64_t unused)
+{
+    (void)unused;
+    wn_module *exe = g_proc.exe;
+    wn_wow64_thread *wt = wn_wow64_thread_attach();
+    if (!wt) {
+        wn_log(WN_LOG_ERR, "wow64: guest thread attach failed");
+        wn_process_exit(1);
+    }
+    if (!wt->stack_low) {
+        extern void *wn_low_mmap(size_t, int, uint64_t);
+        wt->stack_low = wn_low_mmap(0x101000, PROT_READ | PROT_WRITE, 0);
+        if (wt->stack_low == MAP_FAILED) {
+            wn_log(WN_LOG_ERR, "wow64: guest stack alloc failed");
+            wn_process_exit(1);
+        }
+        mprotect(wt->stack_low, 0x1000, PROT_NONE);
+        wt->stack_size = 0x100000;
+    }
+    /* TEB32 stack fields (guest CRTs read fs:[4]/fs:[8]) */
+    *(uint32_t *)(wt->teb32 + 4) = (uint32_t)(uintptr_t)
+        (wt->stack_low + wt->stack_size);
+    *(uint32_t *)(wt->teb32 + 8) = (uint32_t)(uintptr_t)wt->stack_low;
+
+    /* TLS callbacks (32-bit: array of u32 VAs, NULL-terminated) */
+    if (exe->kind == WN_MOD_PE && !exe->pe.is_64) {
+        const wn_image_dos_header *dos = (const void *)exe->pe.base;
+        const wn_image_optional_header32 *oh = (const void *)
+            (exe->pe.base + dos->e_lfanew + 4 + sizeof(wn_image_file_header));
+        const wn_image_data_directory *dir = &oh->dirs[WN_IMAGE_DIR_TLS];
+        if (dir->virtual_address && dir->size >= 24) {
+            const uint32_t *tls = wn_pe_rva(&exe->pe, dir->virtual_address, 24);
+            if (tls && tls[4]) {
+                uint32_t cbva = tls[4];
+                if (cbva >= (uint32_t)exe->pe.preferred_base &&
+                    cbva < (uint32_t)exe->pe.preferred_base + exe->pe.size_of_image)
+                    cbva = (uint32_t)(uintptr_t)exe->pe.base +
+                           (cbva - (uint32_t)exe->pe.preferred_base);
+                uint32_t *cbs = (uint32_t *)(uintptr_t)cbva;
+                for (uint32_t i = 0; cbs[i] && i < 64; i++) {
+                    wn_log(WN_LOG_DEBUG, "loader: TLS callback32[%u] = 0x%x",
+                           i, cbs[i]);
+                    uint32_t esp = (uint32_t)(uintptr_t)
+                        (wt->stack_low + wt->stack_size);
+                    esp = (esp - 32) & ~15u;
+                    esp -= 12;
+                    *(uint32_t *)(uintptr_t)(esp + 0) =
+                        (uint32_t)(uintptr_t)exe->base;
+                    *(uint32_t *)(uintptr_t)(esp + 4) = 1;
+                    *(uint32_t *)(uintptr_t)(esp + 8) = 0;
+                    uint32_t regs[7] = {0};
+                    wn_wow64_call32(cbs[i], &esp, regs);
+                }
+            }
+        }
+    }
+
+    wn_wow64_run_exe((uint32_t)(uintptr_t)(exe->base + exe->pe.entry_rva));
+    return 0;   /* not reached */
+}
 
 /* Run the exe's TLS callbacks (if any), then its entry point. */
 static WN_API uint64_t guest_entry_shim(uint64_t unused)
@@ -297,13 +362,12 @@ static int cmd_run(int argc, char **argv)
     /* 32-bit EXE: hand off to the 32-bit loader build (bin/winnux32). */
     if (pe_peek_machine(exe_path) == WN_IMAGE_FILE_MACHINE_I386) {
 #if defined(__x86_64__)
-        if (reexec_w32(argc - i, argv + i))
-            return 0;     /* never reached on success (execv) */
-        fprintf(stderr, "winnux: this is a 32-bit (i386) executable and the "
-                "32-bit loader 'winnux32' was not found next to winnux.\n"
-                "                build it with: make winnux32\n");
-        free(exe_path);
-        return 1;
+        if (!getenv("WINNUX_WOW64")) {
+            if (reexec_w32(argc - i, argv + i))
+                return 0;     /* never reached on success (execv) */
+            wn_log(WN_LOG_INFO, "winnux: winnux32 not found - using the "
+                   "in-process wow64 layer");
+        }
 #else
         /* already the 32-bit build: fall through */
 #endif
@@ -336,9 +400,15 @@ static int cmd_run(int argc, char **argv)
     wn_process_set_cmdline(g_argc, g_argv);
     wn_ms_set_args(g_argc, g_argv);
 
+    /* 32-bit exe: the x86 PEB skeleton needs the final command line. */
+    if (!exe->pe.is_64)
+        wn_wow64_build_peb32();
+
     /* Guest main thread. */
     wn_thread *th;
-    if (!wn_thread_create(exe->pe.stack_reserve, guest_entry_shim, 0, 0, &th, NULL))
+    if (!wn_thread_create(exe->pe.stack_reserve,
+                          exe->pe.is_64 ? guest_entry_shim : guest_entry_shim32,
+                          0, 0, &th, NULL))
         return 1;
     pthread_join(th->pthread, NULL);
     int rv = g_proc.exe ? 0 : 0;

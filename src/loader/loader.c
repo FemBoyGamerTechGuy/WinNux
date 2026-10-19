@@ -11,6 +11,7 @@
 #include "wn_util.h"
 #include <dlfcn.h>
 #include "wn_registry.h"
+#include "wn_wow64.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -35,6 +36,31 @@ wn_module *wn_module_list_head(void) { return g_modules; }
  * do not explode. MZ + PE\0\0 + file header + PE32+ optional header. */
 static uint8_t *builtin_image(void)
 {
+#if defined(__x86_64__) && !defined(WN_W32_SELF)
+    /* wow64 (64-bit build): guest-visible modules must live below 4GB and
+     * present an i386 NT header to 32-bit LDR walks. */
+    if (g_wow64_active) {
+        extern void *wn_low_malloc(size_t);
+        uint8_t *b = wn_low_malloc(0x1000);
+        if (b) {
+            memset(b, 0, 0x1000);
+            wn_image_dos_header *dos = (void *)b;
+            dos->e_magic = 0x5A4D;
+            dos->e_lfanew = 0x40;
+            uint32_t *sig = (void *)(b + 0x40);
+            *sig = 0x00004550;
+            wn_image_file_header *fh = (void *)(b + 0x44);
+            fh->machine = 0x014c;
+            fh->size_of_optional_header = sizeof(wn_image_optional_header32);
+            wn_image_optional_header32 *oh =
+                (void *)(b + 0x44 + sizeof(wn_image_file_header));
+            oh->magic = 0x10B;
+            oh->image_base = 0x10000000;
+            oh->size_of_image = 0x1000;
+            return b;
+        }
+    }
+#endif
     uint8_t *b = wn_xcalloc(1, 0x1000);
     wn_image_dos_header *dos = (void *)b;
     dos->e_magic = 0x5A4D;
@@ -274,6 +300,79 @@ delay:
     return 0;
 }
 
+#ifdef __x86_64__
+/* 32-bit import resolution for the in-process wow64 layer (compat-mode
+ * execution): thunk arrays are u32, ordinals use the 0x80000000 flag,
+ * builtin exports get 16-byte thunk stubs, PE32 dep exports are raw guest
+ * addresses, missing imports get cdecl stub32s. The winnux32 build never
+ * compiles this - it runs guests natively. */
+static uint32_t resolve_imports32(wn_module *m)
+{
+    wn_pe_image *img = &m->pe;
+    const wn_image_dos_header *dos = (const void *)img->base;
+    const wn_image_optional_header32 *oh =
+        (const void *)(img->base + dos->e_lfanew + 4 + sizeof(wn_image_file_header));
+
+    const wn_image_data_directory *dir = &oh->dirs[WN_IMAGE_DIR_IMPORT];
+    if (dir->virtual_address && dir->size) {
+        wn_image_import_descriptor *desc = wn_pe_rva(img, dir->virtual_address,
+                                                     sizeof *desc);
+        if (!desc) {
+            wn_log(WN_LOG_ERR, "loader32: import dir out of bounds in '%s'",
+                   m->path);
+            return WN_ERR_BAD_FORMAT;
+        }
+        for (; desc->name; desc++) {
+            const char *dll_name = wn_pe_rva(img, desc->name, 2);
+            if (!dll_name)
+                return WN_ERR_BAD_FORMAT;
+            wn_module *dep = wn_module_load_dll(dll_name, NULL);
+            if (!dep) {
+                wn_log(WN_LOG_ERR, "loader32: '%s' imports missing DLL '%s'",
+                       m->path, dll_name);
+                return WN_ERR_FILE_NOT_FOUND;
+            }
+            uint32_t *read_thunks = (uint32_t *)wn_pe_rva(img,
+                desc->original_first_thunk ? desc->original_first_thunk
+                                           : desc->first_thunk, 4);
+            uint32_t *write_thunks = (uint32_t *)wn_pe_rva(img, desc->first_thunk, 4);
+            if (!write_thunks)
+                return WN_ERR_BAD_FORMAT;
+            for (uint32_t i = 0; read_thunks && write_thunks[i]; i++) {
+                uint32_t t = read_thunks[i];
+                uint32_t fn32 = 0;
+                char namebuf[128];
+                const char *disp = "#ord";
+                if (!(t & WN_IMAGE_ORDINAL_FLAG32)) {
+                    wn_image_import_by_name *ibn = wn_pe_rva(img, t, 3);
+                    if (!ibn)
+                        return WN_ERR_BAD_FORMAT;
+                    snprintf(namebuf, sizeof namebuf, "%s", ibn->name);
+                    disp = namebuf;
+                }
+                if (dep->kind == WN_MOD_BUILTIN) {
+                    void *fn = (t & WN_IMAGE_ORDINAL_FLAG32)
+                        ? wn_module_get_proc_ordinal(dep, (uint32_t)(t & 0xFFFF))
+                        : wn_module_get_proc(dep, disp, 0, 0);
+                    fn32 = fn ? wn_wow64_thunk_for(fn, dep->name, disp)
+                              : wn_wow64_stub32_for(dep->name, disp);
+                } else {
+                    void *fn = (t & WN_IMAGE_ORDINAL_FLAG32)
+                        ? wn_module_get_proc_ordinal(dep, (uint32_t)(t & 0xFFFF))
+                        : wn_module_get_proc(dep, disp, 0, 0);
+                    fn32 = fn ? (uint32_t)(uintptr_t)fn
+                              : wn_wow64_stub32_for(dep->name, disp);
+                }
+                wn_log(WN_LOG_TRACE, "loader32: iat %s!%s = 0x%x",
+                       dll_name, disp, fn32);
+                write_thunks[i] = fn32;
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
 /* --- DLL/EXE loading ------------------------------------------------------------ */
 
 static wn_module *load_pe(const char *host_path, const char *display_name,
@@ -302,7 +401,18 @@ static wn_module *load_pe(const char *host_path, const char *display_name,
     if (rc)
         goto fail;
 
+#ifdef __x86_64__
+    if (!m->pe.is_64 && !g_wow64_active) {
+        rc = wn_wow64_init();
+        if (rc) {
+            wn_log(WN_LOG_ERR, "loader32: wow64 init failed (%u)", rc);
+            goto fail;
+        }
+    }
+    rc = m->pe.is_64 ? resolve_imports(m) : resolve_imports32(m);
+#else
     rc = resolve_imports(m);
+#endif
     if (rc)
         goto fail;
 
@@ -321,12 +431,37 @@ static wn_module *load_pe(const char *host_path, const char *display_name,
     m->loading = 0;
 
     if (!is_exe && m->pe.entry_rva) {
-        /* DllMain(hinst, reason, reserved): pointer-sized args so the i386
-         * stdcall callee cleans exactly what we pushed. */
-        typedef WN_API uint32_t (*dllmain_fn)(uintptr_t, uint32_t, uintptr_t);
-        dllmain_fn entry = (dllmain_fn)(void *)(m->base + m->pe.entry_rva);
         wn_log(WN_LOG_DEBUG, "loader: DllMain('%s', PROCESS_ATTACH)", m->name);
-        uint32_t r = entry((uintptr_t)m->base, 1 /*DLL_PROCESS_ATTACH*/, 0);
+        uint32_t r = 1;
+#if defined(__x86_64__) && !defined(WN_W32_SELF)
+        if (!m->pe.is_64) {
+            /* wow64: cross into compat mode for the i386 DllMain */
+            wn_wow64_thread *wt = wn_wow64_thread_current();
+            if (wt && wt->stack_low) {
+                uint32_t target = (uint32_t)(uintptr_t)(m->base + m->pe.entry_rva);
+                uint32_t esp = (uint32_t)(uintptr_t)
+                    (wt->stack_low + wt->stack_size);
+                esp = (esp - 32) & ~15u;
+                esp -= 12;
+                *(uint32_t *)(uintptr_t)(esp + 0) = (uint32_t)(uintptr_t)m->base;
+                *(uint32_t *)(uintptr_t)(esp + 4) = 1;
+                *(uint32_t *)(uintptr_t)(esp + 8) = 0;
+                uint32_t regs[7] = {0};
+                wn_wow64_call32(target, &esp, regs);
+                r = regs[0];
+            } else {
+                wn_log(WN_LOG_WARN, "loader32: no wow64 thread for DllMain "
+                       "of '%s' (skipped)", m->name);
+            }
+        } else
+#endif
+        {
+            /* DllMain(hinst, reason, reserved): pointer-sized args so the i386
+             * stdcall callee cleans exactly what we pushed. */
+            typedef WN_API uint32_t (*dllmain_fn)(uintptr_t, uint32_t, uintptr_t);
+            dllmain_fn entry = (dllmain_fn)(void *)(m->base + m->pe.entry_rva);
+            r = entry((uintptr_t)m->base, 1 /*DLL_PROCESS_ATTACH*/, 0);
+        }
         if (!r)
             wn_log(WN_LOG_WARN, "loader: DllMain of '%s' returned FALSE "
                    "(load continues; Windows would fail it)", m->name);
@@ -457,6 +592,10 @@ wn_module *wn_module_load_dll(const char *name, const char *dir)
                 wn_builtin_subsys_init();
                 if (b->init)
                     b->init();
+#if defined(__x86_64__) && !defined(WN_W32_SELF)
+                if (g_wow64_active)
+                    wn_wow64_ldr_add_module(m);
+#endif
                 wn_log(WN_LOG_DEBUG, "loader: builtin '%s' activated", m->name);
                 return m;
             }

@@ -19,7 +19,7 @@ TARGET  := $(BIN)/winnux
 
 SRCS    := $(sort $(wildcard src/*.c src/common/*.c src/pe/*.c src/loader/*.c \
             src/win/*.c src/dlls/*.c src/backends/*.c src/gfx/*.c src/tools/*.c))
-OBJS    := $(patsubst src/%.c,$(OBJ)/%.o,$(SRCS))
+OBJS    := $(patsubst src/%.c,$(OBJ)/%.o,$(SRCS)) $(OBJ)/win/wow64_gates.o
 
 # Cross toolchain used to build Windows test binaries (tests only, never linked
 # into the product). Discovered via MXGCC env or PATH.
@@ -40,7 +40,18 @@ $(OBJ)/%.o: src/%.c | $(OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+
+$(OBJ)/win/wow64_gates.o: src/win/wow64_gates.S | $(OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) -c -o $@ $<
+
 -include $(OBJ)/*.d $(OBJ)/*/*.d
+
+
+# Signal-context code runs with the GUEST %fs state (base 0 in compat mode);
+# a stack-canary prologue (fs:0x28 read) would fault before the wow64 hook
+# can restore the host FS base. Found via core-dump forensics (d69a017-era).
+$(OBJ)/win/wow64.o $(OBJ)/win/seh.o $(DBGOBJ)/win/wow64.o $(DBGOBJ)/win/seh.o: CFLAGS += -fno-stack-protector
 
 $(BIN) $(OBJ):
 	mkdir -p $@
@@ -48,7 +59,12 @@ $(BIN) $(OBJ):
 # Debug build with sanitizers (kept in separate dirs so both can coexist).
 DBGOBJ  := obj-dbg
 DBGTGT  := $(BIN)/winnux-dbg
-DBGOBJS := $(patsubst src/%.c,$(DBGOBJ)/%.o,$(SRCS))
+DBGOBJS := $(patsubst src/%.c,$(DBGOBJ)/%.o,$(SRCS)) $(DBGOBJ)/win/wow64_gates.o
+
+
+$(DBGOBJ)/win/wow64_gates.o: src/win/wow64_gates.S | $(DBGOBJ)
+	@mkdir -p $(dir $@)
+	$(CC) -c -o $@ $<
 
 debug: $(DBGTGT)
 
