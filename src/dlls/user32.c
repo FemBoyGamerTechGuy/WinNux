@@ -2289,6 +2289,10 @@ static ctl_kind ctl_kind_of(const char *cls)
     if (wn_strcaseeq(cls, "Button"))         return CTL_BUTTON;
     if (wn_strcaseeq(cls, "Static"))         return CTL_STATIC;
     if (wn_strcaseeq(cls, "Edit"))           return CTL_EDIT;
+    /* RichEdit 1.0/2.0/3.0/4.0/5.0 class names (riched32/riched20/
+     * riched30/msftedit). Installers use them as read-only text viewers
+     * (Inno TRichEditViewer): memo semantics are exactly Edit. */
+    if (wn_strcaseprefix(cls, "RichEdit"))   return CTL_EDIT;
     if (wn_strcaseeq(cls, "ListBox"))        return CTL_LISTBOX;
     if (wn_strcaseeq(cls, "ComboBox"))       return CTL_COMBO;
     if (wn_strcaseeq(cls, "SysTreeView32"))  return CTL_TREEVIEW;
@@ -3564,7 +3568,12 @@ static wn_wndclass *builtin_control_class(const char *name)
 {
     static const char *known[] = { "Button", "Edit", "Static", "ListBox",
                                    "ComboBox", "ScrollBar", "SysTreeView32",
-                                   "#32770", NULL };
+                                   "#32770",
+                                   /* riched32/riched20/riched30/msftedit
+                                    * register these on Windows DLL load;
+                                    * apps never RegisterClass them. */
+                                   "RichEdit", "RichEdit20A", "RichEdit20W",
+                                   "RichEdit30", "RichEdit50W", NULL };
     for (int i = 0; known[i]; i++) {
         if (!wn_strcaseeq(name, known[i]))
             continue;

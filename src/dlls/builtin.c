@@ -98,6 +98,13 @@ const wn_builtin_dll wn_builtin_table[] = {
     { "clbcatq.dll",    wn_clbcatq_exports,   NULL },
     { "mpr.dll",        wn_mpr_exports,       NULL },
     { "msimg32.dll",    wn_msimg32_exports,   NULL },
+    /* RichEdit control hosts: LoadLibrary probes + classes live in user32 */
+    { "riched32.dll",    wn_riched32_exports,   NULL },
+    { "riched20.dll",    wn_riched20_exports,   NULL },
+    { "riched30.dll",    wn_riched30_exports,   NULL },
+    { "msftedit.dll",    wn_msftedit_exports,   NULL },
+    /* Restart Manager: "files in use" checks (Inno) */
+    { "rstrtmgr.dll",    wn_rstrtmgr_exports,   NULL },
     { NULL, NULL, NULL },
 };
 

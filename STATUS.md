@@ -1,4 +1,44 @@
 
+## Date: 2026-10-20 (session 15: installer opens — RichEdit/Rstrtmgr/tokens)
+
+### Field report
+With the -mincoming-stack-boundary=2 build on their box, the wizard STOPPED
+crashing in _XSend and the installer window OPENS. Next failure, decoded
+from the user's log: LoadLibrary("RICHED20.DLL"/"RICHED32.DLL"/"Rstrtmgr.dll")
+all failed -> Inno's TRichEditViewer raised Delphi 0x0EEDFACE (unhandled).
+Bonus findings in the same log: OpenThreadToken resolved to the loud stub
+(120) and fed the Delphi RTL garbage (later FreeSid(0x1) WARNs), and the
+unhandled-exception report was useless (RIP blamed the host RaiseException
+builtin at winnux32+0x10bca, all registers zero).
+
+### Fixes (all verified by new regression test t17_richedit — 17/17 suite)
+- riched32/riched20/riched30/msftedit builtins (presence-shim policy: loads
+  succeed; the RichEdit window classes are user32 builtin control classes
+  "RichEdit"/"RichEdit20A"/"RichEdit20W"/"RichEdit30"/"RichEdit50W" mapped
+  to CTL_EDIT memo semantics, exactly what Inno's read-only text viewer
+  needs).
+- rstrtmgr.dll: graceful Restart Manager — RmStartSession issues a session
+  handle + key, RmGetList reports zero affected processes, Shutdown/
+  Restart/End/Cancel succeed; installers skip the "files in use" page
+  (true under WinNux — nothing else runs the target files).
+- advapi32 token honesty: OpenThreadToken FALSE+ERROR_NO_TOKEN (we never
+  impersonate), OpenProcessToken FALSE+ERROR_ACCESS_DENIED (no token
+  subsystem), GetTokenInformation FALSE+ERROR_INVALID_HANDLE,
+  CheckTokenMembership call-ok+not-member (admin checks degrade to plain
+  user installs). Ends the stub-120 -> FreeSid(0x1) garbage path.
+- seh: wn_seh_raise now takes the GUEST raise site (__builtin_return_address
+  from k32_RaiseException = the guest's call site, valid in both native i386
+  IAT calls and wow64 tail-jump stubs). Crash reports for Delphi/C++ EH
+  raises now name the real module+RVA instead of the host builtin; registers
+  stay honestly zero (software raise = no fault context). exc_name knows
+  DELPHI_EXCEPTION (0x0EEDFACE) and MSVC_CXX_EXCEPTION (0xE06D7363).
+- gen_sigs32 regenerated (779 exports; the 12 new functions).
+
+### Next expected blocker (decoded earlier, unchanged)
+TNewCheckListBox 'List item and state item count mismatch' at engine+0x44e058
+(Items.Count [Self+0xfc] vs FState.Count [[Self+0x168]+8] diverge) — now
+reachable with RichEdit alive.
+
 ## Date: 2026-10-20 (session 14: the alignment fix that actually closes the crash)
 
 ### Why the user still crashed after session 13 — two stacked failures

@@ -394,6 +394,64 @@ static WN_API void *adv_FreeSid(wn_abiword sid)
     return NULL;
 }
 
+/* --- tokens ------------------------------------------------------------------
+ * No token subsystem exists (no impersonation, no ACL enforcement on
+ * drive_c). The honest contract for this system: threads carry no token
+ * (ERROR_NO_TOKEN), the process token is unavailable (ERROR_ACCESS_DENIED
+ * - modelled as a token we cannot open), and any handle the guest manages
+ * to invent is invalid. Delphi RTLs probe OpenThreadToken before SID work;
+ * stub-120 used to send them down garbage paths (FreeSid(0x1) WARNs).
+ * CheckTokenMembership answers the CALL ok + "not a member", so admin
+ * checks degrade to a plain non-elevated install. */
+static WN_API int32_t adv_OpenThreadToken(wn_abiword thread,
+                                          uint32_t access, int32_t open_as_self,
+                                          wn_abiword *token)
+{
+    (void)thread; (void)access; (void)open_as_self;
+    if (token)
+        *token = 0;
+    wn_last_error_set(1008 /* ERROR_NO_TOKEN: not impersonating */);
+    return 0;
+}
+
+static WN_API int32_t adv_OpenProcessToken(wn_abiword process,
+                                           uint32_t access,
+                                           wn_abiword *token)
+{
+    (void)process; (void)access;
+    if (token)
+        *token = 0;
+    wn_last_error_set(5 /* ERROR_ACCESS_DENIED: no token subsystem */);
+    return 0;
+}
+
+static WN_API int32_t adv_GetTokenInformation(wn_abiword token,
+                                               uint32_t info_class, void *buf,
+                                               uint32_t len, uint32_t *ret_len)
+{
+    (void)token; (void)info_class; (void)buf; (void)len;
+    if (ret_len)
+        *ret_len = 0;
+    wn_last_error_set(6 /* ERROR_INVALID_HANDLE: we never issue tokens */);
+    return 0;
+}
+
+static WN_API int32_t adv_SetThreadToken(wn_abiword thread, wn_abiword token)
+{
+    (void)thread; (void)token;
+    wn_last_error_set(120);
+    return 0;
+}
+
+static WN_API int32_t adv_CheckTokenMembership(wn_abiword token,
+                                              wn_abiword sid, int32_t *member)
+{
+    (void)token; (void)sid;
+    if (member)
+        *member = 0;                    /* not a member: plain user */
+    return 1;                           /* the CALL succeeded */
+}
+
 static WN_API int32_t adv_InitializeSid(wn_abiword sid, const void *authority,
                                         uint8_t sub_count)
 {
@@ -430,5 +488,10 @@ const wn_export_entry wn_advapi32_exports[] = {
     { "AllocateAndInitializeSid", adv_AllocateAndInitializeSid },
     { "FreeSid", adv_FreeSid },
     { "InitializeSid", adv_InitializeSid },
+    { "OpenThreadToken", adv_OpenThreadToken },
+    { "OpenProcessToken", adv_OpenProcessToken },
+    { "GetTokenInformation", adv_GetTokenInformation },
+    { "SetThreadToken", adv_SetThreadToken },
+    { "CheckTokenMembership", adv_CheckTokenMembership },
     { NULL, NULL },
 };

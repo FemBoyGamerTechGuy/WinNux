@@ -228,3 +228,131 @@ const wn_export_entry wn_msimg32_exports[] = {
     { "vSetDIBitsToDevice", ms_fail },
     { NULL, NULL },
 };
+
+/* --- rstrtmgr.dll - Restart Manager ------------------------------------
+ * Inno Setup uses RM for the "files in use" check before install. The
+ * graceful model for a single-process world: sessions open fine, nothing
+ * is registered as holding files, no conflicts, nothing to shut down or
+ * restart. The wizard then proceeds straight to copying with no
+ * files-in-use page - which is the truth under WinNux (nothing else runs
+ * the target files). Session handles are a simple nonzero counter.
+ * CCH_RM_SESSION_KEY = 32 wchar + NUL. */
+static uint32_t g_rm_session;
+
+static WN_API uint32_t rm_StartSession(uint32_t *handle, uint32_t flags,
+                                       uint16_t *session_key)
+{
+    (void)flags;
+    if (!handle)
+        return 87;                      /* ERROR_INVALID_PARAMETER */
+    if (!session_key)
+        return 87;
+    static const uint16_t key[] = { 'W','i','n','N','u','x','-','R','M','-',
+                                    's','e','s','s','i','o','n','-',
+                                    '0','1',0 };
+    int i;
+    for (i = 0; key[i]; i++)
+        session_key[i] = key[i];
+    session_key[i] = 0;
+    g_rm_session++;
+    *handle = g_rm_session;
+    wn_log(WN_LOG_DEBUG, "rstrtmgr: RmStartSession -> handle %u "
+           "(no processes hold target files here)", g_rm_session);
+    return 0;                           /* ERROR_SUCCESS */
+}
+
+static WN_API uint32_t rm_RegisterResources(wn_abiword handle,
+                                            wn_abiword n_files,
+                                            wn_abiword files,
+                                            wn_abiword n_procs,
+                                            wn_abiword procs,
+                                            wn_abiword n_services,
+                                            wn_abiword services)
+{
+    (void)files; (void)procs; (void)services;
+    (void)n_files; (void)n_procs; (void)n_services;
+    if (!handle)
+        return 6;                       /* ERROR_INVALID_HANDLE */
+    return 0;                           /* accepted; nothing to track */
+}
+
+static WN_API uint32_t rm_GetList(wn_abiword handle, uint32_t *needed,
+                                  uint32_t *count, wn_abiword info,
+                                  uint32_t *reboot_reasons)
+{
+    (void)info; (void)reboot_reasons;
+    if (!handle)
+        return 6;
+    if (needed)
+        *needed = 0;                    /* zero processes affected */
+    if (count)
+        *count = 0;
+    return 0;                           /* ERROR_SUCCESS: list fits */
+}
+
+static WN_API uint32_t rm_EndSession(wn_abiword handle)
+{
+    if (!handle)
+        return 6;
+    return 0;
+}
+
+static WN_API uint32_t rm_Shutdown(wn_abiword handle, wn_abiword flags,
+                                   wn_abiword cb)
+{
+    (void)flags; (void)cb;
+    if (!handle)
+        return 6;
+    return 0;                           /* nothing to shut down */
+}
+
+static WN_API uint32_t rm_Restart(wn_abiword handle, wn_abiword flags,
+                                  wn_abiword cb)
+{
+    (void)flags; (void)cb;
+    if (!handle)
+        return 6;
+    return 0;                           /* nothing to restart */
+}
+
+static WN_API uint32_t rm_CancelCurrentTask(wn_abiword handle)
+{
+    if (!handle)
+        return 6;
+    return 0;
+}
+
+const wn_export_entry wn_rstrtmgr_exports[] = {
+    { "RmStartSession", rm_StartSession },
+    { "RmRegisterResources", rm_RegisterResources },
+    { "RmGetList", rm_GetList },
+    { "RmEndSession", rm_EndSession },
+    { "RmShutdown", rm_Shutdown },
+    { "RmRestart", rm_Restart },
+    { "RmCancelCurrentTask", rm_CancelCurrentTask },
+    { NULL, NULL },
+};
+
+/* --- riched32.dll / riched20.dll / riched30.dll / msftedit.dll ----------
+ * RichEdit control hosts. Apps (Inno Setup first among them) load the DLL
+ * to REGISTER the RichEdit window classes, then CreateWindow("RichEdit20A")
+ * and drive it with EM_* messages. The classes are builtin control classes
+ * in user32 (see builtin_control_class); these modules exist so the
+ * LoadLibrary probe succeeds, exactly like on Windows. The full EM_
+ * surface rides the generic ctl_proc/Edit path; unlisted GetProcAddress
+ * names return NULL like an older Windows riched build would. */
+const wn_export_entry wn_riched32_exports[] = {
+    { NULL, NULL },
+};
+
+const wn_export_entry wn_riched20_exports[] = {
+    { NULL, NULL },
+};
+
+const wn_export_entry wn_riched30_exports[] = {
+    { NULL, NULL },
+};
+
+const wn_export_entry wn_msftedit_exports[] = {
+    { NULL, NULL },
+};

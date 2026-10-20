@@ -1,0 +1,5 @@
+0
+T17 richedit class text: license body text
+T17 restart manager: no files in use
+T17 tokens: plain user, no impersonation
+T17 OK

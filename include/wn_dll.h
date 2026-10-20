@@ -54,6 +54,11 @@ extern const wn_export_entry wn_comres_exports[];
 extern const wn_export_entry wn_clbcatq_exports[];
 extern const wn_export_entry wn_mpr_exports[];
 extern const wn_export_entry wn_msimg32_exports[];
+extern const wn_export_entry wn_riched32_exports[];
+extern const wn_export_entry wn_riched20_exports[];
+extern const wn_export_entry wn_riched30_exports[];
+extern const wn_export_entry wn_msftedit_exports[];
+extern const wn_export_entry wn_rstrtmgr_exports[];
 
 /* The full builtin table (name -> exports). */
 extern const wn_builtin_dll wn_builtin_table[];

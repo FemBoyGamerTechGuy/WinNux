@@ -4371,7 +4371,12 @@ static WN_API void k32_RaiseException(uint32_t code, uint32_t flags,
                 p[i] = p64[i];
         }
     }
-    wn_seh_raise(code, flags, nparams, p);
+    /* __builtin_return_address(0) here is the GUEST raise site: the
+     * stdcall thunk was entered directly from the guest IAT (and the wow64
+     * 16-byte stubs tail-jump preserving the guest return address), so
+     * level-0 return address is the caller of RaiseException. */
+    wn_seh_raise((uintptr_t)__builtin_return_address(0), code, flags,
+                 nparams, p);
 }
 
 static WN_API int32_t k32_DuplicateHandle(wn_handle src_proc, wn_handle src,

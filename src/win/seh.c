@@ -901,6 +901,8 @@ static const char *exc_name(uint32_t c)
     case 0xC0000095: return "EXCEPTION_INT_OVERFLOW";
     case 0xC00000FD: return "EXCEPTION_STACK_OVERFLOW";
     case 0xC0000409: return "EXCEPTION_STACK_BUFFER_OVERRUN";
+    case 0x0EEDFACE: return "DELPHI_EXCEPTION";
+    case 0xE06D7363: return "MSVC_CXX_EXCEPTION";
     default: return "EXCEPTION_UNKNOWN";
     }
 }
@@ -1132,8 +1134,8 @@ void wn_seh_init(void)
     sigaction(SIGILL, &sa, NULL);
 }
 
-void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
-                  const uint64_t *params)
+void wn_seh_raise(uintptr_t raise_site, uint32_t code, uint32_t flags,
+                  uint32_t nparams, const uint64_t *params)
 {
     wn_exc_record rec;
     memset(&rec, 0, sizeof rec);
@@ -1146,11 +1148,13 @@ void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
     {
         const char *mod = "?";
         uint64_t rva = 0;
+        if (!raise_site)
+            raise_site = (uintptr_t)__builtin_return_address(0);
         wn_module *m = wn_module_from_addr(
-            (const void *)(uintptr_t)__builtin_return_address(0), NULL);
+            (const void *)raise_site, NULL);
         if (m) {
             mod = m->name;
-            rva = (uint64_t)(uintptr_t)__builtin_return_address(0) -
+            rva = (uint64_t)raise_site -
                   (uint64_t)(uintptr_t)m->base;
         }
         wn_log(WN_LOG_DEBUG, "seh: RaiseException(0x%08X) from %s+0x%llx",
@@ -1203,7 +1207,13 @@ void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
     memset(&uc, 0, sizeof uc);   /* approximate context: raise site */
     wn_context64 ctx;
     fill_context(&ctx, &uc);
-    ctx.rip = (uint64_t)(uintptr_t)__builtin_return_address(0);
+    /* raise_site = the GUEST instruction that called RaiseException (its
+     * return address); a NULL site means "use my caller" (internal raises).
+     * Without this the crash report blamed the host RaiseException builtin
+     * (RIP in winnux32, registers all zero) instead of the guest raise
+     * point. Registers are honestly unknown for software raises: keep the
+     * zeroed ucontext, but the RIP/RVA now names the real origin. */
+    ctx.rip = (uint64_t)(uintptr_t)raise_site;
     rec.exception_address = ctx.rip;
 
     if (dispatch_veh(&rec, &ctx, &uc))

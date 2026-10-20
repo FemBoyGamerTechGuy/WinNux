@@ -13,8 +13,8 @@ void wn_seh_init(void);
 /* Raise a Windows-style exception (RaiseException). Codes 0xC0000005 etc.
  * Dispatches to VEH handlers; if one continues execution the call returns,
  * otherwise the process exits with the exception code. */
-void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
-                  const uint64_t *params);
+void wn_seh_raise(uintptr_t raise_site, uint32_t code, uint32_t flags,
+                  uint32_t nparams, const uint64_t *params);
 
 /* Vectored handlers (RtlAddVectoredExceptionHandler). Returns a
  * non-NULL registration handle or 0 on failure. */
