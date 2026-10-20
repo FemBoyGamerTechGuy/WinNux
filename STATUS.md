@@ -1341,3 +1341,63 @@ discarded-qualifiers fix from session 2).
 3. Vulkan surface (Xlib) + swapchain once a GPU/ICD is available; D3D9
    translation start (shader decode can be developed headless).
 4. Real-world app testing (Notepad-class tools, installers).
+
+## Session 18 — the white wizard finally paints (the user report that was right)
+
+### The report
+
+User (native i386, real X11 WM): "It opens and stays open but 2 windows open
+which is weird... can minimize but not maximize or close... the window is
+completely white." Plus a fresh log line: `STUB user32.dll!ScrollWindowEx`.
+
+Reproduced under bare Xvfb on the dev box: the wizard was 100% white HERE
+too, with the same second window. The session-17 "painted wizard" claim was
+wrong — its screenshot is 2 colors (black root + white window) and the
+"353k pixels painted" metric counted the white window's own area, not
+content. Everything below is verified against pixel statistics of live
+X grabs plus a VLM read of the final screenshot.
+
+### Root causes (six bugs, all fixed in commit b73c782)
+
+1. **i386 X11 ABI overlays** (`src/backends/x11_backend.c`): every overlay
+   (XEvent fields, XImage fields, XSizeHints) hard-coded LP64 offsets.
+   On i386 all events decoded garbage → `win_for()` never matched →
+   Expose dropped (white), WM_DELETE_WINDOW dropped (dead close),
+   mouse/keyboard dead. Rewritten with per-arch offset macros.
+2. **SW_HIDE mapped the window**: `u32_ShowWindow` called `win_show`
+   before checking the command — Delphi's hidden TApplication owner was
+   mapped by the very call meant to hide it. New `win_hide` backend op;
+   SW_HIDE unmaps and never maps.
+3. **0x0 toplevels inflated to 640x480**: VCL's TApplication window IS a
+   zero-sized WS_POPUP; at 640x480 it became the second visible window.
+   Windows size contract now honored (CW_USEDEFAULT keeps the default).
+4. **SetWindowPos swallowed SWP_SHOWWINDOW**: an early `return 1` on the
+   NOSIZE|NOMOVE path ran before the show flag branch — VCL shows child
+   controls with flags 0x57, so the entire control tree stayed
+   invisible → never dirty → never painted. Also added: show/resize
+   invalidate the whole subtree; EndPaint composes guest-class children
+   up the parent chain (their pixels used to die in offscreen bwins —
+   `x11_present` now also NULL-guards child bwins' priv).
+5. **GDI contracts VCL's paint pipeline gates on** (all were returning-0
+   stubs): RectVisible ("nothing visible" → painted nothing — the biggest
+   single blocker after the event fix), GetClipBox, Intersect/
+   ExcludeClipRect, SelectClipRgn, CreateRectRgn (one-rect clip model),
+   SaveDC/RestoreDC (value snapshots), Window/ViewportOrg get/set with
+   logical→device translation in every draw entry, CreateDIBitmap
+   (1/4/8/24/32bpp BI_RGB incl. palettized — Inno raised "Out of system
+   resources" without it), StretchBlt, SetStretchBltMode, CreatePalette,
+   ScrollWindow/ScrollWindowEx (the reported err-120 stub).
+6. **Text details**: SetWindowText pushes toplevel titles to the WM;
+   full-length wtext round-trips (license-sized payloads truncated
+   through the 127-char title mirror); ES_MULTILINE edits render wtext
+   with DT_WORDBREAK; EM_GETLINECOUNT honest; the space glyph renders
+   blank (it was the missing-glyph box — every space drew as []).
+
+### Result
+
+Under qemu-i386 + Xvfb, deterministic: ONE visible window; the wizard
+renders its license page — gray chrome, instruction text, two radio
+buttons, disabled Next + Cancel buttons, the blue sidebar image
+(VLM-verified: no missing glyphs, structure matches Inno). Idles with a
+7-line log (only a benign SelectPalette stub). 19/19 tests. Commit b73c782
+pushed and verified (origin/main == HEAD).

@@ -4,39 +4,32 @@ Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
 
-## P0 — installer bring-up (session 17 state)
+## P0 — installer bring-up (session 18 state)
 
-THE WIZARD RUNS (session 17): builds the full wizard, paints it, idles at
-0.9% CPU with a clean log. The TNewCheckListBox raise, the POINT-by-value
-stub skew, and the WaitMessage idle spin are all root-caused and fixed
-(session-17 STATUS.md has the decode chain). New P0 = drive the wizard
-through the actual install:
+THE WIZARD PAINTS (session 18, commit b73c782): one visible window, the
+license page fully rendered (text, radios, buttons, sidebar image), idles
+clean. The white window / two windows / dead-close-button report is closed
+root-and-branch: i386 X11 event overlays, SW_HIDE mapping, 0x0-window
+inflation, the SetWindowPos SWP_SHOWWINDOW early-return, the child paint
+pipeline, and the GDI clip/origin/DIB family — full decode chain in
+session-18 STATUS.md. New P0 = interact with the real pixels:
 
-0. CLICK THROUGH: synthetic input (scripts/dev xtree click mode) — Welcome
-   page Next → license radio → components checklistbox checks → dir page
-   typing → install. Every page turn likely surfaces the next missing
-   contract (combo pages, the TNewProgress bar, WM_CTLCOLOR* theming).
-1. /S SILENT PATH: with the GUI chain fixed the silent install should now
-   get much further; run it and harvest the next raise (the crash reports
-   are now self-describing: real registers + EBP frame probe + backtrace).
-2. Files land in drive_c/Program Files/Lua/5.1 → registry uninstall keys
-   (HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall) →
-   lua.exe smoke test: print(1+2*3, ("win"):upper()).
-3. RichEdit: presence-shims only; the license page needs real rich-text
-   rendering to look right (EM_SETCHARFORMAT/EM_SETSEL/EM_GETLINE line
-   model) — cosmetic until users read license text.
-4. Session-11 wow64 width-bug pattern audit (struct readers/writers with
-   compile-time #if __x86_64__): still open.
-5. i686 mingw is installed (toolchain/root, apt-get download line in
-   scripts/dev/raise32.c): a 32-bit smoke suite under run32.sh would lock
-   the i386-only paths (RaiseException gate, builtin proc32 tokens,
-   GetClassInfo layouts) into CI-style checks the way smoke32 did.
-6. Solved (session 13, kept for history): the session-12 "engine data
-   corruption" WAS the registry-key use-after-free — RegCloseKey freed
-   tree-owned nodes and the next RegOpenKey walked recycled heap
-   (wn_handle_set_nofree fixed it; tripwire = 0 hits).
-7. GetSystemMenu/DeleteMenu menus: DONE (session 13, real menu objects).
-
+0. CLICK THROUGH (now meaningful — the pixels exist): synthetic input via
+   scripts/dev xtree click mode. NOTE: the click chain needs the i386 event
+   overlays that landed this session (mouse was dead before). Welcome Next
+   -> license radio -> components checklist -> dir page -> install. Expect
+   the checklist scroll (ScrollWindowEx is real now) and the progress bar
+   as the next contracts.
+1. LICENSE MEMO BODY: the license page renders but the memo is empty. The
+   text path is ready (full wtext + DT_WORDBREAK multiline EDIT paint +
+   EM_GETLINECOUNT honest); trace where Inno's LicenseMemo.Lines.Text
+   actually goes (WM_SETTEXT? EM_REPLACESEL? a gating EM_* we mis-answer?).
+2. /S SILENT PATH + lua.exe smoke test (unchanged from session 17).
+3. Session-11 wow64 width-bug pattern audit: STILL OPEN, and this session
+   added fresh per-arch surfaces (x11_backend offsets, ScrollWindowEx
+   prcUpdate RECT) — all guest-RECT layouts are arch-independent (4x LONG).
+4. i686 32-bit smoke suite under run32.sh (unchanged; now also covers the
+   new GDI clip/origin paths).
 Older P0 notes (session 11/12 handoff):
 
 The reported PeekMessage pump bug is FIXED+verified; the LuaForWindows /S run
