@@ -24,53 +24,87 @@ typedef unsigned long wnx_Atom;
 typedef void *wnx_Visual;
 typedef unsigned long wnx_GContext;
 
-/* XEvent: fixed 192-byte union; overlays below use the documented member
- * offsets for LP64 (type@0, serial@8, send_event@16, display@24,
- * window@32; event-specific data follows). */
+/* XEvent: fixed 192-byte union. FIELD OFFSETS ARE DATA-MODEL DEPENDENT:
+ * Xlib lays its structs out for the ABI of THIS process (we dlopen the
+ * matching libX11), so LP64 (x86_64) and ILP32 (i386) differ wherever a
+ * pointer or unsigned long appears. The original overlays hard-coded the
+ * LP64 offsets; on i386 every event decoded garbage (window read from
+ * dead bytes), win_for() never matched, and Expose/ClientMessage/input
+ * were ALL silently dropped — the field reports of the white-window
+ * wizard with dead close/maximize buttons under a real WM. Offsets:
+ *   LP64: serial@8, send_event@16, display@24, window@32, ...
+ *   ILP32: serial@4, send_event@8, display@12, window@16, ...
+ */
 #define XEVENT_SIZE 192
 
-typedef struct {
-    int32_t type;
-    uint32_t pad4;
-    uint64_t serial;
-    int32_t send_event;
-    uint32_t pad18;
-    wnx_Display display;
-    wnx_Window window;
-} xany;
+#if defined(__x86_64__)
+# define EV_OFF_WINDOW       32
+# define KY_OFF_X            64
+# define KY_OFF_Y            68
+# define KY_OFF_STATE        80
+# define KY_OFF_KEYCODE      84
+# define EX_OFF_X            40
+# define EX_OFF_Y            44
+# define EX_OFF_WIDTH        48
+# define EX_OFF_HEIGHT       52
+# define EX_OFF_COUNT        56
+# define CF_OFF_X            48
+# define CF_OFF_Y            52
+# define CF_OFF_WIDTH        56
+# define CF_OFF_HEIGHT       60
+# define CM_OFF_MSGTYPE     40
+# define CM_OFF_FORMAT       48
+# define CM_OFF_DATA         56
+# define CM_DATA_WORDSIZE    8     /* long l[5] */
+#else
+# define EV_OFF_WINDOW       16
+# define KY_OFF_X            32
+# define KY_OFF_Y            36
+# define KY_OFF_STATE        48
+# define KY_OFF_KEYCODE      52
+# define EX_OFF_X            20
+# define EX_OFF_Y            24
+# define EX_OFF_WIDTH        28
+# define EX_OFF_HEIGHT       32
+# define EX_OFF_COUNT        36
+# define CF_OFF_X            24
+# define CF_OFF_Y            28
+# define CF_OFF_WIDTH        32
+# define CF_OFF_HEIGHT       36
+# define CM_OFF_MSGTYPE     20
+# define CM_OFF_FORMAT       24
+# define CM_OFF_DATA         28
+# define CM_DATA_WORDSIZE    4     /* long = 4 bytes on ILP32 */
+#endif
 
-typedef struct {
-    xany any;
-    wnx_Window root, subwindow;
-    uint64_t time;             /* LP64: Time is unsigned long = 8 bytes! */
-    int32_t x, y;              /* 64, 68 */
-    int32_t x_root, y_root;    /* 72, 76 */
-    uint32_t state;            /* 80 */
-    uint32_t keycode;          /* 84 — button number in XButtonEvent */
-    int32_t same_screen;       /* 88 */
-} xkey;                        /* XKeyEvent AND XButtonEvent shape */
+/* Offset readers into the raw event buffer (memcpy = no alignment or
+ * aliasing assumptions). */
+static int32_t ev_i32(const void *raw, size_t off)
+{
+    int32_t v;
+    memcpy(&v, (const uint8_t *)raw + off, sizeof v);
+    return v;
+}
 
-typedef struct {
-    xany any;
-    int32_t x, y;
-    uint32_t width, height;
-    int32_t count;
-} xexpose;
+static uint32_t ev_u32(const void *raw, size_t off)
+{
+    uint32_t v;
+    memcpy(&v, (const uint8_t *)raw + off, sizeof v);
+    return v;
+}
 
-typedef struct {
-    xany any;
-    wnx_Window event;
-    int32_t x, y;
-    uint32_t width, height;
-    int32_t border_width;
-    wnx_Window above;
-    int32_t override_redirect;
-} xconfigure;
+static wnx_Window ev_window(const void *raw)
+{
+    wnx_Window w;
+    memcpy(&w, (const uint8_t *)raw + EV_OFF_WINDOW, sizeof w);
+    return w;
+}
 
-/* XWindowAttributes (x64): x@0 y@4 width@8 height@12 — all we read.
- * THE STRUCT IS ~136 BYTES: XGetWindowAttributes writes the FULL struct, so
- * the destination must be over-sized (a 24-byte overlay smashed the stack
- * and crashed with wild pointers — same class as the TEXTMETRICA /GS bug). */
+/* XWindowAttributes: x@0 y@4 width@8 height@12 — identical on both data
+ * models (ints only up to there). THE STRUCT IS ~136 BYTES ON LP64 (~96 on
+ * ILP32): XGetWindowAttributes writes the FULL struct, so the destination
+ * must be over-sized (a 24-byte overlay smashed the stack and crashed with
+ * wild pointers — same class as the TEXTMETRICA /GS bug). */
 typedef struct {
     int32_t x, y, width, height;
     int32_t border_width, depth;
@@ -80,43 +114,48 @@ _Static_assert(offsetof(xwattr, width) == 8, "XWindowAttributes ABI");
 _Static_assert(offsetof(xwattr, height) == 12, "XWindowAttributes ABI");
 _Static_assert(sizeof(xwattr) >= 136, "XWindowAttributes full size");
 
-typedef struct {
-    xany any;
-    wnx_Window message_type;
-    int32_t format;
-    uint32_t pad52;
-    uint64_t data[5];
-} xclient;
-
 /* XImage parameters for depth-24 ZPixmap with 32bpp storage: pixel bytes are
- * B,G,R,X — identical to a Win32 32bpp DIB, so zero conversion is needed. */
-/* XImage x64 layout (pointer-aligned): width@0, height@4, xoffset@8,
- * format@12, data@16(8), byte_order@24, bitmap_unit@28,
- * bitmap_bit_order@32, bitmap_pad@36, depth@40, bytes_per_line@44,
- * bits_per_pixel@48, masks@56/64/72, funcs/padding after. */
-typedef struct wnx_image {
-    int32_t width, height, xoffset, format;   /* 0,4,8,12 */
-    char *data;                                /* 16 */
-    int32_t byte_order, bitmap_unit, bitmap_bit_order, bitmap_pad; /* 24..36 */
-    int32_t depth, bytes_per_line, bits_per_pixel;                 /* 40,44,48 */
-    uint32_t pad4c;
-    uint64_t red_mask, green_mask, blue_mask;                      /* 56,64,72 */
-    void *obf1, *obf2;                                             /* 80,88 */
-    int32_t obf3;
-    uint32_t pad_obf3;
-    void *obf4, *obf5, *obf6, *obf7;
-} wnx_XImage;
+ * B,G,R,X — identical to a Win32 32bpp DIB, so zero conversion is needed.
+ * Field offsets BY DATA MODEL (same trap as the event block — the old
+ * overlay was LP64-only, and on i386 its mask writes LANDED IN XImage's
+ * function-pointer tail while byte_order went to bitmap_unit):
+ *   LP64: data@16, byte_order@24, bitmap_bit_order@32, bytes_per_line@44,
+ *         bits_per_pixel@48, masks@56/64/72
+ *   ILP32: data@16, byte_order@20, bitmap_bit_order@28, bytes_per_line@40,
+ *         bits_per_pixel@44, masks@48/52/56
+ * width@0/height@4 are ints and identical everywhere. The struct itself is
+ * opaque: every access goes through these offsets. */
+typedef struct wnx_image wnx_XImage;   /* opaque: offset access only */
 
-/* The wire-ABI offsets above were probed on LP64 X11 (Wine's layout). On
- * i386 the pointer fields are 4 bytes and these asserts do not hold: the
- * X11 glyph-cache path is x64-only for now (32-bit GUI is a later
- * milestone; console apps never touch it). */
 #if defined(__x86_64__)
-_Static_assert(offsetof(wnx_XImage, data) == 16, "XImage ABI");
-_Static_assert(offsetof(wnx_XImage, byte_order) == 24, "XImage ABI");
-_Static_assert(offsetof(wnx_XImage, bytes_per_line) == 44, "XImage ABI");
-_Static_assert(offsetof(wnx_XImage, bits_per_pixel) == 48, "XImage ABI");
+# define XI_OFF_BYTE_ORDER        24
+# define XI_OFF_BITMAP_BIT_ORDER  32
+# define XI_OFF_BPL               44
+# define XI_OFF_BITS_PER_PIXEL    48
+# define XI_OFF_RED               56
+# define XI_OFF_GREEN             64
+# define XI_OFF_BLUE              72
+#else
+# define XI_OFF_BYTE_ORDER        20
+# define XI_OFF_BITMAP_BIT_ORDER  28
+# define XI_OFF_BPL               40
+# define XI_OFF_BITS_PER_PIXEL    44
+# define XI_OFF_RED               48
+# define XI_OFF_GREEN             52
+# define XI_OFF_BLUE              56
 #endif
+
+static void xi_w32(wnx_XImage *img, size_t off, uint32_t v)
+{
+    memcpy((uint8_t *)img + off, &v, sizeof v);
+}
+
+static int32_t xi_r32(void *img, size_t off)
+{
+    int32_t v;
+    memcpy(&v, (uint8_t *)img + off, sizeof v);
+    return v;
+}
 
 /* --- resolved function pointers -------------------------------------------- */
 static wnx_Display (*pXOpenDisplay)(const char *);
@@ -129,6 +168,7 @@ static wnx_Window (*pXCreateSimpleWindow)(wnx_Display, wnx_Window, int, int,
                                           unsigned long, unsigned long);
 static int (*pXDestroyWindow)(wnx_Display, wnx_Window);
 static int (*pXMapWindow)(wnx_Display, wnx_Window);
+static int (*pXUnmapWindow)(wnx_Display, wnx_Window);
 static int (*pXStoreName)(wnx_Display, wnx_Window, const char *);
 static int (*pXSelectInput)(wnx_Display, wnx_Window, long);
 static int (*pXNextEvent)(wnx_Display, void *);
@@ -220,9 +260,10 @@ int wn_backend_glyph_render(unsigned char c, int *w, int *h, uint32_t **rgb)
                               g_scratch_h, 0xFFFFFF, 2 /* ZPixmap */);
         if (!xi)
             return -1;
-        /* XImage: width@8, height@12, ... data@96 (x64 offsets). */
-        int ih = *(int *)((char *)xi + 4);
-        int bpl = *(int *)((char *)xi + 44);
+        /* XImage: height@4 (int, same on all models); data@16 (pointer,
+         * natural width); bytes_per_line is size-model dependent. */
+        int ih = xi_r32(xi, 4);
+        int bpl = xi_r32(xi, XI_OFF_BPL);
         uint8_t *data = *(uint8_t **)((char *)xi + 16);
         x11_glyph *g = wn_xmalloc(sizeof *g);
         g->w = cw;
@@ -337,6 +378,17 @@ static void x11_win_show(wn_bwin *b)
            (unsigned long)p->xwin, pXPending(g_dpy));
 }
 
+static void x11_win_hide(wn_bwin *b)
+{
+    x11_win_priv *p = b->priv;
+    if (!pXUnmapWindow || !p || !p->xwin)   /* child bwin: never mapped */
+        return;
+    pXUnmapWindow(g_dpy, p->xwin);
+    pXFlush(g_dpy);
+    b->mapped = 0;
+    wn_log(WN_LOG_DEBUG, "x11: unmapped window 0x%lx", (unsigned long)p->xwin);
+}
+
 static void x11_win_set_title(wn_bwin *b, const char *title)
 {
     pXStoreName(g_dpy, ((x11_win_priv *)b->priv)->xwin, title);
@@ -346,14 +398,27 @@ static int (*pXMoveResizeWindow)(wnx_Display, wnx_Window, int, int,
                                  unsigned, unsigned);
 static int (*pXSetWMNormalHints)(wnx_Display, wnx_Window, void *);
 
-/* XSizeHints x64 (LP64): flags@0(4)+pad, x@8 y@12 width@16 height@20,
- * min_width@24 min_height@28 max_width@32 max_height@36, width_inc@40,
- * height_inc@44, min_aspect@48(4x int) max_aspect@64, base_width@80,
- * base_height@84, win_gravity@88 -> 96 bytes total. Oversized buffer
- * (HANDOFF gotcha: never undersize X struct overlays). */
+/* XSizeHints: `long flags` + int fields — offsets move with the data model.
+ * x64 (LP64): flags@0(8), x@8 y@12 width@16 height@20, min@24/28,
+ *   max@32/36, width_inc@40/44, aspect@48..64, base@80/84, gravity@88.
+ * i386 (ILP32): flags@0(4), x@4 y@8 width@12 height@16, min@20/24,
+ *   max@28/32, width_inc@36/40, aspect@44..60, base@60/64, gravity@68.
+ * Oversized buffer (HANDOFF gotcha: never undersize X struct overlays). */
 #define XSIZEHINTS_BYTES 96
 #define XHINT_PMIN 0x10
 #define XHINT_PMAX 0x20
+
+#if defined(__x86_64__)
+# define XSH_OFF_MINW 24
+# define XSH_OFF_MINH 28
+# define XSH_OFF_MAXW 32
+# define XSH_OFF_MAXH 36
+#else
+# define XSH_OFF_MINW 20
+# define XSH_OFF_MINH 24
+# define XSH_OFF_MAXW 28
+# define XSH_OFF_MAXH 32
+#endif
 
 static void x11_win_fixed_size(wn_bwin *b)
 {
@@ -364,11 +429,11 @@ static void x11_win_fixed_size(wn_bwin *b)
         return;
     uint8_t hints[XSIZEHINTS_BYTES];
     memset(hints, 0, sizeof hints);
-    *(int *)(void *)(hints + 0) = XHINT_PMIN | XHINT_PMAX;
-    *(int *)(void *)(hints + 24) = b->width;    /* min_width  */
-    *(int *)(void *)(hints + 28) = b->height;   /* min_height */
-    *(int *)(void *)(hints + 32) = b->width;    /* max_width  */
-    *(int *)(void *)(hints + 36) = b->height;   /* max_height */
+    *(int *)(void *)(hints + 0) = XHINT_PMIN | XHINT_PMAX;   /* low word of long */
+    *(int *)(void *)(hints + XSH_OFF_MINW) = b->width;
+    *(int *)(void *)(hints + XSH_OFF_MINH) = b->height;
+    *(int *)(void *)(hints + XSH_OFF_MAXW) = b->width;
+    *(int *)(void *)(hints + XSH_OFF_MAXH) = b->height;
     pXSetWMNormalHints(g_dpy, p->xwin, hints);
     pXFlush(g_dpy);
 }
@@ -402,46 +467,48 @@ static void dispatch(wn_bwin *b, int type, int x, int y, int val, int val2)
 
 static void handle_event(void *raw)
 {
-    xany *a = raw;
-    wn_log(WN_LOG_TRACE, "x11: event type=%d win=0x%lx", a->type,
-           (unsigned long)a->window);
-    switch (a->type) {
+    int type = ev_i32(raw, 0);
+    wnx_Window xw = ev_window(raw);
+    wn_log(WN_LOG_TRACE, "x11: event type=%d win=0x%lx", type,
+           (unsigned long)xw);
+    switch (type) {
     case 12 /* Expose */: {
-        xexpose *e = raw;
-        wn_bwin *b = win_for(e->any.window);
+        wn_bwin *b = win_for(xw);
         if (b)
-            dispatch(b, WN_BEV_EXPOSE, e->x, e->y, (int)e->width, (int)e->height);
+            dispatch(b, WN_BEV_EXPOSE, ev_i32(raw, EX_OFF_X),
+                     ev_i32(raw, EX_OFF_Y), ev_i32(raw, EX_OFF_WIDTH),
+                     ev_i32(raw, EX_OFF_HEIGHT));
         break;
     }
     case 22 /* ConfigureNotify */: {
-        xconfigure *c = raw;
-        wn_bwin *b = win_for(c->any.window);
+        wn_bwin *b = win_for(xw);
         if (!b)
             break;
         x11_win_priv *p = b->priv;
+        int cx = ev_i32(raw, CF_OFF_X), cy = ev_i32(raw, CF_OFF_Y);
         if (p) {
-            p->x = c->x;
-            p->y = c->y;
+            p->x = cx;
+            p->y = cy;
         }
-        if (c->width != (uint32_t)b->width ||
-            c->height != (uint32_t)b->height)
-            dispatch(b, WN_BEV_RESIZE, (int)c->width, (int)c->height, 0, 0);
+        int cw = ev_i32(raw, CF_OFF_WIDTH), ch = ev_i32(raw, CF_OFF_HEIGHT);
+        if (cw != b->width || ch != b->height)
+            dispatch(b, WN_BEV_RESIZE, cw, ch, 0, 0);
         else
-            dispatch(b, WN_BEV_CONFIGURE, c->x, c->y, 0, 0);
+            dispatch(b, WN_BEV_CONFIGURE, cx, cy, 0, 0);
         break;
     }
     case 2 /* KeyPress */:
     case 3 /* KeyRelease */: {
-        xkey *k = raw;
-        wn_bwin *b = win_for(k->any.window);
+        wn_bwin *b = win_for(xw);
         if (!b)
             break;
         char buf[16] = { 0 };
         wnx_Atom keysym = 0;
         int n = pXLookupString(raw, buf, sizeof buf - 1, &keysym, NULL);
-        dispatch(b, k->any.type == 2 ? WN_BEV_KEY : WN_BEV_KEYUP, k->x, k->y,
-                 (int)(keysym & 0xFFFFFFFF), (int)(unsigned char)k->keycode);
-        if (n > 0 && k->any.type == 2) {
+        dispatch(b, type == 2 ? WN_BEV_KEY : WN_BEV_KEYUP,
+                 ev_i32(raw, KY_OFF_X), ev_i32(raw, KY_OFF_Y),
+                 (int)(keysym & 0xFFFFFFFF), ev_u32(raw, KY_OFF_KEYCODE));
+        if (n > 0 && type == 2) {
             buf[n] = '\0';
             for (int i = 0; i < n; i++)
                 dispatch(b, WN_BEV_TEXT, 0, 0, (unsigned char)buf[i], 0);
@@ -450,28 +517,30 @@ static void handle_event(void *raw)
     }
     case 4 /* ButtonPress */:
     case 5 /* ButtonRelease */: {
-        xkey *k = raw;
-        wn_bwin *b = win_for(k->any.window);
+        wn_bwin *b = win_for(xw);
         /* For button events the keycode slot holds the button number. */
         if (b)
-            dispatch(b, WN_BEV_MOUSE_BUTTON, k->x, k->y,
-                     (k->any.type == 4) ? 1 : 0, (int)(unsigned char)k->keycode);
+            dispatch(b, WN_BEV_MOUSE_BUTTON, ev_i32(raw, KY_OFF_X),
+                     ev_i32(raw, KY_OFF_Y), (type == 4) ? 1 : 0,
+                     ev_u32(raw, KY_OFF_KEYCODE));
         break;
     }
     case 6 /* MotionNotify */: {
-        xkey *k = raw;
-        wn_bwin *b = win_for(k->any.window);
+        wn_bwin *b = win_for(xw);
         if (b)
-            dispatch(b, WN_BEV_MOUSE_MOVE, k->x, k->y, 0, 0);
+            dispatch(b, WN_BEV_MOUSE_MOVE, ev_i32(raw, KY_OFF_X),
+                     ev_i32(raw, KY_OFF_Y), 0, 0);
         break;
     }
     case 33 /* ClientMessage */: {
-        xclient *c = raw;
-        if (g_wm_delete && c->data[0] == (uint64_t)g_wm_delete) {
-            wn_bwin *b = win_for(c->any.window);
-            if (b)
-                dispatch(b, WN_BEV_CLOSE, 0, 0, 0, 0);
-        }
+        wn_bwin *b = win_for(xw);
+        if (!b || !g_wm_delete)
+            break;
+        uint64_t data0 = 0;
+        memcpy(&data0, (const uint8_t *)raw + CM_OFF_DATA,
+               CM_DATA_WORDSIZE);
+        if (data0 == (uint64_t)g_wm_delete)
+            dispatch(b, WN_BEV_CLOSE, 0, 0, 0, 0);
         break;
     }
     default:
@@ -508,7 +577,9 @@ static int x11_pump(int timeout_ms)
 static void x11_present(wn_bwin *b)
 {
     x11_win_priv *p = b->priv;
-    if (!p->xwin || !b->pixels)
+    /* Child-window surfaces have priv=NULL (offscreen bwins composed onto
+     * their parents by user32) — there is no X window to present here. */
+    if (!p || !p->xwin || !b->pixels)
         return;
     wnx_XImage *img = pXCreateImage(g_dpy, g_visual, g_depth, 2 /* ZPixmap */,
                                     0, (char *)b->pixels,
@@ -516,12 +587,16 @@ static void x11_present(wn_bwin *b)
                                     32, b->stride);
     if (!img)
         return;
-    img->byte_order = 0;        /* LSBFirst */
-    img->bitmap_bit_order = 0;
-    img->bits_per_pixel = 32;
-    img->red_mask = 0xFF0000;
-    img->green_mask = 0xFF00;
-    img->blue_mask = 0xFF;
+    /* Arch-correct offsets: XI_OFF_* (the LP64-only writes corrupted
+     * bitmap_unit + the function-pointer tail on i386). Masks are
+     * `unsigned long` — a 32-bit little-endian write carries the value
+     * on both data models. */
+    xi_w32(img, XI_OFF_BYTE_ORDER, 0);        /* LSBFirst */
+    xi_w32(img, XI_OFF_BITMAP_BIT_ORDER, 0);
+    xi_w32(img, XI_OFF_BITS_PER_PIXEL, 32);
+    xi_w32(img, XI_OFF_RED, 0xFF0000);
+    xi_w32(img, XI_OFF_GREEN, 0xFF00);
+    xi_w32(img, XI_OFF_BLUE, 0xFF);
     pXPutImage(g_dpy, p->xwin, g_gc, img, 0, 0, 0, 0,
                (unsigned)b->width, (unsigned)b->height);
     /* XDestroyImage is Xfree + data-not-owned; XFree the image header. */
@@ -596,6 +671,7 @@ static int x11_init(void)
     RESOLVE(XCreateSimpleWindow, wnx_Window (*)(wnx_Display, wnx_Window, int, int, unsigned, unsigned, unsigned, unsigned long, unsigned long), "XCreateSimpleWindow");
     RESOLVE(XDestroyWindow, int (*)(wnx_Display, wnx_Window), "XDestroyWindow");
     RESOLVE(XMapWindow, int (*)(wnx_Display, wnx_Window), "XMapWindow");
+    pXUnmapWindow = dlsym(x, "XUnmapWindow");   /* optional (win_hide) */
     RESOLVE(XStoreName, int (*)(wnx_Display, wnx_Window, const char *), "XStoreName");
     RESOLVE(XSelectInput, int (*)(wnx_Display, wnx_Window, long), "XSelectInput");
     RESOLVE(XNextEvent, int (*)(wnx_Display, void *), "XNextEvent");
@@ -662,6 +738,7 @@ const wn_backend wn_x11_backend = {
     .win_create = x11_win_create,
     .win_destroy = x11_win_destroy,
     .win_show = x11_win_show,
+    .win_hide = x11_win_hide,
     .win_set_title = x11_win_set_title,
     .win_move_resize = x11_win_move_resize,
     .win_fixed_size = x11_win_fixed_size,

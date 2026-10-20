@@ -68,6 +68,12 @@ typedef struct wn_backend {
     wn_bwin *(*win_create)(int w, int h, const char *title, void *userdata);
     void (*win_destroy)(wn_bwin *w);
     void (*win_show)(wn_bwin *w);
+    /* Unmap a top-level window (ShowWindow(SW_HIDE)). NULL = unsupported:
+     * user32 then leaves the last mapped state alone. Without this op a
+     * hidden window cannot be taken off the screen — the "two windows"
+     * field report: Delphi's hidden TApplication owner window was mapped
+     * by ShowWindow(SW_HIDE) and a real WM framed it beside the wizard. */
+    void (*win_hide)(wn_bwin *w);
     void (*win_set_title)(wn_bwin *w, const char *title);
     /* Move/resize a top-level backend window (NULL = fixed-size). */
     void (*win_move_resize)(wn_bwin *w, int x, int y, int cw, int ch);

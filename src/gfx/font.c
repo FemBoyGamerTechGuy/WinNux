@@ -22,6 +22,10 @@ static const unsigned char *cell_of(uint32_t cp, int bold, int italic)
         return NULL;
     const unsigned char (*tab)[WN_FONT_CELL_H] =
         bold ? g_glyph_bold : (italic ? g_glyph_ital : g_glyph_book);
+    if (cp == 0x20 /* space: a legitimately BLANK glyph — rendering the
+                    * missing-glyph box for it turned every space into an
+                    * ugly "[]" (VLM-verified on the wizard screenshot) */)
+        return tab[cp];
     const unsigned char *g = tab[cp];
     for (int y = 0; y < WN_FONT_CELL_H; y++)
         if (g[y])

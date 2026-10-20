@@ -32,29 +32,53 @@ typedef enum {
     GDI_PEN,
     GDI_FONT,
     GDI_BITMAP,             /* DIB section */
+    GDI_REGION,             /* rectangular region (CreateRectRgn) */
 } gdi_kind;
+
+/* Full mutable DC state — extracted to a named type so SaveDC can snapshot
+ * it by value. Includes the one-rect clip model: has_clip=0 = full drawable. */
+typedef struct gdi_dc_state {
+    uint64_t hwnd;              /* window DCs */
+    wn_bwin *bwin;
+    uint8_t *pixels;            /* memory DC target */
+    int w, h, stride;
+    int dib_bottom_up;          /* memory DC bitmap orientation */
+    uint32_t text_color;        /* COLORREF */
+    uint32_t bk_color;
+    int bk_mode;                /* TRANSPARENT=1, OPAQUE=2 */
+    int cur_x, cur_y;           /* MoveTo position */
+    struct gdi_obj *cur_bitmap;
+    struct gdi_obj *cur_font;   /* selected HFONT (NULL = default) */
+    struct gdi_obj *cur_brush;  /* selected HBRUSH (NULL = white) */
+    wn_handle    cur_brush_h;   /* its handle (SelectObject returns it) */
+    struct gdi_obj *cur_pen;    /* selected HPEN (NULL = black) */
+    wn_handle    cur_pen_h;
+    int rop2;                   /* SetROP2 mode (R2_COPYPEN default) */
+    /* Clip rect in DC device coordinates (has_clip=0 = whole drawable).
+     * Windows clips with real regions; our DCs get one rect — always
+     * over-inclusive rather than under (extra drawing is invisible in the
+     * blit, missing drawing is not). */
+    int has_clip;
+    int clip_l, clip_t, clip_r, clip_b;
+    /* MM_TEXT page-space origins (GDI: device = logical - WindowOrg +
+     * ViewportOrg). VCL paints child controls by shifting the window origin
+     * and drawing at (0,0)-relative coordinates — without these, every
+     * org-shifted draw landed at the wrong place (wizard stalled after the
+     * first label). Defaults (0,0) = identity, so nothing else changes. */
+    int worg_x, worg_y, vporg_x, vporg_y;
+} gdi_dc_state;
 
 typedef struct gdi_obj {
     gdi_kind kind;
-    /* DC state */
+    gdi_dc_state dc;
+    /* SaveDC stack: value snapshots of the DC state (VCL's canvas
+     * SaveState pattern). IDs are 1-based and unique per DC. */
     struct {
-        uint64_t hwnd;              /* window DCs */
-        wn_bwin *bwin;
-        uint8_t *pixels;            /* memory DC target */
-        int w, h, stride;
-        int dib_bottom_up;          /* memory DC bitmap orientation */
-        uint32_t text_color;        /* COLORREF */
-        uint32_t bk_color;
-        int bk_mode;                /* TRANSPARENT=1, OPAQUE=2 */
-        int cur_x, cur_y;           /* MoveTo position */
-        struct gdi_obj *cur_bitmap;
-        struct gdi_obj *cur_font;   /* selected HFONT (NULL = default) */
-        struct gdi_obj *cur_brush;  /* selected HBRUSH (NULL = white) */
-        wn_handle    cur_brush_h;   /* its handle (SelectObject returns it) */
-        struct gdi_obj *cur_pen;    /* selected HPEN (NULL = black) */
-        wn_handle    cur_pen_h;
-        int rop2;                    /* SetROP2 mode (R2_COPYPEN default) */
-    } dc;
+        gdi_dc_state s[8];
+        int id[8];
+        int n;
+        int next_id;
+    } saves;
     /* object state */
     uint32_t color;                 /* brush/pen COLORREF */
     struct {                        /* bitmap */
@@ -63,6 +87,9 @@ typedef struct gdi_obj {
         int bpp;
         int bottom_up;
     } bmp;
+    struct {                        /* region */
+        int l, t, r, b;
+    } rgn;
     struct {                        /* font (LOGFONT distilled) */
         int height;                 /* requested cell height (px, >0) */
         int weight;                 /* >=700 = bold */
@@ -381,9 +408,13 @@ WN_API int32_t g32_EndPaint(wn_abiword hwnd, const void *ps)
         return 0;
     const wn_backend *be = wn_backend_get();
     extern wn_bwin *wn_user32_bwin_of(uint64_t hwnd);
+    extern void wn_user32_compose_if_child(uint64_t hwnd);
     wn_bwin *b = wn_user32_bwin_of(hwnd);
     if (be && be->present && b)
         be->present(b);
+    /* Guest-class children paint into offscreen surfaces; push them onto
+     * the parent chain so the pixels actually reach the screen. */
+    wn_user32_compose_if_child((uint64_t)hwnd);
     wn_user32_validate_paint(hwnd);
     return 1;
 }
@@ -531,6 +562,268 @@ static WN_API int32_t g32_DeleteObject(wn_handle obj)
     return wn_handle_close(obj);
 }
 
+/* --- DC clipping + saved state -------------------------------------------------
+ * VCL's WM_PAINT pipeline gates every control draw on RectVisible /
+ * GetClipBox against the DC clip ("anything to draw in the update region?").
+ * The returning-0 stubs told VCL "nothing is visible" — the ENTIRE wizard
+ * painted nothing and every window stayed white (the field report that
+ * outlived the expose fix). Model: one clip rect per DC (default = full
+ * drawable), rect-valued regions, value-snapshot SaveDC/RestoreDC. */
+
+static void dc_clip_reset(gdi_dc_state *d)
+{
+    d->has_clip = 0;
+}
+
+static void dc_clip_intersect(gdi_dc_state *d, int l, int t, int r, int b)
+{
+    if (r <= l || b <= t) {         /* empty rect = empty clip */
+        d->clip_l = d->clip_t = d->clip_r = d->clip_b = 0;
+        d->has_clip = 1;
+        return;
+    }
+    if (!d->has_clip) {
+        d->clip_l = l; d->clip_t = t;
+        d->clip_r = r; d->clip_b = b;
+        d->has_clip = 1;
+        return;
+    }
+    if (l > d->clip_l) d->clip_l = l;
+    if (t > d->clip_t) d->clip_t = t;
+    if (r < d->clip_r) d->clip_r = r;
+    if (b < d->clip_b) d->clip_b = b;
+}
+
+/* Effective clip = stored clip ∩ drawable bounds; returns 0 if empty. */
+static int dc_clip_rect(const gdi_dc_state *d, int *l, int *t, int *r, int *b)
+{
+    int fl = 0, ft = 0, fr = d->w, fb = d->h;
+    if (d->has_clip) {
+        if (d->clip_l > fl) fl = d->clip_l;
+        if (d->clip_t > ft) ft = d->clip_t;
+        if (d->clip_r < fr) fr = d->clip_r;
+        if (d->clip_b < fb) fb = d->clip_b;
+    }
+    *l = fl; *t = ft; *r = fr; *b = fb;
+    return fr > fl && fb > ft;
+}
+
+/* Logical (page-space MM_TEXT) -> device translation. */
+static void dc_xlate(const gdi_dc_state *d, int *x, int *y)
+{
+    *x = *x - d->worg_x + d->vporg_x;
+    *y = *y - d->worg_y + d->vporg_y;
+}
+
+static void dc_xlate_rect(const gdi_dc_state *d, int *l, int *t, int *r, int *b)
+{
+    *l = *l - d->worg_x + d->vporg_x;
+    *r = *r - d->worg_x + d->vporg_x;
+    *t = *t - d->worg_y + d->vporg_y;
+    *b = *b - d->worg_y + d->vporg_y;
+}
+
+/* Window/viewport origin get/set (POINT = two LONGs, same on both arches). */
+static WN_API int32_t g32_GetWindowOrgEx(wn_handle hdc, void *pt)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !pt)
+        return 0;
+    int32_t *p = pt;
+    p[0] = dc->dc.worg_x;
+    p[1] = dc->dc.worg_y;
+    return 1;
+}
+
+static WN_API int32_t g32_SetWindowOrgEx(wn_handle hdc, int32_t x, int32_t y,
+                                        void *old_pt)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return 0;
+    if (old_pt) {
+        int32_t *p = old_pt;
+        p[0] = dc->dc.worg_x;
+        p[1] = dc->dc.worg_y;
+    }
+    dc->dc.worg_x = x;
+    dc->dc.worg_y = y;
+    return 1;
+}
+
+static WN_API int32_t g32_GetViewportOrgEx(wn_handle hdc, void *pt)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !pt)
+        return 0;
+    int32_t *p = pt;
+    p[0] = dc->dc.vporg_x;
+    p[1] = dc->dc.vporg_y;
+    return 1;
+}
+
+static WN_API int32_t g32_SetViewportOrgEx(wn_handle hdc, int32_t x, int32_t y,
+                                          void *old_pt)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return 0;
+    if (old_pt) {
+        int32_t *p = old_pt;
+        p[0] = dc->dc.vporg_x;
+        p[1] = dc->dc.vporg_y;
+    }
+    dc->dc.vporg_x = x;
+    dc->dc.vporg_y = y;
+    return 1;
+}
+
+static WN_API int32_t g32_RectVisible(wn_handle hdc, const void *rect)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !rect)
+        return 0;
+    const int32_t *rc = rect;
+    int l, t, r, b;
+    if (!dc_clip_rect(&dc->dc, &l, &t, &r, &b))
+        return 0;
+    return (rc[0] < r && rc[1] < b && rc[2] > l && rc[3] > t) ? 1 : 0;
+}
+
+static WN_API int32_t g32_PtVisible(wn_handle hdc, int32_t x, int32_t y)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return 0;
+    int l, t, r, b;
+    if (!dc_clip_rect(&dc->dc, &l, &t, &r, &b))
+        return 0;
+    return (x >= l && x < r && y >= t && y < b) ? 1 : 0;
+}
+
+static WN_API int32_t g32_GetClipBox(wn_handle hdc, void *rect)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !rect)
+        return 0;
+    int32_t *rc = rect;
+    int l, t, r, b;
+    if (!dc_clip_rect(&dc->dc, &l, &t, &r, &b)) {
+        rc[0] = rc[1] = rc[2] = rc[3] = 0;
+        return 1;   /* NULLREGION: empty clip */
+    }
+    rc[0] = l; rc[1] = t; rc[2] = r; rc[3] = b;
+    return 2;       /* SIMPLEREGION */
+}
+
+static WN_API int32_t g32_IntersectClipRect(wn_handle hdc, int32_t l, int32_t t,
+                                           int32_t r, int32_t b)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return 0;
+    /* callers pass logical coordinates — clip is stored in device space */
+    dc_xlate_rect(&dc->dc, &l, &t, &r, &b);
+    dc_clip_intersect(&dc->dc, l, t, r, b);
+    return 1;
+}
+
+static WN_API int32_t g32_ExcludeClipRect(wn_handle hdc, int32_t l, int32_t t,
+                                          int32_t r, int32_t b)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return 1;
+    /* callers pass logical coordinates — clip is stored in device space */
+    dc_xlate_rect(&dc->dc, &l, &t, &r, &b);
+    /* Single-rect model: shrink only when the excluded band spans the whole
+     * clip horizontally or vertically; otherwise stay over-inclusive. */
+    if (!dc->dc.has_clip) {
+        dc->dc.has_clip = 1;
+        dc->dc.clip_l = 0; dc->dc.clip_t = 0;
+        dc->dc.clip_r = dc->dc.w; dc->dc.clip_b = dc->dc.h;
+    }
+    if (l <= dc->dc.clip_l && r >= dc->dc.clip_r) {
+        if (t <= dc->dc.clip_t)
+            dc->dc.clip_t = b;               /* top band */
+        else if (b >= dc->dc.clip_b)
+            dc->dc.clip_b = t;               /* bottom band */
+    } else if (t <= dc->dc.clip_t && b >= dc->dc.clip_b) {
+        if (l <= dc->dc.clip_l)
+            dc->dc.clip_l = r;               /* left band */
+        else if (r >= dc->dc.clip_r)
+            dc->dc.clip_r = l;               /* right band */
+    }
+    if (dc->dc.clip_r <= dc->dc.clip_l || dc->dc.clip_b <= dc->dc.clip_t)
+        dc->dc.clip_l = dc->dc.clip_t = dc->dc.clip_r = dc->dc.clip_b = 0;
+    return 1;
+}
+
+static WN_API wn_handle g32_CreateRectRgn(int32_t l, int32_t t, int32_t r,
+                                        int32_t b)
+{
+    gdi_obj *rg = wn_xcalloc(1, sizeof *rg);
+    rg->kind = GDI_REGION;
+    rg->rgn.l = l; rg->rgn.t = t;
+    rg->rgn.r = r; rg->rgn.b = b;
+    return gdi_new(rg);
+}
+
+static WN_API int32_t g32_SelectClipRgn(wn_handle hdc, wn_handle hrgn)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return 0;
+    if (!hrgn) {                    /* NULL region resets the clip */
+        dc_clip_reset(&dc->dc);
+        return 1;                   /* SIMPLEREGION */
+    }
+    gdi_obj *rg = gdi_get(hrgn, GDI_REGION);
+    if (!rg)
+        return 0;
+    if (rg->rgn.r <= rg->rgn.l || rg->rgn.b <= rg->rgn.t) {
+        /* empty region selected: empty clip (Windows NULLREGION semantics) */
+        dc->dc.has_clip = 1;
+        dc->dc.clip_l = dc->dc.clip_t = 0;
+        dc->dc.clip_r = dc->dc.clip_b = 0;
+        return 1;                   /* NULLREGION */
+    }
+    dc->dc.has_clip = 1;
+    dc->dc.clip_l = rg->rgn.l; dc->dc.clip_t = rg->rgn.t;
+    dc->dc.clip_r = rg->rgn.r; dc->dc.clip_b = rg->rgn.b;
+    return 2;                       /* SIMPLEREGION */
+}
+
+static WN_API int32_t g32_SaveDC(wn_handle hdc)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || dc->saves.n >= 8)
+        return 0;
+    int idx = dc->saves.n++;
+    dc->saves.s[idx] = dc->dc;      /* value snapshot incl. clip */
+    dc->saves.id[idx] = ++dc->saves.next_id;
+    return dc->saves.next_id;
+}
+
+static WN_API int32_t g32_RestoreDC(wn_handle hdc, int32_t saved)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || saved <= 0)
+        return 0;
+    int idx = -1;
+    for (int i = 0; i < dc->saves.n; i++) {
+        if (dc->saves.id[i] == (int)saved) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0)
+        return 0;
+    dc->dc = dc->saves.s[idx];
+    dc->saves.n = idx;              /* pop the level and everything above */
+    return 1;
+}
+
 /* --- drawing ops --------------------------------------------------------------------------- */
 
 WN_API int32_t g32_FillRect(wn_handle hdc, const void *rect, wn_handle brush)
@@ -541,7 +834,9 @@ WN_API int32_t g32_FillRect(wn_handle hdc, const void *rect, wn_handle brush)
     gdi_obj *br = gdi_get(brush, GDI_BRUSH);
     uint32_t cr = br ? br->color : 0x00FFFFFF;
     const int32_t *r = rect;
-    fill_rect_rgb(dc, r[0], r[1], r[2], r[3], colorref_to_u32(cr));
+    int l = r[0], t = r[1], rr = r[2], b = r[3];
+    dc_xlate_rect(&dc->dc, &l, &t, &rr, &b);
+    fill_rect_rgb(dc, l, t, rr, b, colorref_to_u32(cr));
     return 1;
 }
 
@@ -603,6 +898,7 @@ static WN_API int32_t g32_PatBlt(wn_handle hdc, int32_t x, int32_t y,
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
     if (!dc || w <= 0 || h <= 0)
         return 0;
+    dc_xlate(&dc->dc, &x, &y);
     uint32_t rgb;
     if (rop == 0x00000042u /*BLACKNESS*/)
         rgb = 0x000000;
@@ -961,6 +1257,7 @@ WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
     size_t n = count < 0 ? strlen(s) : (size_t)count;
     if (!dc->dc.cur_font)
         dc->dc.cur_font = default_font(dc);
+    dc_xlate(&dc->dc, &x, &y);
     draw_text_into(dc, x, y, s, n);
     return 1;
 }
@@ -980,6 +1277,7 @@ static WN_API int32_t g32_TextOutW(wn_handle hdc, int x, int y,
     }
     if (!dc->dc.cur_font)
         dc->dc.cur_font = default_font(dc);
+    dc_xlate(&dc->dc, &x, &y);
     draw_text16(dc, x, y, s, n);
     return 1;
 }
@@ -987,7 +1285,10 @@ static WN_API int32_t g32_TextOutW(wn_handle hdc, int x, int y,
 WN_API uint32_t g32_SetPixel(wn_handle hdc, int32_t x, int32_t y, uint32_t color)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
-    if (!dc || x < 0 || y < 0 || x >= dc->dc.w || y >= dc->dc.h)
+    if (!dc)
+        return 0;
+    dc_xlate(&dc->dc, &x, &y);
+    if (x < 0 || y < 0 || x >= dc->dc.w || y >= dc->dc.h)
         return 0;
     int dy = dc->dc.dib_bottom_up ? dc->dc.h - 1 - y : y;
     uint8_t *px = dc->dc.pixels + (size_t)dy * dc->dc.stride + (size_t)x * 4;
@@ -1017,8 +1318,11 @@ static WN_API int32_t g32_LineTo(wn_handle hdc, int32_t x, int32_t y)
     if (!dc)
         return 0;
     uint32_t rgb = colorref_to_u32(dc->dc.text_color);  /* use text color as pen (simplification) */
-    int x0 = dc->dc.cur_x, y0 = dc->dc.cur_y;
-    int dx = x - x0, dy = y - y0;
+    /* cur position and the endpoint are LOGICAL; draw in device space. */
+    int x0 = dc->dc.cur_x, y0 = dc->dc.cur_y, x1 = x, y1 = y;
+    dc_xlate(&dc->dc, &x0, &y0);
+    dc_xlate(&dc->dc, &x1, &y1);
+    int dx = x1 - x0, dy = y1 - y0;
     int sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1;
     dx = dx < 0 ? -dx : dx;
     dy = dy < 0 ? -dy : dy;
@@ -1029,7 +1333,7 @@ static WN_API int32_t g32_LineTo(wn_handle hdc, int32_t x, int32_t y)
             int ddy = dc->dc.dib_bottom_up ? dc->dc.h - 1 - cy : cy;
             put_px(dc->dc.pixels + (size_t)ddy * dc->dc.stride + (size_t)cx * 4, rgb);
         }
-        if (cx == x && cy == y)
+        if (cx == x1 && cy == y1)
             break;
         int e2 = 2 * err;
         if (e2 > -dy) { err -= dy; cx += sx; }
@@ -1045,6 +1349,7 @@ WN_API int32_t g32_Rectangle(wn_handle hdc, int l, int t, int r, int b)
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
     if (!dc)
         return 0;
+    dc_xlate_rect(&dc->dc, &l, &t, &r, &b);
     uint32_t rgb = colorref_to_u32(dc->dc.text_color);
     /* Thin frame. */
     for (int x = l; x < r; x++) {
@@ -1085,6 +1390,9 @@ static WN_API int32_t g32_BitBlt(wn_handle dst, int dx0, int dy0, int w, int h,
     gdi_obj *s = gdi_get(src, GDI_DC_WINDOW);
     if (!d || !s || !s->dc.pixels)
         return 0;
+    /* destination and source points are in their own DCs' logical spaces */
+    dc_xlate(&d->dc, &dx0, &dy0);
+    dc_xlate(&s->dc, &sx0, &sy0);
     for (int row = 0; row < h; row++) {
         for (int col = 0; col < w; col++) {
             int sxs = sx0 + col, sys = sy0 + row;
@@ -1117,6 +1425,7 @@ static WN_API int32_t g32_SetDIBitsToDevice(wn_handle hdc, int xdst, int ydst,
     gdi_obj *d = gdi_get(hdc, GDI_DC_WINDOW);
     if (!d || !bits || !bmi)
         return 0;
+    dc_xlate(&d->dc, &xdst, &ydst);
     const uint8_t *hdr = bmi;
     int bw = *(const int32_t *)(const void *)(hdr + 4);
     int bh = *(const int32_t *)(const void *)(hdr + 8);
@@ -1143,6 +1452,177 @@ static WN_API int32_t g32_SetDIBitsToDevice(wn_handle hdc, int xdst, int ydst,
             const uint8_t *sp = (const uint8_t *)bits +
                                 (size_t)sy * bw * 4 + (size_t)sxs * 4;
             uint8_t *dp = d->dc.pixels + (size_t)dyy * d->dc.stride + (size_t)dx * 4;
+            dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = 0xFF;
+        }
+    }
+    return 1;
+}
+
+/* --- DIB bitmaps, palettes, stretching -----------------------------------
+ * VCL's TBitmap builds wizard images through CreateDIBitmap; the returning-0
+ * stub made Inno raise "Out of system resources" the moment the welcome
+ * page tried to load its sidebar bitmap. Real model: convert the DIB (any
+ * BI_RGB bit depth incl. palettized 1/4/8bpp) into a 32bpp GDI_BITMAP
+ * keeping the source row order; SelectObject + BitBlt/StretchBlt render it. */
+static WN_API wn_handle g32_CreateDIBitmap(wn_handle hdc, const void *hdrp,
+                                          uint32_t init, const void *bits,
+                                          const void *bmip, uint32_t usage)
+{
+    (void)hdc;
+    const uint8_t *hdr = hdrp ? hdrp : bmip;
+    if (!hdr)
+        return (wn_handle)0;
+    /* BITMAPINFOHEADER: width@4, height@8, planes@12(u16), bpp@14(u16),
+     * compression@16, clrused@32 — fixed layout on every guest arch. */
+    int w = *(const int32_t *)(const void *)(hdr + 4);
+    int h_raw = *(const int32_t *)(const void *)(hdr + 8);
+    uint16_t bpp = *(const uint16_t *)(const void *)(hdr + 0xE);
+    uint32_t compr = *(const uint32_t *)(const void *)(hdr + 16);
+    uint32_t clrused = *(const uint32_t *)(const void *)(hdr + 32);
+    if (w <= 0 || h_raw == 0 || compr != 0 /*BI_RGB*/ ||
+        (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 24 && bpp != 32)) {
+        wn_log(WN_LOG_WARN, "gdi32: CreateDIBitmap unsupported: %dx%d "
+               "bpp=%u compr=%u", w, h_raw, bpp, compr);
+        return (wn_handle)0;
+    }
+    int h = h_raw < 0 ? -h_raw : h_raw;
+    int bottom_up = h_raw > 0;
+    if (usage != 0 /*DIB_RGB_COLORS*/)
+        wn_log(WN_LOG_DEBUG, "gdi32: CreateDIBitmap usage=%u approximated "
+               "as RGB colors", usage);
+    uint32_t ncolors = bpp <= 8
+        ? (clrused ? clrused : (1u << bpp)) : 0;
+    /* color table lives at bmi + header (bmip carries it when hdrp==NULL or
+     * points at the same header); entries are RGBQUAD B,G,R,reserved. */
+    const uint8_t *quads = (const uint8_t *)bmip;
+    if (quads) {
+        uint32_t hsz = *(const uint32_t *)(const void *)(quads);
+        quads += hsz ? hsz : 40;
+        if (hdrp && bmip && bmip != hdrp) {
+            /* distinct info block: its own header size still applies and
+             * the table follows it; recompute below from bmip directly. */
+        }
+    }
+    gdi_obj *o = wn_xcalloc(1, sizeof *o);
+    o->kind = GDI_BITMAP;
+    o->bmp.w = w;
+    o->bmp.h = h;
+    o->bmp.bpp = 32;
+    o->bmp.bottom_up = bottom_up;
+    o->bmp.bits = wn_xmalloc((size_t)w * h * 4 + 64);
+    memset(o->bmp.bits, 0, (size_t)w * h * 4);
+    if ((init & 0x4u /*CBM_INIT*/) && bits && bpp > 8) {
+        size_t rowb = ((size_t)w * (bpp / 8) + 3) & ~(size_t)3;
+        for (int y = 0; y < h; y++) {
+            int sy = bottom_up ? h - 1 - y : y;
+            const uint8_t *src = (const uint8_t *)bits + (size_t)sy * rowb;
+            uint8_t *dst = o->bmp.bits + (size_t)y * w * 4;
+            if (bpp == 24) {
+                for (int x = 0; x < w; x++) {
+                    dst[x * 4 + 0] = src[x * 3 + 0];
+                    dst[x * 4 + 1] = src[x * 3 + 1];
+                    dst[x * 4 + 2] = src[x * 3 + 2];
+                    dst[x * 4 + 3] = 0xFF;
+                }
+            } else {   /* 32bpp B,G,R,X */
+                for (int x = 0; x < w; x++) {
+                    dst[x * 4 + 0] = src[x * 4 + 0];
+                    dst[x * 4 + 1] = src[x * 4 + 1];
+                    dst[x * 4 + 2] = src[x * 4 + 2];
+                    dst[x * 4 + 3] = 0xFF;
+                }
+            }
+        }
+    } else if ((init & 0x4u /*CBM_INIT*/) && bits && bpp <= 8) {
+        const uint8_t *tab = quads ? quads : NULL;
+        if (!tab) {
+            wn_log(WN_LOG_WARN, "gdi32: CreateDIBitmap palettized but no "
+                   "color table reachable");
+            wn_handle_close(gdi_new(o));
+            return (wn_handle)0;
+        }
+        size_t rowb = (((size_t)w * bpp + 31) / 32) * 4;
+        for (int y = 0; y < h; y++) {
+            int sy = bottom_up ? h - 1 - y : y;
+            const uint8_t *src = (const uint8_t *)bits + (size_t)sy * rowb;
+            uint8_t *dst = o->bmp.bits + (size_t)y * w * 4;
+            for (int x = 0; x < w; x++) {
+                unsigned idx = 0;
+                if (bpp == 8) {
+                    idx = src[x];
+                } else {
+                    unsigned bit = (unsigned)x * bpp;
+                    unsigned byte = bit >> 3;
+                    unsigned off = 8 - bpp - (bit & 7);
+                    idx = (src[byte] >> off) & ((1u << bpp) - 1u);
+                }
+                if (idx >= ncolors)
+                    idx = ncolors ? ncolors - 1 : 0;
+                const uint8_t *q = tab + idx * 4;
+                dst[x * 4 + 0] = q[0];     /* blue */
+                dst[x * 4 + 1] = q[1];     /* green */
+                dst[x * 4 + 2] = q[2];     /* red */
+                dst[x * 4 + 3] = 0xFF;
+            }
+        }
+    }
+    return gdi_new(o);
+}
+
+/* LOGPALETTE: palVersion(u16)@0, palNumEntries(u16)@2, entries[4] B,G,R,fl.
+ * A handle-backed token is all callers need today (VCL tolerates a palette
+ * that never realizes under a TrueColor model). */
+static WN_API wn_handle g32_CreatePalette(const void *logpal)
+{
+    if (!logpal)
+        return (wn_handle)0;
+    gdi_obj *o = wn_xcalloc(1, sizeof *o);
+    o->kind = GDI_REGION;       /* payload type reuse: inert token */
+    return gdi_new(o);
+}
+
+static WN_API int32_t g32_SetStretchBltMode(wn_handle hdc, int32_t mode)
+{
+    (void)hdc;
+    return mode >= 1 && mode <= 4 ? 1 : 0;   /* previous mode: default */
+}
+
+/* StretchBlt SRCCOPY with nearest-neighbor scaling (identical sizes reduce
+ * to a straight blit). Source = window or memory DC. */
+static WN_API int32_t g32_StretchBlt(wn_handle dst, int dx, int dy,
+                                    int dw, int dh, wn_handle src,
+                                    int sx, int sy, int sw, int sh,
+                                    uint32_t rop)
+{
+    if (rop != 0x00CC0020 /*SRCCOPY*/) {
+        wn_log(WN_LOG_WARN, "gdi32: StretchBlt rop 0x%x unsupported", rop);
+        wn_last_error_set(WN_ERR_NOT_SUPPORTED);
+        return 0;
+    }
+    gdi_obj *d = gdi_get(dst, GDI_DC_WINDOW);
+    gdi_obj *s = gdi_get(src, GDI_DC_WINDOW);
+    if (!d || !s || !s->dc.pixels || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0)
+        return 0;
+    dc_xlate(&d->dc, &dx, &dy);
+    dc_xlate(&s->dc, &sx, &sy);
+    for (int row = 0; row < dh; row++) {
+        int srow = sy + (sh * row) / dh;   /* nearest-neighbor vertical */
+        int dyy = d->dc.dib_bottom_up ? d->dc.h - 1 - (dy + row) : dy + row;
+        int syy = s->dc.dib_bottom_up ? s->dc.h - 1 - srow : srow;
+        if (dy + row < 0 || dy + row >= d->dc.h ||
+            syy < 0 || syy >= s->dc.h)
+            continue;
+        const uint8_t *sline = s->dc.pixels + (size_t)syy * s->dc.stride;
+        uint8_t *dline = d->dc.pixels + (size_t)dyy * d->dc.stride;
+        for (int col = 0; col < dw; col++) {
+            int scol = sx + (sw * col) / dw;
+            if (scol < 0 || scol >= s->dc.w)
+                continue;
+            int dcol = dx + col;
+            if (dcol < 0 || dcol >= d->dc.w)
+                continue;
+            const uint8_t *sp = sline + (size_t)scol * 4;
+            uint8_t *dp = dline + (size_t)dcol * 4;
             dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = 0xFF;
         }
     }
@@ -1821,7 +2301,26 @@ WN_API int32_t g32_DrawTextA(wn_handle hdc, const char *s,
     size_t m = n < 4096 ? n : 4096;
     for (size_t i = 0; i < m; i++)
         w[i] = (unsigned char)s[i];
-    return draw_text_common(dc, w, m, rect, fmt);
+    int32_t rct[4];
+    memcpy(rct, rect, sizeof rct);
+    {
+        int l = rct[0], t = rct[1], r = rct[2], b = rct[3];
+        dc_xlate_rect(&dc->dc, &l, &t, &r, &b);
+        rct[0] = l; rct[1] = t; rct[2] = r; rct[3] = b;
+    }
+    int32_t res = draw_text_common(dc, w, m, rct, fmt);
+    /* DT_CALCRECT: results come back in the CALLER's (logical) rect */
+    if (fmt & 0x400u /*DT_CALCRECT*/) {
+        memcpy(rect, rct, sizeof rct);
+        if (dc->dc.worg_x || dc->dc.vporg_x || dc->dc.worg_y ||
+            dc->dc.vporg_y) {
+            int32_t *rc = rect;
+            int ox = dc->dc.worg_x - dc->dc.vporg_x;
+            int oy = dc->dc.worg_y - dc->dc.vporg_y;
+            rc[0] += ox; rc[1] += oy; rc[2] += ox; rc[3] += oy;
+        }
+    }
+    return res;
 }
 
 WN_API int32_t g32_DrawTextW(wn_handle hdc, const uint16_t *s,
@@ -1842,7 +2341,25 @@ WN_API int32_t g32_DrawTextW(wn_handle hdc, const uint16_t *s,
     uint16_t w[4096];
     size_t m = n < 4096 ? n : 4096;
     memcpy(w, s, m * 2);
-    return draw_text_common(dc, w, m, rect, fmt);
+    int32_t rct[4];
+    memcpy(rct, rect, sizeof rct);
+    {
+        int l = rct[0], t = rct[1], r = rct[2], b = rct[3];
+        dc_xlate_rect(&dc->dc, &l, &t, &r, &b);
+        rct[0] = l; rct[1] = t; rct[2] = r; rct[3] = b;
+    }
+    int32_t res = draw_text_common(dc, w, m, rct, fmt);
+    if (fmt & 0x400u /*DT_CALCRECT*/) {
+        memcpy(rect, rct, sizeof rct);
+        if (dc->dc.worg_x || dc->dc.vporg_x || dc->dc.worg_y ||
+            dc->dc.vporg_y) {
+            int32_t *rc = rect;
+            int ox = dc->dc.worg_x - dc->dc.vporg_x;
+            int oy = dc->dc.worg_y - dc->dc.vporg_y;
+            rc[0] += ox; rc[1] += oy; rc[2] += ox; rc[3] += oy;
+        }
+    }
+    return res;
 }
 
 /* Control-painting helpers shared with user32's builtin controls. */
@@ -1946,6 +2463,8 @@ const wn_export_entry wn_gdi32_exports[] = {
     { "UnrealizeObject", g32_UnrealizeObject },
     { "GetObjectA", g32_GetObjectA },
     { "CreateBrushIndirect", g32_CreateBrushIndirect },
+    { "CreateDIBitmap", g32_CreateDIBitmap },
+    { "CreatePalette", g32_CreatePalette },
     { "CreatePenIndirect", g32_CreatePenIndirect },
     { "CreateCompatibleBitmap", g32_CreateCompatibleBitmap },
     { "CreateCompatibleDC", g32_CreateCompatibleDC },
@@ -1959,6 +2478,8 @@ const wn_export_entry wn_gdi32_exports[] = {
     { "DrawEdge", g32_DrawEdge },
     { "GetTextExtentPoint32A", g32_GetTextExtentPoint32A },
     { "GetTextExtentPoint32W", g32_GetTextExtentPoint32W },
+    { "GetViewportOrgEx", g32_GetViewportOrgEx },
+    { "GetWindowOrgEx", g32_GetWindowOrgEx },
     { "GetTextExtentPointA", g32_GetTextExtentPointA },
     { "GetTextExtentPointW", g32_GetTextExtentPointW },
     { "GetCurrentPositionEx", g32_GetCurrentPositionEx },
@@ -1969,18 +2490,31 @@ const wn_export_entry wn_gdi32_exports[] = {
     { "EnumFontFamiliesA", g32_EnumFontFamiliesA },
     { "EnumFontFamiliesW", g32_EnumFontFamiliesW },
     { "CreatePen", g32_CreatePen },
+    { "CreateRectRgn", g32_CreateRectRgn },
     { "CreateSolidBrush", g32_CreateSolidBrush },
     { "DeleteDC", g32_DeleteDC },
     { "DeleteObject", g32_DeleteObject },
+    { "ExcludeClipRect", g32_ExcludeClipRect },
+    { "GetClipBox", g32_GetClipBox },
     { "GetDeviceCaps", g32_GetDeviceCaps },
     { "GetStockObject", g32_GetStockObject },
+    { "IntersectClipRect", g32_IntersectClipRect },
     { "LineTo", g32_LineTo },
     { "MoveToEx", g32_MoveToEx },
+    { "PtVisible", g32_PtVisible },
     { "Rectangle", g32_Rectangle },
+    { "RectVisible", g32_RectVisible },
+    { "RestoreDC", g32_RestoreDC },
+    { "SaveDC", g32_SaveDC },
+    { "SelectClipRgn", g32_SelectClipRgn },
     { "SelectObject", g32_SelectObject },
     { "SetBkColor", g32_SetBkColor },
     { "SetBkMode", g32_SetBkMode },
     { "SetDIBitsToDevice", g32_SetDIBitsToDevice },
+    { "SetStretchBltMode", g32_SetStretchBltMode },
+    { "SetViewportOrgEx", g32_SetViewportOrgEx },
+    { "SetWindowOrgEx", g32_SetWindowOrgEx },
+    { "StretchBlt", g32_StretchBlt },
     { "SetPixel", g32_SetPixel },
     { "SetTextColor", g32_SetTextColor },
     { "TextOutA", g32_TextOutA },

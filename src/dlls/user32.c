@@ -130,6 +130,7 @@ static int g_bwin_count;
 /* Forward decls (defined later in this file). */
 static void compose_child(wn_window *child);
 static void present_root(wn_window *w);
+static void u32_dirty_window_tree(uint64_t hwnd);
 static void win_screen_origin(wn_window *w, int *x, int *y);
 static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
                                         wn_abiword wp, wn_abiword_s lp);
@@ -523,15 +524,27 @@ static WN_API int32_t u32_ShowWindow(wn_abiword hwnd, int32_t cmd)
     int was_visible = w->visible;
     /* Only top-level windows have a real backend surface; children are
      * offscreen surfaces composed by their parent (be->win_show on a child
-     * bwin crashed on priv=NULL — the putty About-box segfault). */
-    if (!w->parent && be && be->win_show)
-        be->win_show(w->bwin);
-    if (cmd != 0 /* SW_HIDE */)
-        w->visible = 1;
-    else
-        w->visible = 0;
+     * bwin crashed on priv=NULL — the putty About-box segfault).
+     *
+     * SW_HIDE must UNMAP — and must NEVER map: the old code called
+     * win_show unconditionally, so a hidden-to-be window (Delphi's
+     * TApplication owner window, Inno's hidden MainForm) got MAPPED by
+     * the very call that asked to hide it. Under a real WM every one of
+     * those became a framed toplevel: the user's "two windows" report,
+     * with the hidden owner painted white beside the wizard. */
+    if (!w->parent && be) {
+        if (cmd == 0 /* SW_HIDE */) {
+            if (w->bwin->mapped && be->win_hide)
+                be->win_hide(w->bwin);
+        } else if (be->win_show) {
+            be->win_show(w->bwin);
+        }
+    }
+    w->visible = (cmd != 0);
     if (w->parent && w->visible)
         compose_child(w);
+    if (cmd != 0)
+        u32_dirty_window_tree((uint64_t)hwnd);   /* shown: invalidate subtree */
     return was_visible;
 }
 
@@ -589,11 +602,15 @@ static void user32_move_resize(uint64_t hwnd, int x, int y, int w, int h,
         deliver_now(hwnd, WN_WM_MOVE, 0,
                     (int64_t)(((uint64_t)(uint16_t)win->wx) |
                               ((uint64_t)(uint16_t)win->wy << 16)));
-    /* full-surface damage: the pump will synthesize ONE WM_PAINT */
+    /* full-surface damage: the pump will synthesize ONE WM_PAINT — and the
+     * resized SUBTREE needs one too (children hold their own offscreen
+     * surfaces and see no X events; see u32_dirty_window_tree). */
     win->dirty.l = 0;
     win->dirty.t = 0;
     win->dirty.r = win->cw;
     win->dirty.b = win->ch;
+    if (do_size)
+        u32_dirty_window_tree(hwnd);
     if (win->parent && win->visible)
         compose_child(win);
 }
@@ -631,14 +648,239 @@ static WN_API int32_t u32_SetWindowPos(wn_abiword hwnd, wn_abiword after,
                            !(flags & 0x0002 /* SWP_NOMOVE */) ? 1 : 0, 1);
     } else if (!(flags & 0x0002 /* SWP_NOMOVE */)) {
         user32_move_resize(hwnd, x, y, win->cw, win->ch, 1, 0);
-    } else {
-        return 1;
     }
+    /* NO early return: VCL shows child controls with SWP flags 0x57
+     * (NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED|SHOWWINDOW). An early
+     * `return 1` on the no-size/no-move path swallowed SWP_SHOWWINDOW, so
+     * the wizard's entire control tree stayed invisible=0 → never dirty →
+     * never painted (white wizard with nothing but the form's bevels). */
     if (flags & 0x0040 /* SWP_SHOWWINDOW */)
         u32_ShowWindow(hwnd, 5);
     else if (flags & 0x0080 /* SWP_HIDEWINDOW */)
         u32_ShowWindow(hwnd, 0);
     return 1;
+}
+
+/* --- ScrollWindow / ScrollWindowEx ------------------------------------------
+ * VCL scrolls client areas with ScrollWindowEx (TWinControl.ScrollBy and
+ * the checklist paths); the returning-0 stub left the wizard with
+ * GetLastError=ERROR_CALL_NOT_IMPLEMENTED and a stale checklist. Real
+ * semantics on the surface model: shift the window's own bwin pixels by
+ * (-dx,-dy) inside the scroll rect (clipped by prcClip), invalidate the
+ * exposed strips so the guest repaints them through the normal WM_PAINT
+ * pipeline, and report the exposed region's complexity like Windows:
+ *   NULLREGION(1) / SIMPLEREGION(2) / COMPLEXREGION(3), 0 = error.
+ * SW_SCROLLCHILDREN moves intersecting children (parent coords); children
+ * keep their own surfaces, so the scroll itself only touches pixels.
+ * SW_SMOOTHSCROLL is honored as an immediate scroll (no animation). */
+#define WN_SW_SCROLLCHILDREN 0x0001u
+#define WN_SW_INVALIDATE      0x0002u
+#define WN_SW_ERASE           0x0004u   /* repaint path erases anyway */
+#define WN_SW_SMOOTHSCROLL    0x0010u
+
+static void u32_dirty_union(wn_window *w, int l, int t, int r, int b)
+{
+    if (r <= l || b <= t)
+        return;
+    if (w->dirty.l < 0) {
+        w->dirty.l = l;
+        w->dirty.t = t;
+        w->dirty.r = r;
+        w->dirty.b = b;
+    } else {
+        if (l < w->dirty.l) w->dirty.l = l;
+        if (t < w->dirty.t) w->dirty.t = t;
+        if (r > w->dirty.r) w->dirty.r = r;
+        if (b > w->dirty.b) w->dirty.b = b;
+    }
+}
+
+/* Mark a window and every descendant as fully dirty (one full WM_PAINT
+ * each). Windows invalidates the whole newly-visible subtree on show and
+ * the whole resized subtree on SetWindowPos; our child windows have NO X
+ * window events (offscreen surfaces composed by their parents), so without
+ * this they NEVER became dirty and NEVER painted — the wizard showed only
+ * the form's own bevel lines while every child control stayed invisible
+ * (white). */
+static void u32_dirty_window_tree(uint64_t hwnd)
+{
+    for (int i = 0; i < g_hwnd_count; i++) {
+        wn_window *w = g_hwnds[i].win;
+        if (!w || w->in_destroy)
+            continue;
+        uint64_t cur = (uint64_t)(uintptr_t)g_hwnds[i].h;
+        int depth = 0;
+        int in_tree = 0;
+        while (cur && depth++ < 64) {
+            if (cur == hwnd) {
+                in_tree = 1;
+                break;
+            }
+            wn_window *cw = win_from_hwnd(cur);
+            if (!cw)
+                break;
+            cur = cw->parent;
+        }
+        if (!in_tree)
+            continue;
+        if (w->cw > 0 && w->ch > 0) {
+            w->dirty.l = 0;
+            w->dirty.t = 0;
+            w->dirty.r = w->cw;
+            w->dirty.b = w->ch;
+        }
+    }
+}
+
+static uint32_t scroll_window_ex(uint64_t hwnd, int dx, int dy,
+                                 const int32_t *prc_scroll,
+                                 const int32_t *prc_clip, void *prc_update,
+                                 uint32_t flags)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !w->bwin || !w->bwin->pixels) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;   /* ERROR */
+    }
+    int W = w->bwin->width, H = w->bwin->height;
+    /* Guest RECT is 4 x LONG (4 bytes) — identical on every arch. */
+    int l = 0, t = 0, r = W, b = H;
+    if (prc_scroll) {
+        l = prc_scroll[0]; t = prc_scroll[1];
+        r = prc_scroll[2]; b = prc_scroll[3];
+    }
+    if (prc_clip) {
+        if (prc_clip[0] > l) l = prc_clip[0];
+        if (prc_clip[1] > t) t = prc_clip[1];
+        if (prc_clip[2] < r) r = prc_clip[2];
+        if (prc_clip[3] < b) b = prc_clip[3];
+    }
+    if (l < 0) l = 0;
+    if (t < 0) t = 0;
+    if (r > W) r = W;
+    if (b > H) b = H;
+    if (r <= l || b <= t) {
+        wn_last_error_set(WN_ERR_SUCCESS);
+        return 1;   /* NULLREGION: nothing to scroll */
+    }
+    if (dx == 0 && dy == 0) {
+        wn_last_error_set(WN_ERR_SUCCESS);
+        return 2;   /* SIMPLEREGION, nothing exposed */
+    }
+
+    /* Shift the surface: new(x,y) = old(x+dx, y+dy), both inside [l,t,r,b).
+     * Iterate destination rows in the safe order (memmove for horizontal
+     * overlap; vertical overlap handled by direction). */
+    {
+        int stride = w->bwin->stride;
+        uint8_t *px = w->bwin->pixels;
+        int y = t, yend = b, ystep = 1;
+        if (dy < 0) { y = b - 1; yend = t - 1; ystep = -1; }
+        for (; y != yend; y += ystep) {
+            int sy = y + dy;
+            if (sy < t || sy >= b)
+                continue;               /* row revealed by the scroll */
+            int dst_l = l, dst_r = r;
+            if (dx > 0) {
+                dst_l = l + dx;          /* left edge revealed */
+                if (dst_l > r) dst_l = r;
+            } else {
+                dst_r = r + dx;          /* right edge revealed */
+                if (dst_r < l) dst_r = l;
+            }
+            if (dst_r <= dst_l)
+                continue;
+            memmove(px + (size_t)y * stride + (size_t)dst_l * 4,
+                    px + (size_t)sy * stride + (size_t)(dst_l + dx) * 4,
+                    (size_t)(dst_r - dst_l) * 4);
+        }
+    }
+
+    /* Exposed strips (client coordinates) → dirty; prcUpdate gets the
+     * bounding box of the uncovered area. Two independent strips, unioned:
+     *   dy > 0 -> bottom strip [l, b-dy, r, b]   dy < 0 -> top strip
+     *   dx > 0 -> right strip  [r-dx, t, r, b]   dx < 0 -> left strip     */
+    int ex_l = 0x7FFFFFFF, ex_t = 0x7FFFFFFF, ex_r = -1, ex_b = -1;
+    int both_axes = (dx != 0 && dy != 0);
+    int s_l = 0, s_t = 0, s_r = 0, s_b = 0;
+    if (dy != 0) {
+        s_l = l; s_r = r;
+        if (dy > 0) { s_t = b - dy; s_b = b; }
+        else        { s_t = t;      s_b = t - dy; }
+        u32_dirty_union(w, s_l, s_t, s_r, s_b);
+        if (s_l < ex_l) ex_l = s_l;
+        if (s_t < ex_t) ex_t = s_t;
+        if (s_r > ex_r) ex_r = s_r;
+        if (s_b > ex_b) ex_b = s_b;
+    }
+    if (dx != 0) {
+        s_t = t; s_b = b;
+        if (dx > 0) { s_l = r - dx; s_r = r; }
+        else        { s_l = l;      s_r = l - dx; }
+        u32_dirty_union(w, s_l, s_t, s_r, s_b);
+        if (s_l < ex_l) ex_l = s_l;
+        if (s_t < ex_t) ex_t = s_t;
+        if (s_r > ex_r) ex_r = s_r;
+        if (s_b > ex_b) ex_b = s_b;
+    }
+    if (flags & WN_SW_INVALIDATE)
+        u32_dirty_union(w, l, t, r, b);   /* whole scroll region */
+    if (prc_update) {
+        int32_t *u = prc_update;
+        if (ex_r > ex_l && ex_b > ex_t) {
+            u[0] = ex_l; u[1] = ex_t; u[2] = ex_r; u[3] = ex_b;
+        } else {
+            u[0] = 0; u[1] = 0; u[2] = 0; u[3] = 0;
+        }
+    }
+
+    /* SW_SCROLLCHILDREN: Windows moves every child intersecting the scroll
+     * rect by (-dx,-dy) (coordinates only — no resize, no z-change). */
+    if (flags & WN_SW_SCROLLCHILDREN) {
+        for (int i = 0; i < g_hwnd_count; i++) {
+            wn_window *c = g_hwnds[i].win;
+            if (!c || c->parent != hwnd)
+                continue;
+            if (c->wx < r && c->wy < b && c->wx + c->cw > l &&
+                c->wy + c->ch > t) {
+                c->wx -= dx;
+                c->wy -= dy;
+            }
+        }
+    }
+
+    /* Push the shifted pixels to the parent/root chain immediately; the
+     * dirty region schedules the guest repaint of the exposed strips. */
+    if (w->parent && w->visible)
+        compose_child(w);
+    else if (!w->parent && w->visible)
+        present_root(w);
+
+    wn_last_error_set(WN_ERR_SUCCESS);
+    return both_axes ? 3u /* COMPLEXREGION */ : 2u /* SIMPLEREGION */;
+}
+
+static WN_API uint32_t u32_ScrollWindowEx(wn_abiword hwnd, int32_t dx,
+                                         int32_t dy, const void *prc_scroll,
+                                         const void *prc_clip,
+                                         wn_abiword hrgn_update,
+                                         void *prc_update, uint32_t flags)
+{
+    /* HRGN updates are not modeled: the invalidation rect (prcUpdate)
+     * carries the same damage information for our painting model. */
+    (void)hrgn_update;
+    return scroll_window_ex((uint64_t)hwnd, dx, dy,
+                            (const int32_t *)prc_scroll,
+                            (const int32_t *)prc_clip, prc_update, flags);
+}
+
+static WN_API int32_t u32_ScrollWindow(wn_abiword hwnd, int32_t dx,
+                                      int32_t dy, const void *prc_scroll,
+                                      const void *prc_clip)
+{
+    return scroll_window_ex((uint64_t)hwnd, dx, dy,
+                            (const int32_t *)prc_scroll,
+                            (const int32_t *)prc_clip, NULL, 0) != 0;
 }
 
 /* --- focus, activation, desktop --------------------------------------------- */
@@ -1593,8 +1835,18 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
     win->owner = parent;              /* owner != parent: stays top-level */
     win->wx = x;
     win->wy = y;
-    if (w <= 0) w = 640;
-    if (h <= 0) h = 480;
+    /* Windows size contract: w/h of 0 means a ZERO-sized window (Delphi's
+     * hidden TApplication owner is exactly that — a WS_POPUP 0x0 tool
+     * window; inflating it to 640x480 made it a visible framed toplevel:
+     * the "two windows" field report). Creation with x = CW_USEDEFAULT
+     * keeps the historical default sizing for apps relying on it. */
+    if (x == (int32_t)0x80000000u /* CW_USEDEFAULT */) {
+        if (w <= 0) w = 640;
+        if (h <= 0) h = 480;
+    } else {
+        if (w <= 0) w = 1;
+        if (h <= 0) h = 1;
+    }
     win->cw = w;                     /* canonical size (cw/ch, not just bwin) */
     win->ch = h;
     win->bwin = be->win_create(w, h, win->title, win);
@@ -2315,6 +2567,24 @@ static void present_root(wn_window *w)
         be->present(w->bwin);
 }
 
+/* Post-paint compose for GUEST-class child windows (VCL panels, the Inno
+ * checklist...). ctl_proc composes builtin controls itself, but a child
+ * window painted by the GUEST's WM_PAINT path ends at g32_EndPaint, which
+ * can only present the child's own offscreen bwin (no X window). Without
+ * walking the parent chain, everything the guest painted on a child was
+ * invisible. */
+void wn_user32_compose_if_child(uint64_t hwnd)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    while (w && w->parent && !w->in_destroy) {
+        wn_window *p = win_from_hwnd(w->parent);
+        if (!p)
+            break;
+        compose_child(w);       /* blit w onto its parent (+ root present) */
+        w = p;
+    }
+}
+
 static void compose_children_of(uint64_t parent)
 {
     for (int i = 0; i < g_hwnd_count; i++) {
@@ -2355,6 +2625,8 @@ static ctl_kind ctl_kind_of(const char *cls)
 #define WN_WM_GETTEXTLENGTH 0x000E
 
 extern WN_API int32_t g32_DrawTextA(wn_handle hdc, const char *s,
+                                    int32_t count, void *rect, uint32_t fmt);
+extern WN_API int32_t g32_DrawTextW(wn_handle hdc, const uint16_t *s,
                                     int32_t count, void *rect, uint32_t fmt);
 extern WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
                                    const char *s, int32_t count);
@@ -2905,13 +3177,40 @@ static void ctl_items_clear(wn_window *w)
 /* UTF-16 text -> control storage (SETTEXT/GETTEXT core) */
 static void ctl_set_text(wn_window *w, const char *utf8)
 {
-    snprintf(w->title, sizeof w->title, "%s", utf8 ? utf8 : "");
+    const char *s = utf8 ? utf8 : "";
+    snprintf(w->title, sizeof w->title, "%s", s);
+    /* FULL text into wtext — title is a 127-char display mirror, but
+     * multi-line viewers (Inno's license memo via WM_SETTEXT) hold far
+     * more; truncating through title cut the license to its first line. */
+    uint16_t *t = wn_utf8_to_utf16_n(s, strlen(s));
+    if (t) {
+        size_t i = 0;
+        while (t[i] && i < 511) {
+            w->wtext[i] = t[i];
+            i++;
+        }
+        w->wtext[i] = 0;
+        free(t);
+        w->caret = (int)(i < 511 ? i : 511);
+        return;
+    }
     user32_set_wtext_utf8(w, w->title);
     w->caret = (int)(strlen(w->title) < 511 ? strlen(w->title) : 511);
 }
 
 static int64_t ctl_get_text(wn_window *w, char *out, size_t cap)
 {
+    /* canonical UTF-16 text first: it carries the FULL multi-line payload
+     * (title is a 127-char mirror — WM_GETTEXT on the license memo must
+     * round-trip the whole text, not its truncated head). */
+    if (w->wtext[0]) {
+        char *a = wn_utf16_to_utf8(w->wtext, 511);
+        if (a) {
+            snprintf(out, cap, "%s", a);
+            free(a);
+            return (int64_t)strlen(out);
+        }
+    }
     snprintf(out, cap, "%s", w->title);
     return (int64_t)strlen(out);
 }
@@ -3102,14 +3401,22 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
             break;
         }
         case CTL_EDIT: {
-            int32_t tr[4] = { 3, 0, W - 3, H };
-            g32_DrawTextA(hdc, w->title, -1, tr, 0x20 | 0x100 | 0x24);
-            if (focused) {   /* caret after text */
-                int cx = 3 + w->caret * 8;
-                int32_t cr[4] = { cx, (H - rh) / 2, cx + 1, (H - rh) / 2 + rh };
-                wn_handle cb = g32_CreateSolidBrush(0);
-                g32_FillRect(hdc, cr, cb);
-                wn_handle_close(cb);
+            if (w->style & 0x4 /*ES_MULTILINE: the license/memo viewers —
+                                 Inno's TNewMemo is an EDIT superclass and
+                                 its whole multi-line text lives in wtext */) {
+                int32_t mr[4] = { 4, 2, W - 4, H - 2 };
+                g32_DrawTextW(hdc, w->wtext, -1, mr,
+                              0x10 /*DT_WORDBREAK*/ | 0x100 /*DT_NOPREFIX*/);
+            } else {
+                int32_t tr[4] = { 3, 0, W - 3, H };
+                g32_DrawTextA(hdc, w->title, -1, tr, 0x20 | 0x100 | 0x24);
+                if (focused) {   /* caret after text */
+                    int cx = 3 + w->caret * 8;
+                    int32_t cr[4] = { cx, (H - rh) / 2, cx + 1, (H - rh) / 2 + rh };
+                    wn_handle cb = g32_CreateSolidBrush(0);
+                    g32_FillRect(hdc, cr, cb);
+                    wn_handle_close(cb);
+                }
             }
             break;
         }
@@ -3316,7 +3623,15 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
     }
     case EM_SETSEL: w->caret = (int)(int32_t)(wp & 0xFFFFFFFF); return 0;
     case EM_SETLIMITTEXT: return 0;
-    case EM_GETLINECOUNT: return 1;
+    case EM_GETLINECOUNT: {
+        /* honest line count for multi-line viewers (VCL/Inno's license
+         * memo layout queries it; "1" broke page setup) */
+        int64_t n = 1;
+        for (size_t i = 0; w->wtext[i] && i < 512; i++)
+            if (w->wtext[i] == '\n')
+                n++;
+        return n;
+    }
     case EM_REPLACESEL: {
         ctl_set_text(w, (const char *)(uintptr_t)lp);
         ctl_repaint(w);
@@ -4184,6 +4499,15 @@ static WN_API int32_t u32_SetWindowTextA(wn_abiword hwnd, const char *text)
     if (!w)
         return 0;
     snprintf(w->title, sizeof w->title, "%s", text ? text : "");
+    user32_set_wtext_utf8(w, text ? text : "");   /* canonical text too */
+    /* Top-level titles live in the WM frame: push them to the backend
+     * (VCL sets captions AFTER CreateWindow — without this the wizard's
+     * real title never reached the window manager). */
+    if (!w->parent) {
+        const wn_backend *be = wn_backend_get();
+        if (be && be->win_set_title && w->bwin)
+            be->win_set_title(w->bwin, w->title);
+    }
     if (w->is_child) {
         compose_child(w);
     }
@@ -6104,6 +6428,8 @@ const wn_export_entry wn_user32_exports[] = {
     { "SetTimer", u32_SetTimer },
     { "SetWindowTextA", u32_SetWindowTextA },
     { "SetWindowPos", u32_SetWindowPos },
+    { "ScrollWindow", u32_ScrollWindow },
+    { "ScrollWindowEx", u32_ScrollWindowEx },
     { "ShowWindow", u32_ShowWindow },
     { "MoveWindow", u32_MoveWindow },
     { "SetCapture", u32_SetCapture },
