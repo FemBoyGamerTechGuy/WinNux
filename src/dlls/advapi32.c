@@ -330,7 +330,13 @@ static WN_API int32_t adv_GetUserNameW(uint16_t *buf, uint32_t *cap)
 
 /* --- SIDs ----------------------------------------------------------------------
  * AllocateAndInitializeSid builds a real S-1-5-20-style SID blob (revision,
- * authority, sub-authorities). FreeSid releases ONLY SIDs we allocated
+ * authority, sub-authorities) and hands it back through the 11th stack
+ * argument (PSID *pSid) — the Windows contract is 11 stdcall words and a
+ * BOOL return, NOT a PSID return. Field post-mortem (LuaForWindows 5.1.5,
+ * post-realign log): the 10-word version never wrote pSid, so the Delphi
+ * RTL's admin check freed a stale 0x1 stack slot twice (FreeSid(0x1)
+ * WARNs) and every caller's stack stayed 4 bytes skewed after the call
+ * (11 pushed vs 10 popped). FreeSid releases ONLY SIDs we allocated
  * (live registry below): a confused guest — fed garbage by unimplemented
  * token stubs — once called FreeSid on stack/static pointers, and free()ing
  * those aborted the process mid-install. Layout is byte-packed — identical
@@ -338,19 +344,22 @@ static WN_API int32_t adv_GetUserNameW(uint16_t *buf, uint32_t *cap)
 
 static void *g_live_sids[256];
 
-static WN_API wn_abiword adv_AllocateAndInitializeSid(const void *authority,
-                                                      wn_abiword count_,
-                                                      wn_abiword sub0,
-                                                      wn_abiword sub1,
-                                                      wn_abiword sub2,
-                                                      wn_abiword sub3,
-                                                      wn_abiword sub4,
-                                                      wn_abiword sub5,
-                                                      wn_abiword sub6,
-                                                      wn_abiword sub7)
+static WN_API int32_t adv_AllocateAndInitializeSid(const void *authority,
+                                                   wn_abiword count_,
+                                                   wn_abiword sub0,
+                                                   wn_abiword sub1,
+                                                   wn_abiword sub2,
+                                                   wn_abiword sub3,
+                                                   wn_abiword sub4,
+                                                   wn_abiword sub5,
+                                                   wn_abiword sub6,
+                                                   wn_abiword sub7,
+                                                   wn_abiword sid_out)
 {
-    if (!authority || (uintptr_t)authority < 0x10000)
+    if (!authority || (uintptr_t)authority < 0x10000) {
+        wn_last_error_set(87 /*ERROR_INVALID_PARAMETER*/);
         return 0;
+    }
     int count = (int)(uint32_t)count_;
     if (count < 0 || count > 8) {
         wn_last_error_set(87 /*ERROR_INVALID_PARAMETER*/);
@@ -364,14 +373,26 @@ static WN_API wn_abiword adv_AllocateAndInitializeSid(const void *authority,
     sid[1] = (uint8_t)count;
     memcpy(sid + 2, authority, 6);   /* IdentifierAuthority (6 bytes) */
     for (int i = 0; i < count; i++)
-        memcpy(sid + 8 + 4 * i, &subs[i], 4);
+        memcpy(sid + 8 + 4 * i, &subs[i], 4);   /* subauthorities LE */
+    int registered = 0;
     for (size_t i = 0; i < sizeof g_live_sids / sizeof g_live_sids[0]; i++) {
         if (!g_live_sids[i]) {
             g_live_sids[i] = sid;
+            registered = 1;
             break;
         }
     }
-    return (wn_abiword)(uintptr_t)sid;
+    if (!registered) {
+        /* Registry full: hand the pointer out anyway (leak it) — the guest
+         * must still see a valid SID; FreeSid will simply WARN on it later. */
+        wn_log(WN_LOG_WARN, "advapi32: live-SID registry full (%d) — "
+               "SID leaked", (int)(sizeof g_live_sids /
+                                   sizeof g_live_sids[0]));
+    }
+    if (sid_out)
+        wn_wow64_out_handle((void *)(uintptr_t)sid_out,
+                            (uint64_t)(uintptr_t)sid);
+    return WN_TRUE;                  /* BOOL success */
 }
 
 /* FreeSid returns NULL on success (PSID-returning API, MSDN). Only SIDs
@@ -405,22 +426,25 @@ static WN_API void *adv_FreeSid(wn_abiword sid)
  * checks degrade to a plain non-elevated install. */
 static WN_API int32_t adv_OpenThreadToken(wn_abiword thread,
                                           uint32_t access, int32_t open_as_self,
-                                          wn_abiword *token)
+                                          wn_abiword token_slot)
 {
     (void)thread; (void)access; (void)open_as_self;
-    if (token)
-        *token = 0;
+    /* out-slot written at the CALLER's pointer width (a 32-bit caller's
+     * HANDLE slot is 4 bytes; a host-width store would smash the guest
+     * dword sitting next to it). */
+    if (token_slot)
+        wn_wow64_out_handle((void *)(uintptr_t)token_slot, 0);
     wn_last_error_set(1008 /* ERROR_NO_TOKEN: not impersonating */);
     return 0;
 }
 
 static WN_API int32_t adv_OpenProcessToken(wn_abiword process,
                                            uint32_t access,
-                                           wn_abiword *token)
+                                           wn_abiword token_slot)
 {
     (void)process; (void)access;
-    if (token)
-        *token = 0;
+    if (token_slot)
+        wn_wow64_out_handle((void *)(uintptr_t)token_slot, 0);
     wn_last_error_set(5 /* ERROR_ACCESS_DENIED: no token subsystem */);
     return 0;
 }

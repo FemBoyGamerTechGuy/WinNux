@@ -1,0 +1,13 @@
+0
+T18 EnumFontsA: 10 faces (ret=1)
+T18 first face: MS Sans Serif
+T18 stop protocol: ret=0 after 1 continue
+T18 filter face: Courier New
+T18 alias face: Wingdings served
+T18 EnumFontsW: 10 faces, first MS Sans Serif
+T18 EnumFontFamiliesA/W: 10 faces
+T18 AllocAndInitSid: TRUE + pSid written
+T18 SID bytes: rev=1 count=2
+T18 second SID distinct
+T18 FreeSid x2: ok (no WARN refusals)
+T18 OK

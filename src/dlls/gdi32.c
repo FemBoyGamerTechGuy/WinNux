@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 extern uint64_t wn_user32_paint_count(void);
 extern void wn_user32_validate_paint(uint64_t hwnd);
@@ -1317,6 +1318,246 @@ static WN_API int32_t g32_GetTextMetricsW(wn_handle hdc, void *tm)
     return g32_GetTextMetricsA(hdc, tm);   /* same layout for the fields we set */
 }
 
+/* --- font enumeration -----------------------------------------------------------
+ * Windows guests walk the font world before drawing UI: Inno Setup probes
+ * EnumFontsA during wizard construction and VCL TScreen.Fonts walks
+ * EnumFontFamilies. The old stub answered "not implemented" (return 0 +
+ * ERROR 120 garbage), i.e. "this machine has NO fonts" — empty font lists
+ * flowed into RTL font pickers. We enumerate the faces our text path can
+ * actually serve: every name below is accepted by CreateFont* and renders
+ * (FreeType buckets on x64; the 8x16 bitmap atlas everywhere). The metrics
+ * come from the same source GetTextMetricsA reports, so a face's LOGFONT
+ * and TEXTMETRIC never disagree with what the DC path draws.
+ *
+ * Callbacks are guest code: 32-bit guests are invoked through the 4-dword
+ * bridge (the LOGFONT/TEXTMETRIC live in guest-addressable memory — low
+ * arena under wow64), native-width guests are called directly. One entry
+ * per face, FontType = TRUETYPE_FONTTYPE (we scale, so raster-style
+ * per-size enumeration would be a lie). Return value is the last
+ * callback result — stop on zero, exactly the Windows protocol. */
+typedef struct {
+    const char *name;
+    uint8_t     pitch_family;
+    int32_t     weight;
+} font_face_ent;
+
+static const font_face_ent g_font_faces[] = {
+    { "MS Sans Serif",    0x24 /* VARIABLE|FF_SWISS */, 400 },
+    { "MS Shell Dlg",     0x24,                          400 },
+    { "Tahoma",           0x24,                          400 },
+    { "Arial",            0x24,                          400 },
+    { "MS Serif",         0x22 /* VARIABLE|FF_ROMAN  */, 400 },
+    { "Times New Roman",  0x22,                          400 },
+    { "Courier New",      0x31 /* FIXED|FF_MODERN    */, 400 },
+    { "Fixedsys",         0x31,                          400 },
+    { "System",           0x24,                          700 },
+    { "Small Fonts",      0x24,                          400 },
+};
+#define WN_FONT_FACE_COUNT \
+    (sizeof g_font_faces / sizeof g_font_faces[0])
+
+typedef WN_API int32_t (*wn_font_enum_cb)(const void *lf, const void *tm,
+                                          uint32_t type, wn_abiword lparam);
+
+/* LOGFONT + TEXTMETRIC pair for one face, in the caller's width.
+ * Layouts (wingdi.h, 4-byte packed — same field order both arches):
+ *   LOGFONTA 60 / LOGFONTW 92: lfHeight@0 lfWeight@16 lfItalic@20
+ *     lfCharSet@23 lfPitchAndFamily@27 lfFaceName@28 ([32] CHAR/WCHAR).
+ *   TEXTMETRICA 56: tmHeight@0 tmAscent@4 tmDescent@8 tmInternalLeading@12
+ *     tmExternalLeading@16 tmAveCharWidth@20 tmMaxCharWidth@24 tmWeight@28
+ *     tmOverhang@32 tmDigitizedAspectX@36 tmDigitizedAspectY@40
+ *     tmFirstChar@44 tmLastChar@45 tmDefaultChar@46 tmBreakChar@47
+ *     tmItalic@48 tmUnderlined@49 tmStruckOut@50 tmPitchAndFamily@51
+ *     tmCharSet@52.
+ *   TEXTMETRICW 60: same LONG head; FirstChar/LastChar/Default/Break are
+ *     WCHAR@44/46/48/50, Italic@52 Underlined@53 StruckOut@54
+ *     PitchAndFamily@55 CharSet@56. */
+static void fill_font_enum_blk(uint8_t *blk, const font_face_ent *f, int wide)
+{
+    size_t lf_sz = wide ? 92 : 60;
+    memset(blk, 0, lf_sz + (wide ? 60 : 56));
+
+    int asc = 13, desc = 3, hgt = 16, ave = 8;   /* bitmap atlas cell 8x16 */
+    if (wn_ft_available()) {
+        int slot = wn_ft_select(f->name, 16, f->weight >= 700, 0);
+        if (slot >= 0)
+            wn_ft_metrics(slot, &asc, &desc, &hgt, &ave);
+        else { asc = 13; desc = 3; hgt = 16; ave = 8; }
+    }
+
+    int32_t *lf = (int32_t *)(void *)blk;
+    lf[0] = hgt;                    /* lfHeight (cell height, positive) */
+    lf[4] = 0;                      /* lfWidth */
+    lf[8] = 0;                      /* lfEscapement */
+    lf[12] = 0;                     /* lfOrientation */
+    lf[16] = f->weight;             /* lfWeight */
+    blk[20] = 0;                    /* lfItalic */
+    blk[21] = 0;                    /* lfUnderline */
+    blk[22] = 0;                    /* lfStrikeOut */
+    blk[23] = 0;                    /* lfCharSet: ANSI */
+    blk[24] = 0;                    /* lfOutPrecision */
+    blk[25] = 0;                    /* lfClipPrecision */
+    blk[26] = 0;                    /* lfQuality */
+    blk[27] = f->pitch_family;      /* lfPitchAndFamily */
+    if (wide) {
+        uint16_t *w = (uint16_t *)(void *)(blk + 28);
+        for (size_t i = 0; i + 1 < 32 && f->name[i]; i++)
+            w[i] = (uint16_t)(uint8_t)f->name[i];
+    } else {
+        strncpy((char *)(void *)(blk + 28), f->name, 31);
+    }
+
+    uint8_t *tm = blk + lf_sz;
+    int32_t *v = (int32_t *)(void *)tm;
+    v[0] = hgt;                     /* tmHeight */
+    v[1] = asc;                     /* tmAscent */
+    v[2] = desc;                    /* tmDescent */
+    v[3] = hgt - asc - desc > 0 ? hgt - asc - desc : 2;   /* internal lead */
+    v[4] = 0;                       /* tmExternalLeading */
+    v[5] = ave;                     /* tmAveCharWidth */
+    v[6] = ave;                     /* tmMaxCharWidth */
+    v[7] = f->weight;               /* tmWeight */
+    v[8] = 0;                       /* tmOverhang */
+    v[9] = 96;                      /* tmDigitizedAspectX */
+    v[10] = 96;                     /* tmDigitizedAspectY */
+    if (wide) {
+        uint16_t *w = (uint16_t *)(void *)(tm + 44);
+        w[0] = 0x20;                /* tmFirstChar */
+        w[1] = 0xFF;                /* tmLastChar */
+        w[2] = 0x3F;                /* tmDefaultChar */
+        w[3] = 0x20;                /* tmBreakChar */
+        tm[52] = 0;                 /* tmItalic */
+        tm[53] = 0;                 /* tmUnderlined */
+        tm[54] = 0;                 /* tmStruckOut */
+        tm[55] = f->pitch_family;
+        tm[56] = 0;                 /* tmCharSet */
+    } else {
+        tm[44] = 0x20;              /* tmFirstChar */
+        tm[45] = 0xFF;              /* tmLastChar */
+        tm[46] = 0x3F;              /* tmDefaultChar */
+        tm[47] = 0x20;              /* tmBreakChar */
+        tm[48] = 0;                 /* tmItalic */
+        tm[49] = 0;                 /* tmUnderlined */
+        tm[50] = 0;                 /* tmStruckOut */
+        tm[51] = f->pitch_family;
+        tm[52] = 0;                 /* tmCharSet */
+    }
+}
+
+static int32_t enum_fonts_core(wn_handle hdc, const char *face_a,
+                               const uint16_t *face_w, wn_abiword proc,
+                               wn_abiword lparam, int wide)
+{
+    (void)hdc;   /* the face world is machine-wide, not per-DC */
+    if (!proc)
+        return 0;
+    int g32 = wn_wow64_guest32();
+    size_t lf_sz = wide ? 92 : 60;
+    size_t tm_sz = wide ? 60 : 56;
+
+    /* Face filter: NULL/"" walks every face, a name picks one. The name
+     * rides guest memory — read it bounded + safe-probed. */
+    char want[64] = "";
+    if (face_a) {
+        size_t n = wn_safe_strnlen(face_a, 32);
+        if (n < sizeof want) {
+            memcpy(want, face_a, n);
+            want[n] = 0;
+        }
+    } else if (face_w && wn_ptr_readable(face_w, 2)) {
+        char *u = wn_utf16_to_utf8(face_w, 32);
+        if (u) {
+            snprintf(want, sizeof want, "%s", u);
+            free(u);
+        }
+    }
+    for (char *p = want; *p; p++)   /* face matching is case-insensitive */
+        *p = (char)((*p >= 'A' && *p <= 'Z') ? *p + 32 : *p);
+
+    uint8_t *blk;
+#if defined(__x86_64__)
+    blk = g32 ? wn_low_malloc(lf_sz + tm_sz) : wn_xmalloc(lf_sz + tm_sz);
+#else
+    blk = wn_xmalloc(lf_sz + tm_sz);
+#endif
+
+    int32_t last = 1;
+    int reported = 0;
+    for (size_t i = 0; i < WN_FONT_FACE_COUNT; i++) {
+        if (want[0] && strcasecmp(g_font_faces[i].name, want) != 0)
+            continue;
+        fill_font_enum_blk(blk, &g_font_faces[i], wide);
+        int32_t r;
+        if (g32)
+            r = (int32_t)wn_wow64_call_wndproc32(
+                (uint32_t)proc, (uint32_t)(uintptr_t)blk,
+                (uint32_t)(uintptr_t)(blk + lf_sz), 4 /*TRUETYPE_FONTTYPE*/,
+                (uint32_t)lparam);
+        else
+            r = ((wn_font_enum_cb)(uintptr_t)proc)(
+                blk, blk + lf_sz, 4 /*TRUETYPE_FONTTYPE*/, lparam);
+        reported = 1;
+        last = r;
+        if (!r)
+            break;   /* callback asked to stop the enumeration */
+    }
+    if (!reported && want[0]) {
+        /* Unknown-but-requested face: our renderer serves ANY name through
+         * the alias buckets, so reporting it is consistent — on Windows a
+         * full font dir would answer it too. Windows-contract callers that
+         * search for a specific face then find it and stop guessing. */
+        font_face_ent alias;
+        alias.name = want;
+        alias.pitch_family = 0x24;
+        alias.weight = 400;
+        fill_font_enum_blk(blk, &alias, wide);
+        int32_t r;
+        if (g32)
+            r = (int32_t)wn_wow64_call_wndproc32(
+                (uint32_t)proc, (uint32_t)(uintptr_t)blk,
+                (uint32_t)(uintptr_t)(blk + lf_sz), 4, (uint32_t)lparam);
+        else
+            r = ((wn_font_enum_cb)(uintptr_t)proc)(
+                blk, blk + lf_sz, 4, lparam);
+        last = r;
+    }
+#if defined(__x86_64__)
+    if (g32)
+        wn_low_free(blk);
+    else
+        free(blk);
+#else
+    free(blk);
+#endif
+    return last;
+}
+
+static WN_API int32_t g32_EnumFontsA(wn_handle hdc, wn_pcstr face,
+                                     wn_abiword proc, wn_abiword lparam)
+{
+    return enum_fonts_core(hdc, face, NULL, proc, lparam, 0);
+}
+
+static WN_API int32_t g32_EnumFontsW(wn_handle hdc, wn_pcwstr face,
+                                     wn_abiword proc, wn_abiword lparam)
+{
+    return enum_fonts_core(hdc, NULL, face, proc, lparam, 1);
+}
+
+static WN_API int32_t g32_EnumFontFamiliesA(wn_handle hdc, wn_pcstr face,
+                                            wn_abiword proc,
+                                            wn_abiword lparam)
+{
+    return enum_fonts_core(hdc, face, NULL, proc, lparam, 0);
+}
+
+static WN_API int32_t g32_EnumFontFamiliesW(wn_handle hdc, wn_pcwstr face,
+                                            wn_abiword proc,
+                                            wn_abiword lparam)
+{
+    return enum_fonts_core(hdc, NULL, face, proc, lparam, 1);
+}
+
 static WN_API int32_t g32_GetTextExtentPoint32A(wn_handle hdc,
                                                 const char *s, int32_t count,
                                                 void *size)
@@ -1723,6 +1964,10 @@ const wn_export_entry wn_gdi32_exports[] = {
     { "GetCurrentPositionEx", g32_GetCurrentPositionEx },
     { "GetTextMetricsA", g32_GetTextMetricsA },
     { "GetTextMetricsW", g32_GetTextMetricsW },
+    { "EnumFontsA", g32_EnumFontsA },
+    { "EnumFontsW", g32_EnumFontsW },
+    { "EnumFontFamiliesA", g32_EnumFontFamiliesA },
+    { "EnumFontFamiliesW", g32_EnumFontFamiliesW },
     { "CreatePen", g32_CreatePen },
     { "CreateSolidBrush", g32_CreateSolidBrush },
     { "DeleteDC", g32_DeleteDC },

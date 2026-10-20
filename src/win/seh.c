@@ -907,6 +907,84 @@ static const char *exc_name(uint32_t c)
     }
 }
 
+/* Best-effort decode of a Delphi raise for the crash report: the exception
+ * object carries [obj]=VMT (class-name shortstring embedded in the VMT's
+ * metadata block below the class ref, canonically at vmt-$0C) and
+ * [obj+4]=FMessage (longstring: length DWORD at ptr-4, chars at ptr).
+ * Delphi 2-era RTLs — the Inno Setup engine — pass info[1]=object with
+ * info[0]=raise site; newer RTLs swap them, so probe both candidates.
+ * Every read is safe-probed: a bogus pointer can only cost the decoration,
+ * never the report itself. This turns the next field log from
+ * "DELPHI_EXCEPTION at <helper RVA>, registers zero" into the actual
+ * class + message the installer raised (e.g. its list-integrity checks). */
+static void delphi_describe(const wn_exc_record *rec, char *out, size_t outsz)
+{
+    out[0] = '?';
+    out[1] = 0;
+    if (rec->number_parameters < 2)
+        return;
+    for (int cand = 1; cand >= 0; cand--) {
+        uint32_t obj = (uint32_t)rec->exception_information[cand];
+        if (obj <= 0x10000 || !wn_ptr_readable((void *)(uintptr_t)obj, 16))
+            continue;
+        uint32_t vmt = 0, msgp = 0;
+        memcpy(&vmt, (const void *)(uintptr_t)obj, 4);
+        memcpy(&msgp, (const void *)(uintptr_t)(obj + 4), 4);
+
+        /* Class name: longest plausible shortstring in the VMT metadata
+         * block [vmt-0x40, vmt-4). Length byte + printable chars; the
+         * canonical vmtClassName sits at -$0C in Delphi 2..7 layouts. */
+        char cls[48];
+        size_t best = 0;
+        cls[0] = 0;
+        if (vmt > 0x10000 && wn_ptr_readable((void *)(uintptr_t)(vmt - 0x40),
+                                             0x40)) {
+            for (int off = -0x40; off < -3; off++) {
+                const volatile uint8_t *q =
+                    (const volatile uint8_t *)(const void *)(uintptr_t)(vmt + (int64_t)off);
+                uint8_t len = *q;
+                if (len < 2 || len > 40)
+                    continue;
+                size_t k = 0;
+                for (; k < len; k++) {
+                    uint8_t ch = q[k + 1];
+                    if (ch < 0x20 || ch > 0x7E)
+                        break;
+                }
+                if (k == len && k > best) {
+                    best = k;
+                    memcpy(cls, (const void *)(const volatile void *)(q + 1), k);
+                    cls[k] = 0;
+                }
+            }
+        }
+
+        /* Message: longstring (length DWORD at msgp-4, chars at msgp). */
+        char msg[208];
+        msg[0] = 0;
+        if (msgp > 0x10000 &&
+            wn_ptr_readable((void *)(uintptr_t)(msgp - 4), 8)) {
+            uint32_t mlen = 0;
+            memcpy(&mlen, (const void *)(uintptr_t)(msgp - 4), 4);
+            if (mlen && mlen < 512 &&
+                wn_ptr_readable((void *)(uintptr_t)msgp, mlen)) {
+                size_t n = mlen < 200 ? mlen : 200;
+                memcpy(msg, (const void *)(uintptr_t)msgp, n);
+                msg[n] = 0;
+            }
+        }
+
+        if (cls[0] && msg[0])
+            snprintf(out, outsz, "%s: \"%s\"", cls, msg);
+        else if (msg[0])
+            snprintf(out, outsz, "\"%s\"", msg);
+        else if (cls[0])
+            snprintf(out, outsz, "%s (no message)", cls);
+        if (out[0] != '?')
+            return;   /* first candidate that decodes wins */
+    }
+}
+
 /* Print a Windows-style crash report, then exit with the exception code. */
 static __attribute__((noreturn)) void
 crash_report(wn_exc_record *rec, wn_context64 *ctx)
@@ -922,6 +1000,15 @@ crash_report(wn_exc_record *rec, wn_context64 *ctx)
     }
     wn_log(WN_LOG_ERR, "===== unhandled exception %s (0x%08X) at %s =====",
            exc_name(rec->exception_code), rec->exception_code, where);
+    if (rec->exception_code == 0x0EEDFACEu) {
+        /* The one line a field log actually needs: WHAT the installer
+         * raised. Without it every Delphi raise looked identical (all
+         * funnel through the RTL's single raise helper, so the raise
+         * site names nothing). */
+        char desc[288];
+        delphi_describe(rec, desc, sizeof desc);
+        wn_log(WN_LOG_ERR, "  delphi exception: %s", desc);
+    }
     if (rec->exception_code == 0xC0000005 && rec->number_parameters >= 2)
         wn_log(WN_LOG_ERR, "  access %s at address 0x%llx",
                rec->exception_information[0] ? "write" : "read",

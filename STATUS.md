@@ -1,4 +1,66 @@
 
+## Date: 2026-10-20 (session 16: field-log forensics — user IS on the fix; SID 11-word ABI + real EnumFonts + self-describing Delphi reports)
+
+### Forensics: the user's latest log is from a d8c6996 build
+The new field log prints `DELPHI_EXCEPTION (0x0EEDFACE) at
+luaforwindows_v5.1.5-52.tmp+0x4e09e` — that exc_name and the guest-module
+attribution exist ONLY in d8c6996 (git grep at a9f6643: zero hits). So the
+RichEdit/Rstrtmgr chain landed and the DLL loads now succeed (no
+ERROR_MOD_NOT_FOUND lines). What remains in that log, in order:
+`STUB EnumFontsA -> 0, GetLastError=120`, `FreeSid(0x1) refused` TWICE,
+then the Delphi raise, still unhandled.
+
+### AllocateAndInitializeSid was a 10-word lie about an 11-word contract
+Windows signature: `BOOL AllocateAndInitializeSid(authority, count,
+sub0..sub7, PSID *pSid)` — 11 stdcall words, BOOL return. Ours declared
+10 params and RETURNED the PSID (which nobody reads). Three separate
+breakages from one wrong signature: pSid never written (the RTL kept a
+stale 0x1 stack slot and freed it — the two FreeSid WARNs), the guest's
+44 pushed bytes met a 40-byte `ret` (4-byte stack skew per call), and the
+gen_sigs32-derived thunk words said 10 while the stub table said 11.
+Fixed: full 11-param C signature, BOOL return, out-slot written via
+wn_wow64_out_handle (caller-width store). obj32 proof:
+`ret 0x2c` (44) with the realign prologue intact; sig table regen to 11
+words. Same pass fixed OpenThreadToken/OpenProcessToken out-slots
+(previously `wn_abiword *token` host-width stores — an 8-byte write into
+a 32-bit caller's 4-byte HANDLE slot under wow64, smashing the adjacent
+guest dword).
+
+### EnumFonts/EnumFontFamilies: the font world exists now
+`STUB EnumFontsA -> 0, GetLastError=120` told every font-walking guest
+"this machine has NO fonts" (Inno probes EnumFontsA during wizard
+construction; VCL TScreen.Fonts walks EnumFontFamilies). gdi32 now serves
+EnumFontsA/W + EnumFontFamiliesA/W from the advertised face table (the
+names CreateFont* actually accepts: MS Sans Serif, Arial, Courier New,
+Tahoma, System...), one callback per face with LOGFONT/TEXTMETRIC laid
+out per mingw's wingdi.h (TEXTMETRICA 56: tmItalic@0x30,
+tmPitchAndFamily@0x33, tmCharSet@0x34), metrics sourced from the same path
+GetTextMetricsA reports (FreeType on x64, 8x16 atlas otherwise). Guest
+callbacks ride the 4-dword bridge for 32-bit guests (low-arena structs)
+and direct calls for native-width guests; stop-on-zero and last-callback-
+return semantics per Windows. Unknown-but-requested facenames still get
+one entry (our renderer aliases any name — reporting it is consistent).
+
+### Unhandled Delphi raises are now self-describing
+All Delphi raises funnel through one RTL helper, so "raise site" names
+nothing. The crash report now decodes the Exception object:
+[obj]=VMT (class-name shortstring scanned from the VMT metadata block,
+canonical vmtClassName at -$0C), [obj+4]=FMessage (longstring: length
+DWORD at ptr-4), probing info[1] then info[0] (Delphi 2-era RTLs — the
+Inno engine — pass the object in info[1]). Everything safe-probed.
+Verified end-to-end with a synthetic raise (tests/fuzz/s15_delphi_raise.c,
+VirtualAlloc'd below 4GB to model a 32-bit guest's memory):
+`delphi exception: ETestError: "list item and state item count mismatch"`.
+The NEXT field log will print what the installer actually raises — no
+more guessing which check fired.
+
+### Gates
+New regression test t18_font_enum_sid (exact face counts, stop protocol,
+facename filter, alias, W variants, lparam roundtrip, 11-word SID
+contract incl. pSid sentinel + revision bytes + distinct SIDs + FreeSid
+NULL returns): **18/18 PASS first run**. gen_sigs32 regen: 783 exports.
+winnux32 boots under qemu-i386; `ret 0x2c`/`ret 0x10` proofs above.
+
 ## Date: 2026-10-20 (session 15: installer opens — RichEdit/Rstrtmgr/tokens)
 
 ### Field report
