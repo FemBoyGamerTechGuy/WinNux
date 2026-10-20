@@ -45,13 +45,15 @@ $(OBJ)/win/wow64_gates.o: src/win/wow64_gates.S | $(OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) -c -o $@ $<
 
--include $(OBJ)/*.d $(OBJ)/*/*.d
+-include $(OBJ)/*.d $(OBJ)/*/*.d obj32/*.d obj32/*/*.d
 
 
 # Signal-context code runs with the GUEST %fs state (base 0 in compat mode);
 # a stack-canary prologue (fs:0x28 read) would fault before the wow64 hook
 # can restore the host FS base. Found via core-dump forensics (d69a017-era).
 $(OBJ)/win/wow64.o $(OBJ)/win/seh.o $(DBGOBJ)/win/wow64.o $(DBGOBJ)/win/seh.o: CFLAGS += -fno-stack-protector
+# Same rationale on the i386 build (signal-context code under guest %fs).
+obj32/win/wow64.o obj32/win/seh.o: CFLAGS += -fno-stack-protector
 
 $(BIN) $(OBJ):
 	mkdir -p $@
@@ -187,8 +189,7 @@ endif
 $(OBJ32)/%.o: src/%.c | $(OBJ32)
 ifneq ($(M32_MODE),none)
 	@mkdir -p $(dir $@)
-	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) $(M32FLAGS) \
-	      -fstack-protector-strong -c -o $@ $<
+	$(CC) $(CFLAGS) $(M32FLAGS) -c -o $@ $<
 endif
 check32:
 ifeq ($(M32_MODE),none)

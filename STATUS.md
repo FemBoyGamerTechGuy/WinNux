@@ -80,6 +80,46 @@ full i386 frame-SEH engine:
   runs their bodies (CloseHandle etc. inside the handler), and the outer
   installer instance completes its whole failure lifecycle.
 
+### Session 12: native i386 frame SEH + nested-walk cap (both engines)
+
+User-reported: `make && make winnux32` died at wow64.c's
+`wn_wow64_unwind32_take` (-Werror=unused-parameter under -m32). The fix
+(void-casts in the #else branch, matching its sibling) exposed what the
+user's next build would have hit: `wn_seh_rtl_unwind_32` was defined only
+for the x86_64 host, but kernel32/ntdll call it unconditionally — the i386
+link died on 2 undefined references. seh.c gained the full NATIVE i386
+frame-SEH engine as the #else branch of the wow64 one:
+- %fs:0x18 is the REAL TEB on this build, so the walk reads the live
+  fs:[0] chain head directly (the guest maintains it); handler addresses
+  are plain cdecl code pointers (i386 frame handlers are cdecl, NOT
+  WN_API/stdcall — see wn_types.h);
+- fault path: real ucontext -> guest-layout CONTEXT (0x2CC),
+  ExceptionContinueExecution writes regs back into uc, unwind lands by
+  patching uc->EIP/ESP/EAX (sigreturn does the switch);
+- RaiseException path: same walk; after an RtlUnwind continuation is
+  pending, wn_seh_raise lands via the wn_seh32_land global-asm trampoline
+  (mov ecx/edx/eax; mov edx,esp; jmp *ecx) — a real stack switch that
+  never returns, mirroring the wow64 thunk's pending-unwind exit path;
+- RtlUnwind: walk+pop frames running finally bodies, write the Delphi
+  continuation ([esp]=ReturnValue, [esp+4]=Record), longjmp back to a live
+  walk or leave the landing pending.
+The nested-fault guard (session-11 hang: a finally body raising again
+re-entered seh32_dispatch) is now on BOTH engines: a per-thread
+g_seh32_walk_active cap refuses re-entrant walks, and a capped raise
+during an unwind reuses the pending continuation (x64: the thunk exit
+path lands it; i386: the trampoline) instead of hanging or crashing.
+Build hygiene: the obj32 rules now use $(CFLAGS) (dep tracking + the
+per-file -fno-stack-protector rule extended to obj32 signal-context
+files, same rationale as x64); beware: Makefile rules defined BEFORE
+OBJ32:= expand $(OBJ32) as empty (the -include line literally picked up
+/etc/apparmor.d via the /*/*.d glob — use literal obj32 paths above the
+definition, as committed). toolchain/root32 + qemu-i386 were rebuilt
+(setup: /home/z/my-project/scripts/setup_root32.sh).
+VERIFIED: `make` + `make winnux32` both link clean (sysroot mode here;
+the user's native-multilib box needs only the source fixes), smoke32
+9/9 checks under qemu (TEB fs:0x18/0x20/0x34, heaps, ticks, last-error),
+64-bit suite 16/16.
+
 ### The installer state after all of this
 
 The process TREE now works end-to-end: outer exe extracts -> spawns the

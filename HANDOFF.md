@@ -44,17 +44,25 @@ returning `hwnd=101 msg=1` forever and hit the timeout.
 
 ## The next 3 steps
 
+0. DONE in session 12 (context): the reported `make winnux32` failure
+   (unused params in wn_wow64_unwind32_take under -m32) plus the link
+   breakage it was masking (wn_seh_rtl_unwind_32 was x64-only): seh.c now
+   has the NATIVE i386 frame-SEH engine (#else branch — real fs:0x18 TEB
+   walk, cdecl handler calls, wn_seh32_land stack-switch landing), the
+   nested-fault cap + pending-unwind reuse went into BOTH engines, and
+   the obj32 Makefile rules gained per-file -fno-stack-protector + dep
+   tracking. toolchain/root32 + qemu were rebuilt (setup script:
+   /home/z/my-project/scripts/setup_root32.sh); `make winnux32` links,
+   smoke32 9/9 under qemu, 64-bit suite 16/16.
 1. Instrument the engine data corruption: the crash writes [edx] with
    edx=0x40a998 (CODE-section address) while eax=0x2e ('.') and the stack
    holds "...\...tmp\4000" (Inno language-table path). Add DEBUG logging
    around the child's decompression buffer consumption
    (VirtualAlloc@0x41de2000, 32MB) and the Classes/GlobalNameSpace object
-   list; compare with qemu-i386 (winnux32 native path — rebuild
-   toolchain/root32 first, the reset wiped it; scripts/dev/run32.sh has
-   the recipe notes from session 10's STATUS entry).
-2. Guard nested faults inside the SEH unwind (the walk hangs in the 4th
-   frame when a finally body raises again — seh32_dispatch needs a
-   re-entrancy cap + pending-unwind reuse).
-3. Then the same installer goal continues: engine past the data-corruption
+   list; compare with qemu-i386 (`make winnux32` + scripts/dev/run32.sh —
+   both green again). If the SAME corruption appears under qemu (no
+   wow64 layer at all), the engine's own logic is the writer; if not,
+   the wow64 width-bug audit (TODO item 4) is the faster trail.
+2. Then the same installer goal continues: engine past the data-corruption
    crash -> files land in drive_c/Program Files -> registry uninstall keys
    -> lua.exe smoke test `print(1+2*3, ("win"):upper())`.

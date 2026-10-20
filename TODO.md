@@ -20,12 +20,13 @@ Remaining, in evidence order:
    (CreateFileA path-logging + ReadFile size/pos logging added at DEBUG);
    next: instrument WHO writes the object pointer (the list comes from
    GlobalNameSpace/Classes registration), and compare against qemu-i386
-   (winnux32, once the root32 sysroot is rebuilt — the sandbox reset wiped
-   it again).
-2. NESTED FAULT DURING SEH UNWIND: the walk hangs in the 4th frame (the
-   finally body raises again inside the unwind — seh32_dispatch re-enters
-   without depth accounting). Add a nested-walk guard (pending-unwind
-   reuse + recursion cap) in seh.c's seh32_dispatch.
+   (winnux32 — root32 sysroot REBUILT in session 12, `make winnux32` green,
+   run32.sh loop verified; the comparison is unblocked).
+2. DONE (session 12, moved to STATUS.md): nested-walk guard — a
+   per-thread g_seh32_walk_active cap refuses re-entrant seh32_dispatch on
+   BOTH engines (x64 wow64 + native i386), and capped raises during an
+   unwind reuse the pending continuation (x64: thunk exit path; i386:
+   wn_seh32_land trampoline) instead of crashing the walk.
 3. GetSystemMenu/DeleteMenu (stub32) — implement real menu-object stubs so
    Inno's TApplication setup path is faithful; EnumFontsA (gdi32 stub)
    likely harmless (installer proceeded past it).

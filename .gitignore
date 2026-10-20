@@ -22,3 +22,4 @@ tests/fuzz/crashes/
 *.secret
 .env
 core
+obj32/

@@ -1331,6 +1331,7 @@ int wn_wow64_unwind32_take(uint32_t *target, uint32_t *esp, uint32_t *eax)
     if (eax) *eax = wt->unwind32_eax;
     return 1;
 #else
+    (void)target; (void)esp; (void)eax;   /* native: nothing to unwind */
     return 0;
 #endif
 }

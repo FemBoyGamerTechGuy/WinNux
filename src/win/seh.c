@@ -303,6 +303,10 @@ typedef struct seh32_jmp {
     int    depth;          /* wt->depth to restore after the longjmp */
 } seh32_jmp;
 static __thread seh32_jmp *g_seh32_jmp;
+static __thread int g_seh32_walk_active;   /* nested-fault cap: a fault or
+                                           * raise inside a walk never re-enters
+                                           * (it hung in the 4th frame when a
+                                           * finally body raised again) */
 
 static int seh32_mapped(uint32_t addr, uint32_t len)
 {
@@ -349,6 +353,12 @@ static int seh32_dispatch(wn_exc_record *rec, wn_context64 *ctx, void *uc_)
     wn_wow64_thread *wt = wn_wow64_thread_current();
     if (!wt || !g_wow64_active)
         return 0;
+    if (g_seh32_walk_active) {
+        wn_log(WN_LOG_WARN, "seh32: nested fault/raise inside the walk — "
+               "capped (pending unwind: %s)",
+               wn_wow64_unwind32_pending() ? "kept" : "none");
+        return 0;
+    }
     uint32_t teb32 = (uint32_t)(uintptr_t)wt->teb32;
     if (!seh32_mapped(teb32, 4))
         return 0;
@@ -386,6 +396,7 @@ static int seh32_dispatch(wn_exc_record *rec, wn_context64 *ctx, void *uc_)
     wn_log(WN_LOG_DEBUG, "seh32: dispatch code=%08x addr=%x head=%x "
            "anchor=%x uc=%d", rec->exception_code,
            (uint32_t)rec->exception_address, head, anchor, uc ? 1 : 0);
+    g_seh32_walk_active = 1;
     for (int i = 0; i < 128 && seh32_mapped(head, 8); i++) {
         uint32_t next = *(uint32_t *)(uintptr_t)head;
         uint32_t handler = *(uint32_t *)(uintptr_t)(head + 4);
@@ -480,6 +491,7 @@ static int seh32_dispatch(wn_exc_record *rec, wn_context64 *ctx, void *uc_)
             walked[n_walked++] = head;
         head = next;
     }
+    g_seh32_walk_active = 0;
     wn_low_free(blk);
     return handled;
 }
@@ -539,6 +551,297 @@ void wn_seh_rtl_unwind_32(uint32_t target_frame, uint32_t target_ip,
         longjmp(j->jb, 1);
     }
     /* no walk: the dispatch layer applies the pending unwind */
+}
+
+#else  /* !__x86_64__ — native i386 (winnux32) frame-based SEH ---------------
+ * The same walk engine as the wow64 host above, except everything is
+ * native: %fs:0x18 IS the TEB (its first dword is the live fs:[0] chain
+ * head the guest maintains itself), handler addresses are real cdecl
+ * code pointers, and the unwound continuation lands by switching the
+ * real stack. Guest pointers need no low-memory staging, but rec32/ctx32
+ * still go through wn_low_malloc to keep the shape identical. */
+
+#include <setjmp.h>
+
+typedef struct seh32_jmp {
+    jmp_buf jb;
+    struct seh32_jmp *prev;
+} seh32_jmp;
+static __thread seh32_jmp *g_seh32_jmp;
+static __thread int      g_seh32_walk_active;   /* same nested-fault cap */
+static __thread uint32_t g_land_ip, g_land_esp, g_land_eax;
+static __thread int      g_land_pending;
+
+static int seh32_mapped(uint32_t addr, uint32_t len)
+{
+    if (addr < 0x10000)
+        return 0;
+    if (addr + len < addr)
+        return 0;
+    return msync((void *)(uintptr_t)(addr & ~0xFFFULL), 0x1000, MS_ASYNC) == 0;
+}
+
+/* i386 frame handlers are CDECL (wn_types.h: caller cleans) — plain fn-ptr
+ * calls, the Linux i386 default ABI. NOT WN_API/stdcall. */
+typedef int (*seh32_handler_t)(uint32_t rec, uint32_t frame, uint32_t ctx,
+                               uint32_t dispatcher);
+static int seh32_call(uint32_t handler, uint32_t rec, uint32_t frame,
+                      uint32_t ctx)
+{
+    return ((seh32_handler_t)(uintptr_t)handler)(rec, frame, ctx, 0);
+}
+
+/* i386 CONTEXT (0x2CC). uc != NULL → fault path (real register state);
+ * uc == NULL → RaiseException path: approximate with the raise site
+ * (same spirit as the x64 host's approximation). */
+static void seh32_fill_ctx(uint8_t *ctx32, const ucontext_t *uc)
+{
+    uint32_t gs, fs, es, ds, cs, ss;
+    uint32_t edi, esi, ebx, edx, ecx, eax, ebp, eip, efl, esp;
+    __asm__ volatile ("movl %%gs, %0" : "=r"(gs));
+    __asm__ volatile ("movl %%fs, %0" : "=r"(fs));
+    __asm__ volatile ("movl %%es, %0" : "=r"(es));
+    __asm__ volatile ("movl %%ds, %0" : "=r"(ds));
+    __asm__ volatile ("movl %%cs, %0" : "=r"(cs));
+    __asm__ volatile ("movl %%ss, %0" : "=r"(ss));
+    if (uc) {
+        edi = uc->uc_mcontext.gregs[REG_EDI];
+        esi = uc->uc_mcontext.gregs[REG_ESI];
+        ebx = uc->uc_mcontext.gregs[REG_EBX];
+        edx = uc->uc_mcontext.gregs[REG_EDX];
+        ecx = uc->uc_mcontext.gregs[REG_ECX];
+        eax = uc->uc_mcontext.gregs[REG_EAX];
+        ebp = uc->uc_mcontext.gregs[REG_EBP];
+        eip = uc->uc_mcontext.gregs[REG_EIP];
+        efl = uc->uc_mcontext.gregs[REG_EFL];
+        esp = uc->uc_mcontext.gregs[REG_ESP];
+    } else {
+        __asm__ volatile ("movl %%edi, %0" : "=r"(edi));
+        __asm__ volatile ("movl %%esi, %0" : "=r"(esi));
+        __asm__ volatile ("movl %%ebx, %0" : "=r"(ebx));
+        __asm__ volatile ("movl %%edx, %0" : "=r"(edx));
+        __asm__ volatile ("movl %%ecx, %0" : "=r"(ecx));
+        __asm__ volatile ("movl %%eax, %0" : "=r"(eax));
+        __asm__ volatile ("movl %%ebp, %0" : "=r"(ebp));
+        __asm__ volatile ("pushfl\n\tpopl %0" : "=r"(efl));
+        __asm__ volatile ("movl %%esp, %0" : "=r"(esp));
+        eip = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    }
+    memset(ctx32, 0, 0x2CC);
+    *(uint32_t *)(void *)(ctx32 + 0x00) = 0x10007;   /* CONTEXT_FULL */
+    *(uint32_t *)(void *)(ctx32 + 0x8C) = gs;
+    *(uint32_t *)(void *)(ctx32 + 0x90) = fs;
+    *(uint32_t *)(void *)(ctx32 + 0x94) = es;
+    *(uint32_t *)(void *)(ctx32 + 0x98) = ds;
+    *(uint32_t *)(void *)(ctx32 + 0x9C) = edi;
+    *(uint32_t *)(void *)(ctx32 + 0xA0) = esi;
+    *(uint32_t *)(void *)(ctx32 + 0xA4) = ebx;
+    *(uint32_t *)(void *)(ctx32 + 0xA8) = edx;
+    *(uint32_t *)(void *)(ctx32 + 0xAC) = ecx;
+    *(uint32_t *)(void *)(ctx32 + 0xB0) = eax;
+    *(uint32_t *)(void *)(ctx32 + 0xB4) = ebp;
+    *(uint32_t *)(void *)(ctx32 + 0xB8) = eip;
+    *(uint32_t *)(void *)(ctx32 + 0xBC) = cs;
+    *(uint32_t *)(void *)(ctx32 + 0xC0) = efl;
+    *(uint32_t *)(void *)(ctx32 + 0xC4) = esp;
+    *(uint32_t *)(void *)(ctx32 + 0xC8) = ss;
+}
+
+/* Walk the fs:[0] frame chain (native build).
+ *   uc != NULL → signal path: uc patched on unwind / continue-exec.
+ *   uc == NULL → RaiseException path: a pending continuation lands via
+ *               wn_seh32_land (never returns).
+ * Returns 1 when handled (or a continuation is pending), 0 = unhandled. */
+static int seh32_dispatch(wn_exc_record *rec, ucontext_t *uc)
+{
+    if (g_seh32_walk_active) {
+        wn_log(WN_LOG_WARN, "seh32: nested fault/raise inside the walk — "
+               "capped (pending unwind: %s)", g_land_pending ? "kept" : "none");
+        return 0;
+    }
+    wn_teb *teb = wn_teb_current();
+    if (!teb)
+        return 0;
+    uint32_t head = (uint32_t)teb->exception_list;
+    if (!seh32_mapped(head, 8))
+        return 0;
+
+    uint8_t *blk = wn_low_malloc(0x50 + 0x2CC);
+    if (!blk)
+        return 0;
+    uint8_t *rec32 = blk;
+    uint8_t *ctx32 = blk + 0x50;
+    memset(rec32, 0, 0x50);
+    *(uint32_t *)(void *)(rec32 + 0x00) = rec->exception_code;
+    *(uint32_t *)(void *)(rec32 + 0x04) = rec->exception_flags;
+    *(uint32_t *)(void *)(rec32 + 0x08) = 0;        /* nested chain */
+    *(uint32_t *)(void *)(rec32 + 0x0C) = (uint32_t)rec->exception_address;
+    *(uint32_t *)(void *)(rec32 + 0x10) =
+        rec->number_parameters > 15 ? 15 : rec->number_parameters;
+    for (uint32_t i = 0; i < rec->number_parameters && i < 15; i++)
+        *(uint32_t *)(void *)(rec32 + 0x14 + 4 * i) =
+            (uint32_t)rec->exception_information[i];
+    seh32_fill_ctx(ctx32, uc);
+
+    int handled = 0;
+    uint32_t walked[128];      /* frames already searched (for the
+                                * return-1 unwind-to-me pass) */
+    int n_walked = 0;
+    wn_log(WN_LOG_DEBUG, "seh32: dispatch code=%08x addr=%x head=%x uc=%d",
+           rec->exception_code, (uint32_t)rec->exception_address, head,
+           uc ? 1 : 0);
+    g_seh32_walk_active = 1;
+    for (int i = 0; i < 128 && seh32_mapped(head, 8); i++) {
+        uint32_t next = *(uint32_t *)(uintptr_t)head;
+        uint32_t handler = *(uint32_t *)(uintptr_t)(head + 4);
+        wn_log(WN_LOG_DEBUG, "seh32: frame %x handler %x (next %x)",
+               head, handler, next);
+        if (next && next < 0x10000)
+            break;
+        if (!seh32_mapped(handler, 16))
+            break;
+        seh32_jmp j;
+        j.prev = g_seh32_jmp;
+        g_seh32_jmp = &j;
+        int r;
+        if (setjmp(j.jb) == 0)
+            r = seh32_call(handler, (uint32_t)(uintptr_t)rec32, head,
+                           (uint32_t)(uintptr_t)ctx32);
+        else
+            r = -2;    /* RtlUnwind ran inside the handler */
+        g_seh32_jmp = j.prev;
+        wn_log(WN_LOG_DEBUG, "seh32: handler %x verdict %x", handler,
+               (uint32_t)r);
+
+        if (r == -1) {
+            /* EXCEPTION_CONTINUE_EXECUTION: copy (possibly modified)
+             * guest context back and resume. */
+            if (uc) {
+                uc->uc_mcontext.gregs[REG_EAX] = *(uint32_t *)(void *)(ctx32 + 0xB0);
+                uc->uc_mcontext.gregs[REG_ECX] = *(uint32_t *)(void *)(ctx32 + 0xAC);
+                uc->uc_mcontext.gregs[REG_EDX] = *(uint32_t *)(void *)(ctx32 + 0xA8);
+                uc->uc_mcontext.gregs[REG_EBX] = *(uint32_t *)(void *)(ctx32 + 0xA4);
+                uc->uc_mcontext.gregs[REG_ESP] = *(uint32_t *)(void *)(ctx32 + 0xC4);
+                uc->uc_mcontext.gregs[REG_EBP] = *(uint32_t *)(void *)(ctx32 + 0xB4);
+                uc->uc_mcontext.gregs[REG_ESI] = *(uint32_t *)(void *)(ctx32 + 0xA0);
+                uc->uc_mcontext.gregs[REG_EDI] = *(uint32_t *)(void *)(ctx32 + 0x9C);
+                uc->uc_mcontext.gregs[REG_EIP] = *(uint32_t *)(void *)(ctx32 + 0xB8);
+            }
+            handled = 1;
+            break;
+        }
+        if (r == -2 || g_land_pending) {
+            if (uc && g_land_pending) {
+                uc->uc_mcontext.gregs[REG_EIP] = g_land_ip;
+                uc->uc_mcontext.gregs[REG_ESP] = g_land_esp;
+                uc->uc_mcontext.gregs[REG_EAX] = g_land_eax;
+            }
+            handled = 1;
+            break;
+        }
+        if (r == 1) {
+            /* Borland __finally frame (same decode as the x64 twin):
+             * run inner finally bodies with EH_UNWINDING, this frame's with
+             * EH_UNWINDING|EH_TARGET_UNWINDING, pop them all, then continue
+             * the search outward with the same record. */
+            *(uint32_t *)(void *)(rec32 + 0x04) |= 2;   /* EH_UNWINDING */
+            for (int k = 0; k < n_walked; k++) {
+                uint32_t fh = *(uint32_t *)(uintptr_t)(walked[k] + 4);
+                if (seh32_mapped(fh, 16))
+                    seh32_call(fh, (uint32_t)(uintptr_t)rec32, walked[k],
+                               (uint32_t)(uintptr_t)ctx32);
+                teb->exception_list = *(uint32_t *)(uintptr_t)walked[k];
+            }
+            *(uint32_t *)(void *)(rec32 + 0x04) |= 4;   /* TARGET_UNWINDING */
+            if (seh32_mapped(handler, 16))
+                seh32_call(handler, (uint32_t)(uintptr_t)rec32, head,
+                           (uint32_t)(uintptr_t)ctx32);
+            teb->exception_list = next;
+            n_walked = 0;
+            head = next;
+            wn_log(WN_LOG_DEBUG, "seh32: finally-frame unwound, "
+                   "search continues at %x", head);
+            continue;
+        }
+        if (r != 0)
+            wn_log(WN_LOG_DEBUG, "seh32: handler %x returned %x", handler,
+                   (uint32_t)r);
+        if (n_walked < 128)
+            walked[n_walked++] = head;
+        head = next;
+    }
+    g_seh32_walk_active = 0;
+    wn_low_free(blk);
+    return handled;
+}
+
+/* Landing trampoline for the raise path: switches the real stack to the
+ * unwound continuation ([esp]=retval, [esp+4]=record are already in guest
+ * memory; EAX mirrors retval like the x64 twin). Never returns — global
+ * asm, no prologue at all. */
+__asm__(
+".globl wn_seh32_land\n"
+".type  wn_seh32_land, @function\n"
+"wn_seh32_land:\n"
+"  movl 4(%esp), %ecx\n"    /* target ip */
+"  movl 8(%esp), %edx\n"    /* target esp */
+"  movl 12(%esp), %eax\n"   /* retval */
+"  movl %edx, %esp\n"
+"  jmp *%ecx\n"
+".size wn_seh32_land, .-wn_seh32_land\n"
+);
+extern void wn_seh32_land(uint32_t ip, uint32_t esp, uint32_t eax_val);
+
+/* kernel32/ntdll RtlUnwind for a 32-bit caller (native build). Walks the
+ * real fs:[0] chain, runs finally frames, then either longjmps back to a
+ * live walk or leaves the continuation pending for the caller to apply. */
+void wn_seh_rtl_unwind_32(uint32_t target_frame, uint32_t target_ip,
+                         uint32_t rec32, uint32_t retval)
+{
+    wn_teb *teb = wn_teb_current();
+    if (!teb)
+        return;
+    wn_log(WN_LOG_DEBUG, "seh32: RtlUnwind(frame=%x ip=%x rec=%x rv=%x)",
+           target_frame, target_ip, rec32, retval);
+    if (!seh32_mapped(target_frame, 8))
+        return;
+
+    /* intermediate frames: run finally bodies with EH_UNWINDING */
+    if (rec32 && seh32_mapped(rec32, 4))
+        *(uint32_t *)(uintptr_t)(rec32 + 4) |= 2;
+    uint32_t head = (uint32_t)teb->exception_list;
+    for (int i = 0; i < 256 && seh32_mapped(head, 8); i++) {
+        if (head == target_frame)
+            break;
+        uint32_t next = *(uint32_t *)(uintptr_t)head;
+        uint32_t handler = *(uint32_t *)(uintptr_t)(head + 4);
+        if (!next || next < 0x10000)
+            break;
+        if (seh32_mapped(handler, 16))
+            seh32_call(handler, rec32, head, 0);
+        teb->exception_list = next;    /* pop the frame */
+        head = next;
+    }
+    if (head != target_frame)
+        wn_log(WN_LOG_WARN, "seh32: RtlUnwind target %x not on chain "
+               "(at %x) — unwinding anyway", target_frame, head);
+
+    /* pop the target frame; continuation: [esp]=ReturnValue, [esp+4]=Record */
+    teb->exception_list = *(uint32_t *)(uintptr_t)target_frame;
+    *(uint32_t *)(uintptr_t)(target_frame + 4) = rec32;
+    *(uint32_t *)(uintptr_t)target_frame = retval;
+    g_land_ip = target_ip;
+    g_land_esp = target_frame;
+    g_land_eax = retval;
+    g_land_pending = 1;
+
+    if (g_seh32_jmp) {
+        seh32_jmp *j = g_seh32_jmp;
+        g_seh32_jmp = j->prev;
+        longjmp(j->jb, 1);    /* unwound handler frames never returned */
+    }
+    /* no walk: the fault path patches uc, the raise path lands via the
+     * wn_seh32_land trampoline. */
 }
 #endif  /* __x86_64__ */
 
@@ -807,6 +1110,10 @@ static void signal_handler(int sig, siginfo_t *si, void *uc_)
         if (seh32_dispatch(&rec, &ctx, uc))
             return;   /* handled or unwind patched into uc */
     }
+#else
+    /* Native build: the same walk over the REAL fs:[0] chain. */
+    if (seh32_dispatch(&rec, uc))
+        return;   /* handled, or uc patched to the unwind continuation */
 #endif
 
     crash_report(&rec, &ctx);
@@ -865,6 +1172,23 @@ void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
         if (seh32_dispatch(&rec, &ctx, NULL))
             return;   /* handled (or unwind pending: the dispatch layer
                         * resumes the guest at the continuation) */
+        if (wn_wow64_unwind32_pending())
+            return;   /* nested raise during an unwind was capped: keep the
+                        * outer unwind (the thunk exit path lands it) */
+    }
+#else
+    if (seh32_dispatch(&rec, NULL)) {
+        if (g_land_pending) {
+            wn_log(WN_LOG_DEBUG, "seh32: raise landing at %x (esp=%x)",
+                   g_land_ip, g_land_esp);
+            wn_seh32_land(g_land_ip, g_land_esp, g_land_eax);  /* noreturn */
+        }
+        return;   /* handler swallowed the raise (no unwind pending) */
+    }
+    if (g_land_pending) {
+        wn_log(WN_LOG_WARN, "seh32: capped raise during unwind — resuming "
+               "continuation %x", g_land_ip);
+        wn_seh32_land(g_land_ip, g_land_esp, g_land_eax);
     }
 #endif
 
