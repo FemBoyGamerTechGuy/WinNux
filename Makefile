@@ -142,9 +142,22 @@ $(shell printf 'int main(){return 0;}' > /tmp/w32p.c; \
   else echo none; fi)
 endef
 
+# Guest->host stack alignment contract (LuaForWindows GUI crash, 2026-10-20):
+# i386 WinNux builtins are stdcall C functions wired DIRECTLY into the guest
+# IAT, so they are entered from guest code with only the Win32 4-byte ESP
+# alignment. GCC (any -m32 toolchain that emits SSE, e.g. Arch's default
+# tuning) lays out 16-aligned stack slots and copies structs with aligned
+# `movaps` per its -mpreferred-stack-boundary=4 chain assumption -> #GP ->
+# SIGSEGV si_addr=NULL (no CR2 for #GP) at the first misaligned guest call.
+# -mstackrealign is the documented mechanism for exactly this: every function
+# realigns its own frame at entry, so any guest entry alignment is safe.
+# -msse2 pins the same (SSE-enabled) codegen on conservative toolchains too
+# (Debian -m32 = i586 baseline) so this bug class can't silently diverge by
+# build host; every x86-64 CPU has SSE2 and qemu-i386 emulates it.
 M32_MODE := $(strip $(m32_probe))
+M32ALIGN := -msse2 -mstackrealign
 ifeq ($(M32_MODE),native)
-M32FLAGS := -m32 -no-pie -fno-pic -static-libgcc
+M32FLAGS := -m32 -no-pie -fno-pic -static-libgcc $(M32ALIGN)
 M32POST  :=
 else ifeq ($(M32_MODE),sysroot)
 # With -m32, gcc swaps the multiarch include dir (/usr/include/x86_64-linux-gnu
@@ -152,7 +165,7 @@ else ifeq ($(M32_MODE),sysroot)
 # amd64 dir (wordsize.h dispatches on __x86_64__), so re-add it to the chain.
 # GCC32DIR auto-detects the gcc version dir holding 32/crtbegin.o.
 GCC32DIR := $(patsubst %/32/,%,$(dir $(firstword $(wildcard $(M32_SYSROOT)/usr/lib/gcc/x86_64-linux-gnu/*/32/crtbegin.o))))
-M32FLAGS := -m32 -no-pie -fno-pic -static-libgcc \
+M32FLAGS := -m32 -no-pie -fno-pic -static-libgcc $(M32ALIGN) \
   -isystem $(M32_SYSROOT)/usr/include \
   -isystem $(M32_SYSROOT)/usr/include/i386-linux-gnu \
   -isystem /usr/include/x86_64-linux-gnu \

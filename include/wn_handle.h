@@ -45,4 +45,10 @@ int        wn_handle_close(wn_handle h);
 /* Install a destructor for a type (called with o->ptr at final release). */
 void       wn_handle_set_dtor(int type, void (*dtor)(void *));
 
+/* Mark a type's payloads as BORROWED: the handle table refs/deres them but
+ * never frees the payload at refcount-0 (the payload's owner outlives the
+ * handles — e.g. registry keys are owned by the tree and must outlive every
+ * HKEY; RegCloseKey freeing them left freed nodes linked in the tree). */
+void       wn_handle_set_nofree(int type);
+
 #endif /* WN_HANDLE_H */

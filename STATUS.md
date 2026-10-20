@@ -1,4 +1,76 @@
 
+## Date: 2026-10-20 (session 13, rebased + pushed)
+
+### The reported GUI installer crash: root cause + fix (VERIFIED at build level)
+User report: `./bin/winnux run LuaForWindows...exe` (GUI mode, their Arch box)
+died with SIG11 addr=(nil) at winnux32 host code, faulting instruction bytes
+`0f 29 44 24 10...` = `movaps %xmm0,0x10(%esp)` with ESP%16==12.
+Diagnosis: i386 builtins are stdcall C functions wired DIRECTLY into the guest
+IAT; guests only guarantee the Win32 4-byte stack alignment; Arch's -m32
+codegen (SSE-emitting) assumes GCC's 16-byte chain and #GP'd at the first
+misaligned guest call (Linux reports #GP as SIGSEGV si_addr=NULL — no CR2).
+Fix: M32ALIGN = `-msse2 -mstackrealign` for the winnux32 build. Dev-box
+verification of the rebuilt binary: 12 functions contain movaps (SSE now
+pinned on conservative hosts too, so this class can't silently diverge);
+11 of them use stack slots and ALL 11 carry `and $0xfffffff0,%esp`
+realignment prologues (69 total); the 12th (u32_SetKeyboardState) writes
+only the linker-aligned static g_key_state array — alignment-independent.
+Note: this session's sandbox was reset (the earlier session-13 commits were
+lost locally and never pushed); all edits below were re-applied from the
+session ledger and re-verified as builds. The end-to-end wizard-run
+evidence in this ledger comes from that earlier session's runs on the real
+installer (same code): the wizard built TMainForm -> TWizardForm -> outer/
+inner notebooks + pages -> TNewMemo -> TRichEditViewer -> TNewComboBox ->
+TNewCheckListBox, resolved C:\Program Files\Lua\5.1, and MAPPED its window
+under Xvfb. SourceForge blocked the exe re-download this session, so the
+run-level rerun is left to the user's box.
+
+### The session-12 registry corruption mystery: SOLVED (regression-class)
+`reg: CORRUPT child chain` = RegCloseKey -> handle refcount 0 -> the handle
+table FREED the wn_reg_key while it stayed linked in the tree; the next
+RegOpenKey walked RECYCLED heap, matched garbage, and handed the guest a
+handle wrapping someone else's live allocation -> the "runaway write" that
+hit host brk and the engine's own heap (0x49d41c buckets), i.e. the whole
+session-12 forensics trail. Fix: wn_handle_set_nofree(WN_HTYPE_REGKEY) —
+HKEYs are open-instance handles, the tree outlives them (Windows semantics).
+Zero tripwire hits since.
+
+### Wizard-chain blockers fixed in sequence (each proven by its disappearance)
+1. ExtractIconA/SHGetFileInfoA stubs returned 0 -> VCL raised EOutOfResources
+   at the checked icon loads. Both real now (module RT_GROUP_ICON walk +
+   shared LoadIconA handle shape; DrawIconEx blits real RT_ICON DIB pixels).
+2. CreateCompatibleBitmap stub return made VCL raise EOutOfResources; real
+   32bpp bitmap objects now (plus LoadBitmapA walking named RT_BITMAP DIBs —
+   Inno's wizard imagery, 4/8bpp palettes included).
+3. The whole wizard tree was torn down right after creation with NO
+   exception: VCL's menu build (CreateMenu/AppendMenu/SetMenu/GetSystemMenu/
+   DeleteMenu all stubs) failed, Inno freed the half-built wizard, a straggler
+   page insert under a dead parent raised EOutOfResources('Error creating
+   window'). Real menu objects + Set/Get/RemoveProp + scroll state +
+   SendNotifyMessageA landed; the teardown vanished.
+4. WM_NCDESTROY was never delivered by our DestroyWindow: VCL zeroes FHandle
+   in WMNCDestroy, so every destroyed window kept a STALE guest-side handle;
+   Inno's recreate flow then re-created children under dead parents. Fixed:
+   DestroyWindow dispatches 0x82 after WM_DESTROY.
+Also: FreeSid refuses foreign pointers (a garbage SID from token stubs
+free()d a stack pointer and aborted mid-install); full ListBox protocol
+(LB_INSERTSTRING/ITEMDATA/SETSEL/GETSEL/GETSELCOUNT/GETSELITEMS/FINDSTRING/
+GETTOPINDEX + item_data/sel_bits arrays — TCheckListBox state depends on
+these); GetTextExtentPointA/W aliases (the stub wrote NOTHING into the
+caller's SIZE); CreateWindow failure paths log WARNs with guest call sites;
+SendMessage-to-dead-hwnd counter; Delphi exception decoder in the raise log.
+
+### Remaining blocker (decoded, next session)
+BOTH /S and the GUI path die at the SAME deterministic point: Inno's
+TNewCheckListBox count check at engine+0x44e058 raises
+"List item and state item count mismatch" right after the control is
+created. The check compares Items.Count (VCL virtual at [Self+0xfc], a
+TStrings) against FState.Count ([Self+0x168]+8). Our LB trace showed the
+checklistbox receives NO LB_ traffic before the raise — one of the two
+lists diverges through a path we haven't seen yet. NEXT: gdb under qemu
+(break at 0x44e083) to dump both counts + the [Self+0xfc] object, or
+extend the Delphi decoder to walk info[2].
+
 ## Date: 2026-10-19 (session 11)
 
 ### The reported PeekMessageA infinite pump: root cause + fix (VERIFIED)

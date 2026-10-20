@@ -4,6 +4,7 @@
 #include "wn_util.h"
 #include "wn_path.h"
 #include "wn_process.h"
+#include "wn_handle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -328,6 +329,13 @@ static void insert_line(const char *line)
 
 void wn_registry_init(void)
 {
+    /* HKEYs are OPEN-INSTANCE handles, not owners: the key tree outlives
+     * every handle (Windows semantics — only RegDeleteKey removes nodes).
+     * Without this the last RegCloseKey freed live tree nodes and the next
+     * RegOpenKey walk ran through recycled heap (the session-12 engine
+     * corruption: "reg: CORRUPT child chain" + writes over live host data). */
+    wn_handle_set_nofree(WN_HTYPE_REGKEY);
+
     for (int i = 0; i < 4; i++)
         g_roots[i] = key_new(g_root_names[i]);
 

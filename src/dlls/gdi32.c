@@ -48,6 +48,11 @@ typedef struct gdi_obj {
         int cur_x, cur_y;           /* MoveTo position */
         struct gdi_obj *cur_bitmap;
         struct gdi_obj *cur_font;   /* selected HFONT (NULL = default) */
+        struct gdi_obj *cur_brush;  /* selected HBRUSH (NULL = white) */
+        wn_handle    cur_brush_h;   /* its handle (SelectObject returns it) */
+        struct gdi_obj *cur_pen;    /* selected HPEN (NULL = black) */
+        wn_handle    cur_pen_h;
+        int rop2;                    /* SetROP2 mode (R2_COPYPEN default) */
     } dc;
     /* object state */
     uint32_t color;                 /* brush/pen COLORREF */
@@ -491,7 +496,18 @@ static WN_API wn_handle g32_SelectObject(wn_handle hdc, wn_handle obj)
         return old;
     }
     if (o->kind != GDI_BITMAP) {
-        /* brushes/pens: accepted, state not tracked yet */
+        if (o->kind == GDI_BRUSH) {
+            wn_handle old = dc->dc.cur_brush_h;
+            dc->dc.cur_brush = o;
+            dc->dc.cur_brush_h = obj;
+            return old;
+        }
+        if (o->kind == GDI_PEN) {
+            wn_handle old = dc->dc.cur_pen_h;
+            dc->dc.cur_pen = o;
+            dc->dc.cur_pen_h = obj;
+            return old;
+        }
         return (wn_handle)0;
     }
     wn_handle old = (wn_handle)0;
@@ -543,6 +559,332 @@ static WN_API wn_handle g32_CreatePen(uint32_t style, uint32_t width, uint32_t c
     pen->kind = GDI_PEN;
     pen->color = color;
     return gdi_new(pen);
+}
+
+/* CreateBrushIndirect: LOGBRUSH {lbStyle@0, lbColor@4, lbHatch@8} — all
+ * fixed-width fields, same layout in i386 and x64 guests. Hatched/hollow
+ * styles are drawn solid (logged); the wizard's fills are BS_SOLID. */
+static WN_API wn_handle g32_CreateBrushIndirect(const void *logbrush)
+{
+    if (!logbrush)
+        return (wn_handle)0;
+    const uint32_t *lb = logbrush;
+    if (lb[0] != 0 /*BS_SOLID*/)
+        wn_log(WN_LOG_DEBUG, "gdi32: CreateBrushIndirect style %u drawn "
+               "as solid", lb[0]);
+    gdi_obj *br = wn_xcalloc(1, sizeof *br);
+    br->kind = GDI_BRUSH;
+    br->color = lb[1];
+    return gdi_new(br);
+}
+
+/* CreatePenIndirect: LOGPEN {lopnStyle@0, lopnWidth(POINT)@4, lopnColor@12}
+ * — fixed-width fields, identical layout in both guest word sizes. */
+static WN_API wn_handle g32_CreatePenIndirect(const void *logpen)
+{
+    if (!logpen)
+        return (wn_handle)0;
+    const uint32_t *lp = logpen;
+    if (lp[0] != 0 /*PS_SOLID*/)
+        wn_log(WN_LOG_DEBUG, "gdi32: CreatePenIndirect style %u drawn "
+               "as solid", lp[0]);
+    gdi_obj *pen = wn_xcalloc(1, sizeof *pen);
+    pen->kind = GDI_PEN;
+    pen->color = lp[3];
+    return gdi_new(pen);
+}
+
+/* PatBlt: BLACKNESS/WHITENESS paint directly; PATCOPY (and friends, logged)
+ * use the selected brush — VCL's TCanvas.Brush — defaulting to white. */
+static WN_API int32_t g32_PatBlt(wn_handle hdc, int32_t x, int32_t y,
+                                 int32_t w, int32_t h, uint32_t rop)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || w <= 0 || h <= 0)
+        return 0;
+    uint32_t rgb;
+    if (rop == 0x00000042u /*BLACKNESS*/)
+        rgb = 0x000000;
+    else if (rop == 0x00FF0062u /*WHITENESS*/)
+        rgb = 0xFFFFFF;
+    else {
+        rgb = dc->dc.cur_brush ? colorref_to_u32(dc->dc.cur_brush->color)
+                                : 0xFFFFFF;
+        if (rop != 0x00F00021u /*PATCOPY*/)
+            wn_log(WN_LOG_DEBUG, "gdi32: PatBlt rop 0x%x approximated "
+                   "as PATCOPY", rop);
+    }
+    fill_rect_rgb(dc, x, y, x + w, y + h, rgb);
+    return 1;
+}
+
+/* SetROP2: record the drawing mode (R2_COPYPEN default). The raster ops
+ * honor R2_COPY/R2_XOR semantics at draw time; this stores per-DC state. */
+static WN_API int32_t g32_SetROP2(wn_handle hdc, int32_t mode)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || mode < 1 || mode > 16)
+        return 0;
+    int old = dc->dc.rop2 ? dc->dc.rop2 : 13 /*R2_COPYPEN*/;
+    dc->dc.rop2 = mode;
+    return old;
+}
+
+static WN_API int32_t g32_UnrealizeObject(wn_handle obj)
+{
+    (void)obj;   /* re-realization only matters for palettes/brush origins */
+    return 1;
+}
+
+/* GetObjectA: the object descriptor. BITMAP's trailing bmBits pointer makes
+ * the struct 20 (i386) / 24 (x64) bytes; LOGFONTA/LOGBRUSH/LOGPEN are all
+ * fixed-width (60/12/16 in both). Callers ask for what they will read. */
+static WN_API int32_t g32_GetObjectA(wn_handle obj, int32_t cb, void *buf)
+{
+    wn_object *wo = wn_handle_get(obj, WN_HTYPE_GFX);
+    if (!wo || !wo->ptr)
+        return 0;
+    gdi_obj *o = wo->ptr;
+    const int g32 = wn_wow64_guest32();
+    if (o->kind == GDI_BITMAP) {
+        int need = g32 ? 20 : 24;
+        if (!buf)
+            return need;
+        if (cb < need)
+            return 0;
+        memset(buf, 0, (size_t)need);
+        uint8_t *b = buf;
+        uint32_t *w32 = (uint32_t *)buf;
+        w32[1] = (uint32_t)o->bmp.w;                 /* bmWidth */
+        w32[2] = (uint32_t)o->bmp.h;                 /* bmHeight */
+        w32[3] = (uint32_t)(o->bmp.w * (o->bmp.bpp / 8)); /* bmWidthBytes */
+        *(uint16_t *)(void *)(b + 0x10) = 1;         /* bmPlanes */
+        *(uint16_t *)(void *)(b + 0x12) = (uint16_t)o->bmp.bpp;
+        return need;
+    }
+    if (o->kind == GDI_BRUSH) {
+        if (!buf)
+            return 12;
+        if (cb < 12)
+            return 0;
+        uint32_t *lb = buf;   /* LOGBRUSH: style, color, hatch */
+        lb[0] = 0;            /* BS_SOLID */
+        lb[1] = o->color;
+        lb[2] = 0;
+        return 12;
+    }
+    if (o->kind == GDI_PEN) {
+        if (!buf)
+            return 16;
+        if (cb < 16)
+            return 0;
+        uint32_t *lp = buf;   /* LOGPEN: style, width POINT, color */
+        lp[0] = 0;            /* PS_SOLID */
+        lp[1] = 1; lp[2] = 0; /* POINT {1, 0} */
+        lp[3] = o->color;
+        return 16;
+    }
+    if (o->kind == GDI_FONT) {
+        if (!buf)
+            return 60;
+        if (cb < 60)
+            return 0;
+        memset(buf, 0, 60);
+        uint8_t *b = buf;
+        *(int32_t *)(void *)(b + 0) = o->font.height;   /* lfHeight */
+        *(int32_t *)(void *)(b + 0x10) = o->font.weight; /* lfWeight */
+        b[0x14] = (uint8_t)o->font.italic;               /* lfItalic */
+        b[0x17] = 1;                                      /* ANSI charset */
+        snprintf((char *)b + 0x1C, 32, "%.31s", o->font.face);
+        return 60;
+    }
+    return 0;
+}
+
+/* --- cross-DLL DIB blit (icon drawing) --------------------------------------
+ * user32's DrawIconEx resolves the icon and hands the raw RT_ICON DIB here;
+ * gdi32 owns the DC pixel writer. 24/32bpp, top-down or bottom-up, scaled
+ * to (cx,cy) with nearest neighbor. Non-32bpp icon DIBs carry XOR+AND
+ * halves — the image is the half with actual pixels. */
+int wn_gdi_draw_dib(wn_handle hdc, int x, int y, int cx, int cy,
+                    const uint8_t *dib, uint32_t dib_size)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !dib || dib_size < 40 || cx <= 0 || cy <= 0)
+        return 0;
+    uint32_t bsize;
+    memcpy(&bsize, dib + 0, 4);
+    if (bsize < 40)
+        return 0;
+    int32_t bw, bh;
+    memcpy(&bw, dib + 4, 4);
+    memcpy(&bh, dib + 8, 4);
+    uint16_t bpp;
+    memcpy(&bpp, dib + 0xE, 2);
+    if ((bpp != 24 && bpp != 32) || bw <= 0 || bh == 0) {
+        wn_log(WN_LOG_WARN, "gdi32: icon DIB unsupported (w=%d h=%d bpp=%u)",
+               (int)bw, (int)bh, bpp);
+        return 0;
+    }
+    int bottom_up = bh > 0;
+    int ah = bh < 0 ? -bh : bh;
+    int rows = bpp == 32 ? ah : ah / 2;   /* non-32bpp icons: XOR half */
+    if (rows <= 0)
+        return 0;
+    int pxbytes = bpp / 8;
+    size_t rowbytes = (((size_t)bw * (size_t)pxbytes) + 3) & ~(size_t)3;
+    if (40 + rowbytes * (size_t)rows > dib_size) {
+        wn_log(WN_LOG_WARN, "gdi32: icon DIB truncated (%u bytes)", dib_size);
+        return 0;
+    }
+    const uint8_t *pix = dib + 40;
+    for (int dy = 0; dy < cy; dy++) {
+        int sy = rows * dy / cy;
+        int syy = bottom_up ? rows - 1 - sy : sy;
+        const uint8_t *src = pix + (size_t)syy * rowbytes;
+        int dyd = y + dy;
+        if (dyd < 0 || dyd >= dc->dc.h)
+            continue;
+        int dyrow = dc->dc.dib_bottom_up ? dc->dc.h - 1 - dyd : dyd;
+        uint8_t *dst = dc->dc.pixels + (size_t)dyrow * dc->dc.stride;
+        for (int dx = 0; dx < cx; dx++) {
+            int sx = bw * dx / cx;
+            const uint8_t *sp = src + (size_t)sx * pxbytes;
+            if (bpp == 32 && sp[3] == 0)
+                continue;            /* fully transparent pixel: skip */
+            int dxd = x + dx;
+            if (dxd < 0 || dxd >= dc->dc.w)
+                continue;
+            uint8_t *dp = dst + (size_t)dxd * 4;
+            dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = 0xFF;
+        }
+    }
+    return 1;
+}
+
+/* Cross-DLL (see wn_dll.h): a loadable HBITMAP from a raw RT_BITMAP-style
+ * DIB (BITMAPINFOHEADER + pixels). 24/32bpp direct; 4/8bpp through the
+ * inline palette. The object is normalized to 32bpp top-down storage so
+ * every draw path (BitBlt, StretchBlt later) sees one format. */
+wn_handle wn_gdi_bitmap_from_dib(const uint8_t *dib, uint32_t dib_size)
+{
+    if (!dib || dib_size < 40)
+        return (wn_handle)0;
+    uint32_t bsize;
+    memcpy(&bsize, dib + 0, 4);
+    if (bsize < 40)
+        return (wn_handle)0;
+    int32_t bw, bh;
+    memcpy(&bw, dib + 4, 4);
+    memcpy(&bh, dib + 8, 4);
+    uint16_t bpp;
+    memcpy(&bpp, dib + 0xE, 2);
+    if ((bpp != 24 && bpp != 32 && bpp != 8 && bpp != 4) ||
+        bw <= 0 || bh == 0) {
+        wn_log(WN_LOG_WARN, "gdi32: RT_BITMAP DIB unsupported (w=%d h=%d "
+               "bpp=%u)", (int)bw, (int)bh, bpp);
+        return (wn_handle)0;
+    }
+    int bottom_up = bh > 0;
+    int rows = bh < 0 ? -bh : bh;
+    if ((uint64_t)bw > 32768 || (uint64_t)rows > 32768)
+        return (wn_handle)0;
+    size_t pix_off = 40;
+    const uint8_t *pal = NULL;
+    int pal_colors = 0;
+    size_t rowbytes;
+    if (bpp <= 8) {
+        uint32_t clr_used;
+        memcpy(&clr_used, dib + 32, 4);   /* biClrUsed */
+        pal_colors = (int)(clr_used ? clr_used : (1u << bpp));
+        pal = dib + 40;
+        pix_off = 40 + (size_t)pal_colors * 4;
+        rowbytes = bpp == 4 ? ((((size_t)bw + 1) / 2) + 3) & ~(size_t)3
+                           : (((size_t)bw) + 3) & ~(size_t)3;
+    } else {
+        rowbytes = (((size_t)bw * (size_t)(bpp / 8)) + 3) & ~(size_t)3;
+    }
+    if (pix_off + rowbytes * (size_t)rows > dib_size) {
+        wn_log(WN_LOG_WARN, "gdi32: RT_BITMAP DIB truncated (%u bytes)",
+               dib_size);
+        return (wn_handle)0;
+    }
+    gdi_obj *bmp = wn_xcalloc(1, sizeof *bmp);
+    if (!bmp)
+        return (wn_handle)0;
+    bmp->kind = GDI_BITMAP;
+    bmp->bmp.bits = wn_xcalloc((size_t)bw * (size_t)rows, 4);
+    if (!bmp->bmp.bits) {
+        free(bmp);
+        return (wn_handle)0;
+    }
+    bmp->bmp.w = bw;
+    bmp->bmp.h = rows;
+    bmp->bmp.bpp = 32;
+    bmp->bmp.bottom_up = 0;   /* normalized below */
+    const uint8_t *src = dib + pix_off;
+    for (int i = 0; i < rows; i++) {
+        int drow = bottom_up ? rows - 1 - i : i;
+        const uint8_t *sp = src + (size_t)i * rowbytes;
+        uint8_t *dp = bmp->bmp.bits + (size_t)drow * (size_t)bw * 4;
+        for (int x = 0; x < bw; x++) {
+            uint8_t *d = dp + (size_t)x * 4;
+            if (bpp == 24 || bpp == 32) {
+                const uint8_t *sd = sp + (size_t)x * (bpp / 8);
+                d[0] = sd[0]; d[1] = sd[1]; d[2] = sd[2]; d[3] = 0xFF;
+            } else {
+                int idx;
+                if (bpp == 4) {
+                    uint8_t byte = sp[x >> 1];
+                    idx = (x & 1) ? (byte & 0x0F) : (byte >> 4);
+                } else {
+                    idx = sp[x];
+                }
+                if (idx >= pal_colors)
+                    idx = pal_colors ? pal_colors - 1 : 0;
+                const uint8_t *q = pal + (size_t)idx * 4;  /* B G R res */
+                d[0] = q[0]; d[1] = q[1]; d[2] = q[2]; d[3] = 0xFF;
+            }
+        }
+    }
+    return gdi_new(bmp);
+}
+
+/* Cross-DLL helper (see wn_dll.h): a plain 32bpp bitmap object with real
+ * pixel storage — the shape CreateDIBSection hands out, usable by
+ * user32's LoadBitmap (OBM_* system bitmaps). Pixels are zero-initialized. */
+wn_handle wn_bitmap_handle_alloc(int w, int h)
+{
+    if (w <= 0 || h <= 0 || w > 32768 || h > 32768)
+        return (wn_handle)0;
+    gdi_obj *bmp = wn_xcalloc(1, sizeof *bmp);
+    if (!bmp)
+        return (wn_handle)0;
+    bmp->kind = GDI_BITMAP;
+    bmp->bmp.bits = wn_xcalloc((size_t)w * (size_t)h, 4);
+    if (!bmp->bmp.bits) {
+        free(bmp);
+        return (wn_handle)0;
+    }
+    bmp->bmp.w = w;
+    bmp->bmp.h = h;
+    bmp->bmp.bpp = 32;
+    bmp->bmp.bottom_up = 0;
+    return gdi_new(bmp);
+}
+
+/* CreateCompatibleBitmap: a bitmap matching the DC's format. Every WinNux
+ * drawing surface is 32bpp BGRA-style, so the format is independent of the
+ * DC; the size comes from the caller (the Inno wizard builds 32x32 buffers
+ * for its icon, and a NULL return here made VCL raise EOutOfResources). */
+static WN_API wn_handle g32_CreateCompatibleBitmap(wn_handle hdc,
+                                                   int32_t w, int32_t h)
+{
+    (void)hdc;
+    wn_handle r = wn_bitmap_handle_alloc(w, h);
+    if (!r)
+        wn_last_error_set(WN_ERR_INVALID_PARAMETER);
+    return r;
 }
 
 static WN_API wn_handle g32_GetStockObject(int32_t idx)
@@ -1048,6 +1390,35 @@ static WN_API int32_t g32_GetTextExtentPoint32W(wn_handle hdc,
     return 1;
 }
 
+/* GetTextExtentPoint(32)A/W: the pre-Windows-95 name of the same API. The
+ * Inno engine imports the short name; as a stub it wrote NOTHING into the
+ * caller's SIZE, so VCL layout math consumed stale stack garbage. */
+static WN_API int32_t g32_GetTextExtentPointA(wn_handle hdc, const char *s,
+                                              int32_t count, void *size)
+{
+    return g32_GetTextExtentPoint32A(hdc, s, count, size);
+}
+
+static WN_API int32_t g32_GetTextExtentPointW(wn_handle hdc,
+                                              const uint16_t *s,
+                                              int32_t count, void *size)
+{
+    return g32_GetTextExtentPoint32W(hdc, s, count, size);
+}
+
+/* GetCurrentPositionEx: report the DC's line-draw position (POINT = 2 LONGs,
+ * same layout for i386 and x64 guests). */
+static WN_API int32_t g32_GetCurrentPositionEx(wn_handle hdc, void *pt)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !pt)
+        return 0;
+    int32_t *p = pt;
+    p[0] = dc->dc.cur_x;
+    p[1] = dc->dc.cur_y;
+    return 1;
+}
+
 /* Measure the pixel width of a UTF-16 run with the DC's current font
  * (FreeType advances when available, average width otherwise). */
 static void measure_text16(gdi_obj *dc, const uint16_t *s, size_t n, int *out_w)
@@ -1329,6 +1700,13 @@ WN_API int32_t g32_DrawEdge(wn_handle hdc, void *rect, uint32_t edge,
 
 const wn_export_entry wn_gdi32_exports[] = {
     { "BitBlt", g32_BitBlt },
+    { "PatBlt", g32_PatBlt },
+    { "SetROP2", g32_SetROP2 },
+    { "UnrealizeObject", g32_UnrealizeObject },
+    { "GetObjectA", g32_GetObjectA },
+    { "CreateBrushIndirect", g32_CreateBrushIndirect },
+    { "CreatePenIndirect", g32_CreatePenIndirect },
+    { "CreateCompatibleBitmap", g32_CreateCompatibleBitmap },
     { "CreateCompatibleDC", g32_CreateCompatibleDC },
     { "CreateDIBSection", g32_CreateDIBSection },
     { "CreateFontA", g32_CreateFontA },
@@ -1340,6 +1718,9 @@ const wn_export_entry wn_gdi32_exports[] = {
     { "DrawEdge", g32_DrawEdge },
     { "GetTextExtentPoint32A", g32_GetTextExtentPoint32A },
     { "GetTextExtentPoint32W", g32_GetTextExtentPoint32W },
+    { "GetTextExtentPointA", g32_GetTextExtentPointA },
+    { "GetTextExtentPointW", g32_GetTextExtentPointW },
+    { "GetCurrentPositionEx", g32_GetCurrentPositionEx },
     { "GetTextMetricsA", g32_GetTextMetricsA },
     { "GetTextMetricsW", g32_GetTextMetricsW },
     { "CreatePen", g32_CreatePen },

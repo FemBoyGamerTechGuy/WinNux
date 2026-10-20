@@ -4,7 +4,33 @@ Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
 
-## P0 — installer bring-up (session 11's handoff, applies to the same goal)
+## P0 — installer bring-up (session 13 state)
+
+The reported movaps GUI crash is FIXED (M32ALIGN; see STATUS session-13).
+The wizard builds under Xvfb through TNewCheckListBox; /S and GUI converge
+at ONE remaining blocker, decoded to the exact engine check:
+
+0. TNewCheckListBox count check (engine+0x44e058, raise 'List item and
+   state item count mismatch'): Items.Count via [Self+0xfc] (TStrings
+   virtual) vs FState.Count ([Self+0x168]+8) diverge; the checklistbox
+   receives NO LB_ traffic before the raise, so one list is populated
+   through a path we haven't seen. NEXT: qemu -g + gdb break at 0x44e083,
+   dump both counts + [Self+0xfc]'s identity; or extend the Delphi decoder
+   to walk info[2].
+1. Solved (session 13, kept for history): the session-12 "engine data
+   corruption" WAS the registry-key use-after-free — RegCloseKey freed
+   tree-owned nodes and the next RegOpenKey walked recycled heap
+   (wn_handle_set_nofree fixed it; tripwire = 0 hits). The 0x401bb7
+   freelist-push crash should be re-tested against this fix before any
+   further heap-hunting.
+2. GetSystemMenu/DeleteMenu menus: DONE (session 13, real menu objects).
+3. RichEdit: RICHED20/RICHED32 DLLs missing — Inno falls back
+   (TRichEditViewer is created anyway); only matters if the license page
+   needs real rich text later.
+4. Session-11 wow64 width-bug pattern audit (struct readers/writers with
+   compile-time #if __x86_64__): still open.
+
+Older P0 notes (session 11/12 handoff):
 
 The reported PeekMessage pump bug is FIXED+verified; the LuaForWindows /S run
 now: outer instance extracts + spawns the is-*.tmp engine, the engine reads

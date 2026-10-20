@@ -328,6 +328,86 @@ static WN_API int32_t adv_GetUserNameW(uint16_t *buf, uint32_t *cap)
     return 1;
 }
 
+/* --- SIDs ----------------------------------------------------------------------
+ * AllocateAndInitializeSid builds a real S-1-5-20-style SID blob (revision,
+ * authority, sub-authorities). FreeSid releases ONLY SIDs we allocated
+ * (live registry below): a confused guest — fed garbage by unimplemented
+ * token stubs — once called FreeSid on stack/static pointers, and free()ing
+ * those aborted the process mid-install. Layout is byte-packed — identical
+ * in both word sizes. */
+
+static void *g_live_sids[256];
+
+static WN_API wn_abiword adv_AllocateAndInitializeSid(const void *authority,
+                                                      wn_abiword count_,
+                                                      wn_abiword sub0,
+                                                      wn_abiword sub1,
+                                                      wn_abiword sub2,
+                                                      wn_abiword sub3,
+                                                      wn_abiword sub4,
+                                                      wn_abiword sub5,
+                                                      wn_abiword sub6,
+                                                      wn_abiword sub7)
+{
+    if (!authority || (uintptr_t)authority < 0x10000)
+        return 0;
+    int count = (int)(uint32_t)count_;
+    if (count < 0 || count > 8) {
+        wn_last_error_set(87 /*ERROR_INVALID_PARAMETER*/);
+        return 0;
+    }
+    wn_abiword subs[8] = { sub0, sub1, sub2, sub3, sub4, sub5, sub6, sub7 };
+    size_t sz = 8 + 4 * (size_t)count;
+    uint8_t *sid = wn_xmalloc(sz);
+    memset(sid, 0, sz);
+    sid[0] = 1;                      /* SID_REVISION */
+    sid[1] = (uint8_t)count;
+    memcpy(sid + 2, authority, 6);   /* IdentifierAuthority (6 bytes) */
+    for (int i = 0; i < count; i++)
+        memcpy(sid + 8 + 4 * i, &subs[i], 4);
+    for (size_t i = 0; i < sizeof g_live_sids / sizeof g_live_sids[0]; i++) {
+        if (!g_live_sids[i]) {
+            g_live_sids[i] = sid;
+            break;
+        }
+    }
+    return (wn_abiword)(uintptr_t)sid;
+}
+
+/* FreeSid returns NULL on success (PSID-returning API, MSDN). Only SIDs
+ * from our AllocateAndInitializeSid are freed; foreign pointers get a loud
+ * WARN (a contract violation on the guest side, not a crash here). */
+static WN_API void *adv_FreeSid(wn_abiword sid)
+{
+    void *p = (void *)(uintptr_t)sid;
+    if (!p)
+        return NULL;
+    for (size_t i = 0; i < sizeof g_live_sids / sizeof g_live_sids[0]; i++) {
+        if (g_live_sids[i] == p) {
+            g_live_sids[i] = NULL;
+            free(p);
+            return NULL;
+        }
+    }
+    wn_log(WN_LOG_WARN, "advapi32: FreeSid(0x%llx) refused a pointer we "
+           "did not allocate", (unsigned long long)sid);
+    return NULL;
+}
+
+static WN_API int32_t adv_InitializeSid(wn_abiword sid, const void *authority,
+                                        uint8_t sub_count)
+{
+    uint8_t *sd = (uint8_t *)(uintptr_t)sid;
+    if (!sd || !authority || (uintptr_t)authority < 0x10000 ||
+        sub_count > 8)
+        return 0;
+    memset(sd, 0, 8 + 4 * sub_count);
+    sd[0] = 1;
+    sd[1] = sub_count;
+    memcpy(sd + 2, authority, 6);
+    return 1;
+}
+
 const wn_export_entry wn_advapi32_exports[] = {
     { "RegCloseKey", adv_RegCloseKey },
     { "RegCreateKeyExA", adv_RegCreateKeyExA },
@@ -347,5 +427,8 @@ const wn_export_entry wn_advapi32_exports[] = {
     { "RegSetValueExW", adv_RegSetValueExW },
     { "GetUserNameA", adv_GetUserNameA },
     { "GetUserNameW", adv_GetUserNameW },
+    { "AllocateAndInitializeSid", adv_AllocateAndInitializeSid },
+    { "FreeSid", adv_FreeSid },
+    { "InitializeSid", adv_InitializeSid },
     { NULL, NULL },
 };

@@ -69,4 +69,41 @@ const char *wn_dll_normalize_name(const char *name);
  * runtime so new builtins are picked up automatically. Returns 0 on success. */
 int  wn_dll_sync_placeholders(void);
 
+/* --- cross-DLL internal helpers (not guest exports) -------------------------
+ * Declared here so one builtin DLL can use another's machinery without
+ * reaching into its private state; defined next to what they wrap. */
+
+/* kernel32.c — resource walker: entry count / entry id of a resource TYPE
+ * directory (`type` = type-name string or MAKEINTRESOURCE id in the low
+ * word; the FindResource convention). wn_res_type_id_at returns -1 when the
+ * entry is string-named (id_out 0), 0 when type/index is absent. */
+int wn_res_type_count(uint64_t hmod, const char *type, uint32_t *count_out);
+int wn_res_type_id_at(uint64_t hmod, const char *type, uint32_t index,
+                      uint32_t *id_out);
+
+/* kernel32.c — FindResource + the DATA ENTRY's bytes in one step: the raw
+ * resource payload (mapped image bytes, valid while the module lives). */
+int wn_res_lookup_bytes(uint64_t hmod, const char *type, const char *name,
+                        const uint8_t **out, uint32_t *size_out);
+
+/* user32.c — allocate the shared HICON-handle shape (resource id + is_icon +
+ * owning module base for module icons): the same object LoadIconA hands
+ * out, so DestroyIcon and the icon drawing path treat it identically. */
+wn_handle wn_icon_handle_alloc(uint32_t id, int is_icon, uint64_t mod_base);
+
+/* gdi32.c — allocate the shared HBITMAP shape (32bpp pixel storage, the
+ * same object CreateDIBSection/CreateCompatibleBitmap hand out), for
+ * user32's LoadBitmap OBM_* path. */
+wn_handle wn_bitmap_handle_alloc(int w, int h);
+
+/* gdi32.c — blit a raw DIB (BITMAPINFOHEADER + pixels, 24/32bpp, top-down
+ * or bottom-up) into a DC, scaled to cx/cy; the pixel writer behind
+ * user32's DrawIconEx. */
+int wn_gdi_draw_dib(wn_handle hdc, int x, int y, int cx, int cy,
+                    const uint8_t *dib, uint32_t dib_size);
+
+/* gdi32.c — a loadable HBITMAP from a raw RT_BITMAP-style DIB, normalized
+ * to 32bpp top-down storage (behind user32's LoadBitmapA). */
+wn_handle wn_gdi_bitmap_from_dib(const uint8_t *dib, uint32_t dib_size);
+
 #endif /* WN_DLL_H */

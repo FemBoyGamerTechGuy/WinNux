@@ -87,6 +87,10 @@ typedef struct wn_window {
     int top_item;             /* list: first visible row */
     char **items;             /* list/combo: strings (malloc'd) */
     int n_items, items_cap;
+    uint64_t *item_data;      /* list/combo: LB_/CB_ per-item data (VCL's
+                              * TCheckListBox stores its state objects here;
+                              * NULL = all zero) */
+    uint8_t *sel_bits;        /* list: multi-select state (LB_SETSEL/GETSEL) */
     void *ctl_priv;           /* comctl32 private data (tree nodes etc.) */
     /* dialog support */
     int is_dialog;
@@ -1473,6 +1477,8 @@ fail:
     return 0;
 }
 
+static const void *g_last_create_caller;   /* guest site of CreateWindowEx* */
+
 /* Core creation path. lpsz_class_orig / lpsz_name_orig are the GUEST's
  * original class/title pointers (CreateWindowExA: the char* args;
  * CreateWindowExW: the guest's UTF-16 pointers) handed back inside the
@@ -1487,6 +1493,8 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
                                    wn_abiword hinst, void *param)
 {
     if (ensure_gui() != 0 && !parent) {
+        wn_log(WN_LOG_WARN, "user32: CreateWindow('%s') failed: no backend "
+               "for a top-level window", cls_name ? cls_name : "?");
         wn_last_error_set(WN_ERR_NOT_SUPPORTED);
         return 0;
     }
@@ -1497,6 +1505,9 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
     if (!cls) {
         cls = builtin_control_class(cls_name);
         if (!cls) {
+            wn_log(WN_LOG_WARN, "user32: CreateWindow('%s') failed: class "
+                   "not registered (RegisterClassA missing?)",
+                   cls_name ? cls_name : "?");
             wn_last_error_set(1407 /* ERROR_CLASS_DOES_NOT_EXIST */);
             return 0;
         }
@@ -1509,6 +1520,13 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
     if (parent && (style & 0x40000000u /*WS_CHILD*/)) {
         wn_window *pw = win_from_hwnd(parent);
         if (!pw) {
+            char gsite[96];
+            wn_module_describe_addr(g_last_create_caller, gsite,
+                                    sizeof gsite);
+            wn_log(WN_LOG_WARN, "user32: CreateWindow('%s') failed: parent "
+                   "hwnd 0x%llx is not a live window (guest site %s)",
+                   cls_name ? cls_name : "?", (unsigned long long)parent,
+                   gsite);
             wn_last_error_set(WN_ERR_INVALID_HANDLE);
             return 0;
         }
@@ -1545,6 +1563,9 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
                               x, y, win->cw, win->ch, style, ex_style,
                               (uint64_t)(uintptr_t)param,
                               lpsz_name_orig, lpsz_class_orig)) {
+            wn_log(WN_LOG_WARN, "user32: CreateWindow('%s') failed: the "
+                   "wndproc rejected creation (WM_CREATE verdict -1)",
+                   cls_name ? cls_name : "?");
             u32_DestroyWindow((wn_abiword)(uintptr_t)hwnd);
             wn_last_error_set(WN_ERR_NOT_SUPPORTED);
             return 0;
@@ -1579,6 +1600,8 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
     win->bwin = be->win_create(w, h, win->title, win);
     if (!win->bwin) {
         free(win);
+        wn_log(WN_LOG_WARN, "user32: CreateWindow('%s') failed: backend "
+               "win_create returned NULL", cls_name ? cls_name : "?");
         wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
         return 0;
     }
@@ -1611,6 +1634,9 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
                           x, y, w, h, style, ex_style,
                           (uint64_t)(uintptr_t)param,
                           lpsz_name_orig, lpsz_class_orig)) {
+        wn_log(WN_LOG_WARN, "user32: CreateWindow('%s') failed: the wndproc "
+               "rejected creation (WM_CREATE verdict -1)",
+               cls_name ? cls_name : "?");
         u32_DestroyWindow((wn_abiword)(uintptr_t)hwnd);
         wn_last_error_set(WN_ERR_NOT_SUPPORTED);
         return 0;
@@ -1630,6 +1656,7 @@ static WN_API uint64_t u32_CreateWindowExA(uint32_t ex_style, const char *cls_na
                                            wn_abiword parent, wn_abiword menu,
                                            wn_abiword hinst, void *param)
 {
+    g_last_create_caller = __builtin_return_address(0);
     return create_window_core(ex_style, cls_name, title,
                               (uint64_t)(uintptr_t)cls_name,
                               (uint64_t)(uintptr_t)title,
@@ -1668,6 +1695,17 @@ static WN_API int32_t u32_DestroyWindow(wn_abiword hwnd)
     if (w->in_destroy)
         return 1;
     w->in_destroy = 1;
+    {
+        /* Forensics (DEBUG): the guest call site of every DestroyWindow —
+         * VCL teardown vs RecreateWnd vs an app path are different sites. */
+        char where[96];
+        wn_module_describe_addr(__builtin_return_address(0), where,
+                                sizeof where);
+        wn_log(WN_LOG_DEBUG, "user32: DestroyWindow(0x%llx '%s') from %s",
+               (unsigned long long)hwnd,
+               w->title[0] ? w->title : (w->cls ? w->cls->name : "?"),
+               where);
+    }
     /* Destroy children first (Windows order). */
     for (int i = 0; i < g_hwnd_count; i++) {
         wn_window *c = g_hwnds[i].win;
@@ -1676,8 +1714,15 @@ static WN_API int32_t u32_DestroyWindow(wn_abiword hwnd)
     }
     /* WM_DESTROY goes through the proc directly (in-order with calls). */
     if (w->cls && (w->cls->proc || w->cls->proc32 || w->subclass ||
-                   w->subclass32))
+                   w->subclass32)) {
         call_guest_wndproc(w, hwnd, WN_WM_DESTROY, 0, 0);
+        /* Windows sends WM_NCDESTROY (0x82) AFTER WM_DESTROY; VCL zeroes
+         * FHandle in its WMNCDestroy handler. Skipping it left every
+         * destroyed window's FHandle stale on the guest side — the Inno
+         * recreate flow then built pages under dead parents and died with
+         * EOutOfResources('Error creating window'). */
+        call_guest_wndproc(w, hwnd, 0x82 /*WM_NCDESTROY*/, 0, 0);
+    }
     /* control payloads (tree view nodes, list items) */
     if (w->ctl_priv)
         tv_free(w);
@@ -2009,6 +2054,13 @@ static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
                                         wn_abiword wp, wn_abiword_s lp)
 {
     wn_window *w = win_from_hwnd(hwnd);
+    if (!w && hwnd) {
+        /* stale-handle counter: a message to a destroyed hwnd means the
+         * guest kept a dead FHandle (the Inno recreate flow's crash class). */
+        wn_log(WN_LOG_WARN, "user32: SendMessageA(msg=%u) to DEAD hwnd "
+               "0x%llx — handled by DefWindowProc", msg,
+               (unsigned long long)hwnd);
+    }
     if (w && ((w->cls && (w->cls->proc || w->cls->proc32)) ||
               w->subclass || w->subclass32))
         return call_guest_wndproc(w, (uint64_t)hwnd, msg,
@@ -2283,6 +2335,15 @@ extern WN_API uint32_t g32_SetBkColor(wn_handle hdc, uint32_t color);
 #define LB_GETTEXTLEN    0x018A
 #define LB_RESETCONTENT  0x0184
 #define LB_GETSELITEMS   0x0191
+#define LB_SETITEMDATA   0x019A
+#define LB_GETITEMDATA   0x0199
+#define LB_SETSEL        0x0185
+#define LB_GETSEL        0x0187
+#define LB_GETSELCOUNT   0x0190
+#define LB_FINDSTRING    0x018F
+#define LB_GETTOPINDEX   0x018E
+#define CB_SETITEMDATA   0x0151
+#define CB_GETITEMDATA   0x0150
 #define LB_SETCOLUMNWIDTH 0x019C
 #define LB_SETTOPINDEX   0x0197
 #define LB_GETSELITEMS   0x0191
@@ -2729,6 +2790,15 @@ static int ctl_items_reserve(wn_window *w, int need)
     char **ni = realloc(w->items, (size_t)cap * sizeof(char *));
     if (!ni)
         return -1;
+    uint64_t *nd = realloc(w->item_data, (size_t)cap * sizeof(uint64_t));
+    if (!nd) {
+        if (!w->item_data)
+            w->items = ni;   /* keep the strings; data stays NULL */
+        return -1;
+    }
+    memset(nd + w->n_items, 0,
+           (size_t)(cap - w->n_items) * sizeof(uint64_t));
+    w->item_data = nd;
     w->items = ni;
     w->items_cap = cap;
     return 0;
@@ -2742,12 +2812,37 @@ static int ctl_items_add(wn_window *w, const char *s)
     return w->n_items++;
 }
 
+/* LB_INSERTSTRING: insert at index, shifting item_data too (VCL's
+ * TCheckListBox inserts items at positions and keeps its state array
+ * aligned with the list). */
+static int ctl_items_insert(wn_window *w, int idx, const char *s)
+{
+    if (idx < 0 || idx > w->n_items)
+        return -1;
+    if (ctl_items_reserve(w, w->n_items + 1) != 0)
+        return -1;
+    memmove(&w->items[idx], &w->items[idx + 1],
+            (size_t)(w->n_items - idx) * sizeof(char *));
+    if (w->item_data)
+        memmove(&w->item_data[idx], &w->item_data[idx + 1],
+                (size_t)(w->n_items - idx) * sizeof(uint64_t));
+    w->items[idx] = wn_xstrdup(s ? s : "");
+    w->n_items++;
+    if (w->sel >= idx)
+        w->sel++;
+    return idx;
+}
+
 static void ctl_items_clear(wn_window *w)
 {
     for (int i = 0; i < w->n_items; i++)
         free(w->items[i]);
     free(w->items);
+    free(w->item_data);
+    free(w->sel_bits);
     w->items = NULL;
+    w->item_data = NULL;
+    w->sel_bits = NULL;
     w->n_items = w->items_cap = 0;
     w->sel = -1;
     w->top_item = 0;
@@ -3174,6 +3269,93 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         ctl_notify(w, 0x0300 /* EN_CHANGE */);
         return 0;
     }
+    case LB_INSERTSTRING: {
+        char *a = (lp && (wp & 1)) ? wn_utf16_to_utf8((const uint16_t *)(uintptr_t)lp, 4096)
+                                   : wn_xstrdup(lp ? (const char *)(uintptr_t)lp : "");
+        int idx = ctl_items_insert(w, (int)(int32_t)wp, a);
+        free(a);
+        ctl_repaint(w);
+        return (uint64_t)(idx >= 0 ? idx : -1);
+    }
+    case LB_SETITEMDATA:
+    case CB_SETITEMDATA: {
+        int idx = (int)(int32_t)wp;
+        if (idx < 0 || idx >= w->n_items)
+            return -1;            /* LB_ERR */
+        if (ctl_items_reserve(w, w->n_items) != 0)
+            return -1;
+        w->item_data[idx] = (uint64_t)lp;
+        return 0;
+    }
+    case LB_GETITEMDATA:
+    case CB_GETITEMDATA: {
+        int idx = (int)(int32_t)wp;
+        if (idx < 0 || idx >= w->n_items)
+            return -1;            /* LB_ERR */
+        return w->item_data ? w->item_data[idx] : 0;
+    }
+    case LB_SETSEL: {
+        /* wParam: select/deselect; lParam: index (-1 = all with wp=1) */
+        int idx = (int)(int32_t)(uint32_t)lp;
+        if (!w->sel_bits)
+            w->sel_bits = wn_xcalloc(w->n_items > 0 ? (size_t)w->n_items : 1, 1);
+        if (idx == -1) {
+            if (wp)
+                memset(w->sel_bits, 1, (size_t)w->n_items);
+            else
+                memset(w->sel_bits, 0, (size_t)w->n_items);
+        } else if (idx >= 0 && idx < w->n_items) {
+            w->sel_bits[idx] = (uint8_t)(wp ? 1 : 0);
+        }
+        ctl_repaint(w);
+        return 0;
+    }
+    case LB_GETSEL: {
+        int idx = (int)(int32_t)wp;
+        if (idx < 0 || idx >= w->n_items)
+            return -1;
+        if (!w->sel_bits)
+            return idx == w->sel ? 1 : 0;
+        return w->sel_bits[idx] ? 1 : 0;
+    }
+    case LB_GETSELCOUNT: {
+        if (!w->sel_bits)
+            return (w->sel >= 0) ? 1 : 0;
+        int c = 0;
+        for (int i = 0; i < w->n_items; i++)
+            c += w->sel_bits[i] ? 1 : 0;
+        return c;
+    }
+    case LB_GETSELITEMS: {
+        int want = (int)(int32_t)wp;
+        uint32_t *out = (uint32_t *)(uintptr_t)lp;
+        int n = 0;
+        if (!out || want < 0)
+            return -1;
+        for (int i = 0; i < w->n_items && n < want; i++) {
+            int on = w->sel_bits ? w->sel_bits[i] : (i == w->sel);
+            if (on)
+                out[n++] = (uint32_t)i;
+        }
+        return n;
+    }
+    case LB_FINDSTRING: {
+        int start = (int)(int32_t)wp;
+        char *a = (lp && (wp & 1)) ? wn_utf16_to_utf8((const uint16_t *)(uintptr_t)lp, 256)
+                                   : wn_xstrdup(lp ? (const char *)(uintptr_t)lp : "");
+        int found = -1;
+        for (int fi = 1; fi <= w->n_items; fi++) {
+            int i = (start + fi) % w->n_items;
+            if (a && w->items[i] &&
+                wn_strcaseprefix(w->items[i], a)) {
+                found = i;
+                break;
+            }
+        }
+        free(a);
+        return (uint64_t)(found >= 0 ? found : -1);
+    }
+    case LB_GETTOPINDEX: return (uint64_t)w->top_item;
     case LB_ADDSTRING:
     case CB_ADDSTRING: {
         char *a = (lp && (wp & 1)) ? wn_utf16_to_utf8((const uint16_t *)(uintptr_t)lp, 4096)
@@ -3193,6 +3375,9 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         free(w->items[idx]);
         memmove(&w->items[idx], &w->items[idx + 1],
                 (size_t)(w->n_items - idx - 1) * sizeof(char *));
+        if (w->item_data)
+            memmove(&w->item_data[idx], &w->item_data[idx + 1],
+                    (size_t)(w->n_items - idx - 1) * sizeof(uint64_t));
         w->n_items--;
         if (w->sel > idx) w->sel--;
         if (w->sel == idx) w->sel = -1;
@@ -3939,6 +4124,7 @@ static WN_API int32_t u32_GetWindowTextA(wn_abiword hwnd, char *buf, int32_t max
 typedef struct {
     uint32_t id;             /* numeric resource id or 0 for named */
     int is_icon;             /* 0 = cursor, 1 = icon */
+    uint64_t mod_base;       /* owning module image base (0 = builtin art) */
 } u32_res;
 
 static wn_handle res_handle(uint32_t id, int is_icon)
@@ -3946,7 +4132,25 @@ static wn_handle res_handle(uint32_t id, int is_icon)
     u32_res *r = wn_xcalloc(1, sizeof *r);
     r->id = id;
     r->is_icon = is_icon;
+    r->mod_base = 0;
     return wn_handle_alloc(WN_HTYPE_GFX, r);
+}
+
+static wn_handle res_handle_mod(uint32_t id, int is_icon, uint64_t mod_base)
+{
+    u32_res *r = wn_xcalloc(1, sizeof *r);
+    r->id = id;
+    r->is_icon = is_icon;
+    r->mod_base = mod_base;
+    return wn_handle_alloc(WN_HTYPE_GFX, r);
+}
+
+/* Cross-DLL helper (see wn_dll.h): shell32's ExtractIcon/SHGetFileInfo hand
+ * out the same handle shape LoadIconA does, so DestroyIcon and the drawing
+ * path treat them identically. */
+wn_handle wn_icon_handle_alloc(uint32_t id, int is_icon, uint64_t mod_base)
+{
+    return res_handle_mod(id, is_icon, mod_base);
 }
 
 static uint32_t res_name_to_id(const char *name, const char *const *names,
@@ -4014,6 +4218,10 @@ static WN_API wn_handle u32_LoadIconA(wn_abiword hinst, const char *name)
     }
     if (!id && name && name[0] == '#')
         id = res_name_to_id(name, g_idi_names, 100);
+    /* Numeric ids from a module: keep the module so DrawIconEx can walk the
+     * real RT_GROUP_ICON/RT_ICON pixels. */
+    if (id && (uintptr_t)name < 0x10000 && hinst)
+        return res_handle_mod(id, 1, (uint64_t)hinst);
     return res_handle(id, 1);
 }
 
@@ -4767,6 +4975,8 @@ static WN_API uint64_t u32_FindWindowA(const char *cls, const char *title)
     return 0;
 }
 
+static WN_API wn_handle u32_LoadBitmapA(wn_abiword hinst, const char *name);
+
 static WN_API wn_handle u32_LoadImageA(wn_abiword hinst, const char *name,
                                        uint32_t type, int32_t cx, int32_t cy,
                                        uint32_t load)
@@ -4774,9 +4984,563 @@ static WN_API wn_handle u32_LoadImageA(wn_abiword hinst, const char *name,
     (void)cx; (void)cy; (void)load;
     if (type == 1 /*IMAGE_ICON*/)
         return u32_LoadIconA(hinst, name);
+    if (type == 0 /*IMAGE_BITMAP*/)
+        return u32_LoadBitmapA(hinst, name);
     wn_log(WN_LOG_WARN, "user32: LoadImageA(type=%u '%s') bitmaps not "
            "supported yet", type, (name && (uintptr_t)name >= 0x10000) ? name : "#int");
     return (wn_handle)0;
+}
+
+/* LoadBitmapA: MAKEINTRESOURCE ids are the OBM_* system bitmaps (same
+ * 13x13 placeholder art — documented gap); named resources are RT_BITMAP
+ * DIBs walked out of the caller's module — the Inno engine loads its
+ * wizard imagery ('MAINIMAGE', 'STOPIMAGE', ...) that way. */
+static WN_API wn_handle u32_LoadBitmapA(wn_abiword hinst, const char *name)
+{
+    if ((uintptr_t)name < 0x10000) {
+        uint32_t id = (uint32_t)(uintptr_t)name;
+        (void)id;   /* OBM_* ids all get the same 13x13 placeholder */
+        return (wn_handle)(uintptr_t)wn_bitmap_handle_alloc(13, 13);
+    }
+    if (!name || !*name)
+        return (wn_handle)0;
+    const uint8_t *dib = NULL;
+    uint32_t dsz = 0;
+    if (wn_res_lookup_bytes((uint64_t)hinst, (const char *)(uintptr_t)2
+                            /* RT_BITMAP */, name, &dib, &dsz)) {
+        wn_handle h = wn_gdi_bitmap_from_dib(dib, dsz);
+        if (h)
+            return h;
+        return (wn_handle)0;   /* unsupported DIB: honest failure (logged) */
+    }
+    wn_log(WN_LOG_WARN, "user32: LoadBitmapA('%s'): bitmap resource not "
+           "found", name);
+    return (wn_handle)0;
+}
+
+/* --- menus --------------------------------------------------------------------
+ * Real menu objects: VCL's TMainMenu/TApplication path builds a menu with
+ * CreateMenu+AppendMenu and every stubbed return made Inno abort the wizard
+ * (the "Error creating window" teardown). Handles are WN_HTYPE_GFX objects
+ * like every other user32 thing that must survive wn_handle_close paths. */
+
+typedef struct {
+    int      kind;        /* 0 = item, 1 = separator, 2 = popup */
+    uint32_t id;          /* command id (or SC_* for system menus) */
+    uint32_t flags;
+    int      enabled;
+    int      checked;
+    wn_handle submenu;   /* popup */
+    char     text[80];
+} u32_menu_item;
+
+typedef struct {
+    u32_menu_item *items;
+    int count, cap;
+    int is_sysmenu;
+} u32_menu;
+
+static wn_handle menu_alloc(int is_sysmenu)
+{
+    u32_menu *m = wn_xcalloc(1, sizeof *m);
+    m->is_sysmenu = is_sysmenu;
+    return wn_handle_alloc(WN_HTYPE_GFX, m);
+}
+
+static u32_menu *menu_get(wn_handle h)
+{
+    wn_object *o = wn_handle_get(h, WN_HTYPE_GFX);
+    if (!o || !o->ptr)
+        return NULL;
+    return o->ptr;    /* menu objects live in the GFX pool like the rest */
+}
+
+static WN_API wn_handle u32_CreateMenu(void)
+{
+    return menu_alloc(0);
+}
+
+static WN_API wn_handle u32_CreatePopupMenu(void)
+{
+    return menu_alloc(0);
+}
+
+static WN_API int32_t u32_DestroyMenu(wn_handle h)
+{
+    u32_menu *m = menu_get(h);
+    if (!m)
+        return 0;
+    /* popups are owned: kill them with the parent (Windows semantics) */
+    for (int i = 0; i < m->count; i++)
+        if (m->items[i].kind == 2 && m->items[i].submenu)
+            u32_DestroyMenu(m->items[i].submenu);
+    free(m->items);
+    wn_handle_close(h);
+    return 1;
+}
+
+static int menu_item_push(u32_menu *m, const u32_menu_item *it)
+{
+    if (m->count == m->cap) {
+        int ncap = m->cap ? m->cap * 2 : 16;
+        u32_menu_item *ni = realloc(m->items, (size_t)ncap * sizeof *ni);
+        if (!ni)
+            return 0;
+        m->items = ni;
+        m->cap = ncap;
+    }
+    m->items[m->count++] = *it;
+    return 1;
+}
+
+/* MF_ flags (winuser.h) */
+#define MF_BYCOMMAND_ 0x0000
+#define MF_GRAYED_    0x0001
+#define MF_DISABLED_  0x0002
+#define MF_POPUP_     0x0010
+#define MF_SEPARATOR_ 0x0800
+#define MF_BYPOSITION_ 0x0400
+
+static int menu_append_core(wn_handle hmenu, uint32_t flags, uint32_t id,
+                            const char *text)
+{
+    u32_menu *m = menu_get(hmenu);
+    if (!m) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    u32_menu_item it = { 0 };
+    if (flags & MF_SEPARATOR_) {
+        it.kind = 1;
+    } else if (flags & MF_POPUP_) {
+        it.kind = 2;
+        it.submenu = (wn_handle)(uintptr_t)id;  /* uIDNewItem carries the submenu handle */
+        if (text)
+            snprintf(it.text, sizeof it.text, "%s", text);
+    } else {
+        it.kind = 0;
+        it.id = id;
+        if (text)
+            snprintf(it.text, sizeof it.text, "%s", text);
+    }
+    it.flags = flags;
+    it.enabled = !(flags & (MF_GRAYED_ | MF_DISABLED_));
+    if (!menu_item_push(m, &it))
+        return 0;
+    return 1;
+}
+
+static WN_API int32_t u32_AppendMenuA(wn_handle hmenu, uint32_t flags,
+                                      wn_abiword id_or_sub, const char *text)
+{
+    /* MF_BITMAP/MF_OWNERDRAW items: keep the raw payload, no pixels yet. */
+    if (flags & 0x0004 /*MF_BITMAP*/) {
+        wn_log(WN_LOG_DEBUG, "user32: AppendMenuA MF_BITMAP item (no "
+               "pixels yet)");
+        flags &= ~0x0004u;
+    }
+    return menu_append_core(hmenu, flags, (uint32_t)id_or_sub, text);
+}
+
+static WN_API int32_t u32_AppendMenuW(wn_handle hmenu, uint32_t flags,
+                                      wn_abiword id_or_sub,
+                                      const uint16_t *text)
+{
+    char *a = (text && (uintptr_t)text >= 0x10000)
+              ? wn_utf16_to_utf8(text, 80) : NULL;
+    int32_t r = menu_append_core(hmenu, flags, (uint32_t)id_or_sub, a);
+    free(a);
+    return r;
+}
+
+static int menu_find(u32_menu *m, uint32_t what, uint32_t flags, int *idx)
+{
+    if (flags & MF_BYPOSITION_) {
+        if ((int)what >= m->count)
+            return 0;
+        *idx = (int)what;
+        return 1;
+    }
+    for (int i = 0; i < m->count; i++)
+        if (m->items[i].kind != 1 && m->items[i].id == what) {
+            *idx = i;
+            return 1;
+        }
+    return 0;
+}
+
+static WN_API int32_t u32_DeleteMenu(wn_handle hmenu, uint32_t what,
+                                     uint32_t flags)
+{
+    u32_menu *m = menu_get(hmenu);
+    int idx;
+    if (!m || !menu_find(m, what, flags, &idx)) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    if (m->items[idx].kind == 2 && m->items[idx].submenu)
+        u32_DestroyMenu(m->items[idx].submenu);
+    memmove(&m->items[idx], &m->items[idx + 1],
+            (size_t)(m->count - idx - 1) * sizeof *m->items);
+    m->count--;
+    return 1;
+}
+
+static WN_API int32_t u32_RemoveMenu(wn_handle hmenu, uint32_t what,
+                                     uint32_t flags)
+{
+    u32_menu *m = menu_get(hmenu);
+    int idx;
+    if (!m || !menu_find(m, what, flags, &idx)) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    memmove(&m->items[idx], &m->items[idx + 1],
+            (size_t)(m->count - idx - 1) * sizeof *m->items);
+    m->count--;
+    return 1;
+}
+
+static WN_API int32_t u32_EnableMenuItem(wn_handle hmenu, uint32_t what,
+                                         uint32_t flags)
+{
+    u32_menu *m = menu_get(hmenu);
+    int idx;
+    if (!m || !menu_find(m, what, flags, &idx))
+        return (uint32_t)-1;
+    int was = m->items[idx].enabled ? 0 /*MF_ENABLED*/ : (MF_GRAYED_ | 1);
+    if (flags & (MF_GRAYED_ | MF_DISABLED_))
+        m->items[idx].enabled = 0;
+    else if (flags & 0x0000 /*MF_ENABLED via not-disabled*/)
+        m->items[idx].enabled = 1;
+    return was;
+}
+
+static WN_API int32_t u32_GetMenuItemCount(wn_handle hmenu)
+{
+    u32_menu *m = menu_get(hmenu);
+    return m ? m->count : (int32_t)-1;
+}
+
+static WN_API wn_abiword u32_GetMenuItemID(wn_handle hmenu, int32_t pos)
+{
+    u32_menu *m = menu_get(hmenu);
+    if (!m || pos < 0 || pos >= m->count)
+        return (wn_abiword)(uint32_t)-1;
+    if (m->items[pos].kind == 1)
+        return 0;                    /* separator */
+    if (m->items[pos].kind == 2)
+        return (wn_abiword)(uint32_t)-1; /* popup */
+    return (wn_abiword)m->items[pos].id;
+}
+
+/* hwnd -> attached menu + per-window system menu. Bounded parallel tables
+ * (the window objects live in a private struct we don't own here). */
+static struct { uint64_t hwnd; wn_handle menu; wn_handle sysmenu; } g_win_menus[WN_USER32_MAX_WINDOWS];
+
+static int menu_slot_of(uint64_t hwnd)
+{
+    for (int i = 0; i < WN_USER32_MAX_WINDOWS; i++)
+        if (g_win_menus[i].hwnd == hwnd)
+            return i;
+    return -1;
+}
+
+static int menu_slot_alloc(uint64_t hwnd)
+{
+    int i = menu_slot_of(hwnd);
+    if (i >= 0)
+        return i;
+    for (i = 0; i < WN_USER32_MAX_WINDOWS; i++)
+        if (!g_win_menus[i].hwnd) {
+            g_win_menus[i].hwnd = hwnd;
+            return i;
+        }
+    return -1;
+}
+
+static WN_API int32_t u32_SetMenu(wn_abiword hwnd, wn_handle hmenu)
+{
+    if (hmenu && !menu_get(hmenu))
+        return 0;
+    int i = menu_slot_alloc(hwnd);
+    if (i < 0)
+        return 0;
+    g_win_menus[i].menu = hmenu;
+    return 1;
+}
+
+static WN_API wn_handle u32_GetMenu(wn_abiword hwnd)
+{
+    int i = menu_slot_of(hwnd);
+    return (i >= 0) ? g_win_menus[i].menu : (wn_handle)0;
+}
+
+static WN_API wn_handle u32_GetSystemMenu(wn_abiword hwnd, wn_abiword revert)
+{
+    int i = menu_slot_alloc(hwnd);
+    if (i < 0)
+        return (wn_handle)0;
+    if (revert) {
+        /* TRUE = reset back to the default system menu */
+        if (g_win_menus[i].sysmenu)
+            u32_DestroyMenu(g_win_menus[i].sysmenu);
+        g_win_menus[i].sysmenu = (wn_handle)0;
+    }
+    if (!g_win_menus[i].sysmenu) {
+        wn_handle h = menu_alloc(1);
+        u32_menu *m = menu_get(h);
+        struct { const char *txt; uint32_t id; uint32_t fl; } defs[] = {
+            { "&Restore",  0xF120 /*SC_RESTORE*/,  0x0000 },
+            { "&Move",     0xF010 /*SC_MOVE*/,     0x0000 },
+            { "&Size",     0xF000 /*SC_SIZE*/,      0x0000 },
+            { "Mi&nimize", 0xF020 /*SC_MINIMIZE*/, 0x0000 },
+            { "Ma&ximize", 0xF030 /*SC_MAXIMIZE*/, 0x0000 },
+            { "",          0,                      MF_SEPARATOR_ },
+            { "&Close",    0xF060 /*SC_CLOSE*/,    0x0000 },
+        };
+        for (size_t k = 0; k < sizeof defs / sizeof defs[0]; k++) {
+            u32_menu_item it = { 0 };
+            if (defs[k].fl & MF_SEPARATOR_) {
+                it.kind = 1;
+            } else {
+                it.kind = 0;
+                it.id = defs[k].id;
+                snprintf(it.text, sizeof it.text, "%s", defs[k].txt);
+            }
+            it.flags = defs[k].fl;
+            it.enabled = 1;
+            menu_item_push(m, &it);
+        }
+        g_win_menus[i].sysmenu = h;
+    }
+    return g_win_menus[i].sysmenu;
+}
+
+static WN_API int32_t u32_DrawMenuBar(wn_abiword hwnd)
+{
+    (void)hwnd;   /* the X backend paints no native menu bars yet */
+    return 1;
+}
+
+static WN_API int32_t u32_GetMenuState(wn_handle hmenu, uint32_t what,
+                                       uint32_t flags)
+{
+    u32_menu *m = menu_get(hmenu);
+    int idx;
+    if (!m || !menu_find(m, what, flags, &idx))
+        return (uint32_t)-1;
+    u32_menu_item *it = &m->items[idx];
+    if (it->kind == 1)
+        return MF_SEPARATOR_;
+    uint32_t st = 0;
+    if (!it->enabled)
+        st |= MF_GRAYED_ | MF_DISABLED_;
+    if (it->checked)
+        st |= 0x0008 /*MF_CHECKED*/;
+    return (int32_t)st;
+}
+
+/* --- window properties ---------------------------------------------------------
+ * VCL stores its ControlOfs map on every windowed control via SetProp(atom);
+ * stubs returning 0 made the property set silently absent. Keys compare raw
+ * (VCL uses int atoms; string-keyed props match by pointer — documented). */
+typedef struct u32_prop {
+    uint64_t key;
+    uint64_t data;
+    struct u32_prop *next;
+} u32_prop;
+
+static u32_prop *g_props[WN_USER32_MAX_WINDOWS * 2];
+
+static uint32_t prop_slot(uint64_t hwnd)
+{
+    uint64_t h = (uint64_t)(uintptr_t)hwnd;
+    return (uint32_t)((h >> 3) * 2654435761u %
+                      (WN_USER32_MAX_WINDOWS * 2));
+}
+
+static WN_API int32_t u32_SetPropA(wn_abiword hwnd, wn_abiword key,
+                                   wn_abiword data)
+{
+    if (!win_from_hwnd(hwnd)) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    uint32_t sp = prop_slot(hwnd);
+    for (u32_prop *p = g_props[sp]; p; p = p->next)
+        if (p->key == (uint64_t)key) {
+            p->data = data;
+            return 1;
+        }
+    u32_prop *p = wn_xcalloc(1, sizeof *p);
+    p->key = key;
+    p->data = data;
+    p->next = g_props[sp];
+    g_props[sp] = p;
+    return 1;
+}
+
+static WN_API wn_abiword u32_GetPropA(wn_abiword hwnd, wn_abiword key)
+{
+    uint32_t sp = prop_slot(hwnd);
+    for (u32_prop *p = g_props[sp]; p; p = p->next)
+        if (p->key == (uint64_t)key)
+            return p->data;
+    return 0;
+}
+
+static WN_API wn_abiword u32_RemovePropA(wn_abiword hwnd, wn_abiword key)
+{
+    uint32_t sp = prop_slot(hwnd);
+    u32_prop **pp = &g_props[sp];
+    for (u32_prop *p = g_props[sp]; p; pp = &p->next, p = p->next)
+        if (p->key == (uint64_t)key) {
+            *pp = p->next;
+            uint64_t d = p->data;
+            free(p);
+            return d;
+        }
+    return 0;
+}
+
+/* --- scroll state ----------------------------------------------------------------
+ * Per-window SB_HORZ/SB_VERT position ranges. SCROLLINFO is all DWORDs
+ * (cbSize@0 fMask@4 nMin@8 nMax@0xC nPage@0x10 nPos@0x14 nTrackPos@0x18):
+ * identical layout in both guest word sizes. */
+static struct {
+    uint64_t hwnd;
+    int32_t min[2], max[2], pos[2], page[2];
+} g_scrollbars[WN_USER32_MAX_WINDOWS];
+
+static int scroll_slot(uint64_t hwnd, int create)
+{
+    for (int i = 0; i < WN_USER32_MAX_WINDOWS; i++)
+        if (g_scrollbars[i].hwnd == hwnd)
+            return i;
+    if (!create)
+        return -1;
+    for (int i = 0; i < WN_USER32_MAX_WINDOWS; i++)
+        if (!g_scrollbars[i].hwnd) {
+            g_scrollbars[i].hwnd = hwnd;
+            return i;
+        }
+    return -1;
+}
+
+#define SIF_RANGE_ 0x0001
+#define SIF_PAGE_  0x0002
+#define SIF_POS_   0x0004
+#define SB_HORZ_   0
+#define SB_VERT_   1
+
+static WN_API int32_t u32_SetScrollInfo(wn_abiword hwnd, int32_t bar,
+                                        const void *info, int32_t redraw)
+{
+    (void)redraw;
+    if (bar != SB_HORZ_ && bar != SB_VERT_)
+        return 0;
+    int i = scroll_slot(hwnd, 1);
+    if (i < 0)
+        return 0;
+    const uint32_t *si = info;
+    if (!si || si[0] < 0x14)
+        return 0;
+    uint32_t mask = si[1];
+    int b = bar;
+    if (mask & SIF_RANGE_) {
+        g_scrollbars[i].min[b] = (int32_t)si[2];
+        g_scrollbars[i].max[b] = (int32_t)si[3];
+    }
+    if (mask & SIF_PAGE_)
+        g_scrollbars[i].page[b] = (int32_t)si[4];
+    if (mask & SIF_POS_)
+        g_scrollbars[i].pos[b] = (int32_t)si[5];
+    if (g_scrollbars[i].max[b] < g_scrollbars[i].min[b])
+        g_scrollbars[i].max[b] = g_scrollbars[i].min[b];
+    if (g_scrollbars[i].pos[b] < g_scrollbars[i].min[b])
+        g_scrollbars[i].pos[b] = g_scrollbars[i].min[b];
+    if (g_scrollbars[i].pos[b] > g_scrollbars[i].max[b])
+        g_scrollbars[i].pos[b] = g_scrollbars[i].max[b];
+    return g_scrollbars[i].pos[b];
+}
+
+static WN_API int32_t u32_GetScrollInfo(wn_abiword hwnd, int32_t bar, void *info)
+{
+    if (bar != SB_HORZ_ && bar != SB_VERT_)
+        return 0;
+    int i = scroll_slot(hwnd, 0);
+    uint32_t *si = info;
+    if (!si || si[0] < 0x14)
+        return 0;
+    uint32_t mask = si[1];
+    if (i >= 0) {
+        int b = bar;
+        if (mask & SIF_RANGE_) {
+            si[2] = (uint32_t)g_scrollbars[i].min[b];
+            si[3] = (uint32_t)g_scrollbars[i].max[b];
+        }
+        if (mask & SIF_PAGE_)
+            si[4] = (uint32_t)g_scrollbars[i].page[b];
+        if (mask & SIF_POS_)
+            si[5] = (uint32_t)g_scrollbars[i].pos[b];
+        if (mask & 0x0010 /*SIF_TRACKPOS*/)
+            si[6] = (uint32_t)g_scrollbars[i].pos[b];
+    } else {
+        if (mask & SIF_RANGE_) {
+            si[2] = 0;
+            si[3] = 100;
+        }
+        if (mask & SIF_PAGE_)
+            si[4] = 1;
+        if (mask & SIF_POS_)
+            si[5] = 0;
+        if (mask & 0x0010)
+            si[6] = 0;
+    }
+    return 1;
+}
+
+static WN_API int32_t u32_GetScrollPos(wn_abiword hwnd, int32_t bar)
+{
+    if (bar != SB_HORZ_ && bar != SB_VERT_)
+        return 0;
+    int i = scroll_slot(hwnd, 0);
+    return i >= 0 ? g_scrollbars[i].pos[bar] : 0;
+}
+
+static WN_API int32_t u32_SetScrollPos(wn_abiword hwnd, int32_t bar,
+                                       int32_t pos, int32_t redraw)
+{
+    (void)redraw;
+    if (bar != SB_HORZ_ && bar != SB_VERT_)
+        return 0;
+    int i = scroll_slot(hwnd, 1);
+    if (i < 0)
+        return 0;
+    int old = g_scrollbars[i].pos[bar];
+    g_scrollbars[i].pos[bar] = pos;
+    return old;
+}
+
+/* SendNotifyMessage: same-thread windows get it synchronously (Windows only
+ * defers cross-thread sends); our runtime is single-threaded per guest. */
+static WN_API wn_abiword_s u32_SendNotifyMessageA(wn_abiword hwnd,
+                                                  uint32_t msg,
+                                                  wn_abiword wp,
+                                                  wn_abiword_s lp)
+{
+    return u32_SendMessageA(hwnd, msg, wp, lp);
+}
+
+/* IsRectEmpty: a RECT is 4 LONGs (32-bit in every guest word size); TRUE
+ * when the rectangle has no area (right<=left or bottom<=top). */
+static WN_API int32_t u32_IsRectEmpty(const void *rect)
+{
+    if (!rect)
+        return 1;
+    const int32_t *r = rect;
+    return (r[2] <= r[0] || r[3] <= r[1]) ? 1 : 0;
 }
 
 static WN_API int32_t u32_DestroyIcon(wn_handle icon)
@@ -4785,6 +5549,86 @@ static WN_API int32_t u32_DestroyIcon(wn_handle icon)
         return 0;
     wn_handle_close(icon);
     return 1;
+}
+
+/* --- icon drawing ------------------------------------------------------------------
+ * Module icons carry their owning image (ExtractIconA/LoadIconA(hinst,#n));
+ * DrawIconEx walks the module's RT_GROUP_ICON, picks the entry closest to
+ * the requested size, and blits the real RT_ICON DIB pixels through gdi32.
+ * Builtin IDI_* pixel art is still pending (documented gap): those draws
+ * succeed without painting — callers check the return value, not pixels. */
+
+#define U32_RT_ICON       ((const char *)(uintptr_t)3)
+#define U32_RT_GROUP_ICON ((const char *)(uintptr_t)14)
+
+static int draw_icon_pixels(wn_handle hdc, uint64_t mod_base, uint32_t group_id,
+                            int x, int y, int cx, int cy)
+{
+    const uint8_t *grp = NULL;
+    uint32_t gsz = 0;
+    if (!mod_base || !group_id ||
+        !wn_res_lookup_bytes(mod_base, U32_RT_GROUP_ICON,
+                             (const char *)(uintptr_t)group_id, &grp, &gsz) ||
+        gsz < 6)
+        return 0;
+    uint16_t count;
+    memcpy(&count, grp + 4, 2);   /* NEWHEADER: Res@0(2)=0, Type@2(2)=1, Count@4 */
+    if (!count || gsz < 6 + (uint32_t)count * 14)
+        return 0;
+    /* GRPICONENTRY[14]: bWidth@0, bHeight@1, ..., nID@12. Pick the entry
+     * closest to (cx,cy); 0 means 256. */
+    int best = 0;
+    long best_score = 0x7FFFFFFFL;
+    for (int i = 0; i < count; i++) {
+        const uint8_t *e = grp + 6 + (size_t)i * 14;
+        int ew = e[0] ? e[0] : 256;
+        int eh = e[1] ? e[1] : 256;
+        long score = (long)(ew - cx) * (ew - cx) + (long)(eh - cy) * (eh - cy);
+        if (score < best_score) {
+            best_score = score;
+            best = i;
+        }
+    }
+    uint32_t icon_id;
+    memcpy(&icon_id, grp + 6 + (size_t)best * 14 + 12, 4);
+    const uint8_t *dib = NULL;
+    uint32_t dsz = 0;
+    if (!wn_res_lookup_bytes(mod_base, U32_RT_ICON,
+                             (const char *)(uintptr_t)icon_id, &dib, &dsz))
+        return 0;
+    return wn_gdi_draw_dib(hdc, x, y, cx, cy, dib, dsz);
+}
+
+static WN_API int32_t u32_DrawIconEx(wn_handle hdc, int32_t x, int32_t y,
+                                     wn_handle icon, int32_t cx, int32_t cy,
+                                     uint32_t istep, wn_abiword hbr,
+                                     uint32_t flags)
+{
+    (void)istep; (void)hbr; (void)flags;   /* flicker-free draw, steps: later */
+    wn_object *o = wn_handle_get(icon, WN_HTYPE_GFX);
+    if (!o || !o->ptr) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    u32_res *r = o->ptr;
+    int w = cx > 0 ? cx : 32;
+    int h = cy > 0 ? cy : 32;
+    if (r->is_icon && r->mod_base) {
+        if (draw_icon_pixels(hdc, r->mod_base, r->id, x, y, w, h))
+            return 1;
+        wn_log(WN_LOG_DEBUG, "user32: DrawIconEx module icon %u: pixel "
+               "walk failed", r->id);
+        return 1;
+    }
+    wn_log(WN_LOG_DEBUG, "user32: DrawIconEx builtin icon id=%u: art "
+           "pending — no-op success", r->id);
+    return 1;
+}
+
+static WN_API int32_t u32_DrawIcon(wn_handle hdc, int32_t x, int32_t y,
+                                   wn_handle icon)
+{
+    return u32_DrawIconEx(hdc, x, y, icon, 32, 32, 0, 0, 0);
 }
 
 /* --- caret (single global caret, drawn by the focused Edit) --------------------- */
@@ -5161,6 +6005,33 @@ const wn_export_entry wn_user32_exports[] = {
     { "SendDlgItemMessageW", u32_SendDlgItemMessageW },
     { "FindWindowA", u32_FindWindowA },
     { "LoadImageA", u32_LoadImageA },
+    { "LoadBitmapA", u32_LoadBitmapA },
+    { "IsRectEmpty", u32_IsRectEmpty },
+    { "DrawIconEx", u32_DrawIconEx },
+    { "DrawIcon", u32_DrawIcon },
+    { "CreateMenu", u32_CreateMenu },
+    { "CreatePopupMenu", u32_CreatePopupMenu },
+    { "DestroyMenu", u32_DestroyMenu },
+    { "AppendMenuA", u32_AppendMenuA },
+    { "AppendMenuW", u32_AppendMenuW },
+    { "DeleteMenu", u32_DeleteMenu },
+    { "RemoveMenu", u32_RemoveMenu },
+    { "EnableMenuItem", u32_EnableMenuItem },
+    { "GetMenuItemCount", u32_GetMenuItemCount },
+    { "GetMenuItemID", u32_GetMenuItemID },
+    { "GetMenuState", u32_GetMenuState },
+    { "SetMenu", u32_SetMenu },
+    { "GetMenu", u32_GetMenu },
+    { "GetSystemMenu", u32_GetSystemMenu },
+    { "DrawMenuBar", u32_DrawMenuBar },
+    { "SetPropA", u32_SetPropA },
+    { "GetPropA", u32_GetPropA },
+    { "RemovePropA", u32_RemovePropA },
+    { "SetScrollInfo", u32_SetScrollInfo },
+    { "GetScrollInfo", u32_GetScrollInfo },
+    { "GetScrollPos", u32_GetScrollPos },
+    { "SetScrollPos", u32_SetScrollPos },
+    { "SendNotifyMessageA", u32_SendNotifyMessageA },
     { "DestroyIcon", u32_DestroyIcon },
     { "CreateCaret", u32_CreateCaret },
     { "DestroyCaret", u32_DestroyCaret },

@@ -41,4 +41,10 @@ fi
 # re-routes child spawns through the same qemu+winnux32 loop.
 export WINNUX_CHILD_CMD="$QEMU -L $SYSROOT $W32"
 
+# 32-bit GUI: winnux32 dlopen()s libX11.so.6 / libfreetype.so.6 at runtime.
+# qemu-user's -L prefix only covers the ELF interpreter + DT_NEEDED of the
+# main binary — GUEST-initiated dlopen() opens hit REAL filesystem paths.
+# Point LD_LIBRARY_PATH at the i386 libs extracted under root32 (real paths).
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$SYSROOT/usr/lib/i386-linux-gnu:$SYSROOT/usr/lib32"
+
 exec "$QEMU" -L "$SYSROOT" "$W32" run "$@"

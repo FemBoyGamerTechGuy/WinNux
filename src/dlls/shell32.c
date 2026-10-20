@@ -3,13 +3,16 @@
  * REAL: CommandLineToArgvW (full Windows quoting rules), SHGetFolderPath /
  * SHGetSpecialFolderPath (prefix-backed user/profile dirs, CSIDL_FLAG_CREATE
  * honored), IsUserAnAdmin (euid check), ShellExecuteA/W + Ex (URLs and files
- * through xdg-open, .exe/.bat re-launched through our own loader).
+ * through xdg-open, .exe/.bat re-launched through our own loader),
+ * ExtractIconA/W + SHGetFileInfoA/W (module RT_GROUP_ICON walk + the shared
+ * LoadIconA handle shape — the Inno wizard icon path).
  */
 #include "wn_dll.h"
 #include "wn_log.h"
 #include "wn_process.h"
 #include "wn_util.h"
 #include "wn_path.h"
+#include "wn_wow64.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -422,6 +425,233 @@ static WN_API int32_t sh_ShellExecuteExW(void *info)
     return r;
 }
 
+/* --- ExtractIconA/W + SHGetFileInfoA/W --------------------------------------
+ * The Inno Setup engine loads its wizard icon through these two (plus a
+ * SHGetFileInfo folder-icon query for the destination page); as stubs they
+ * returned 0 and the engine's checked-call raised a Delphi exception
+ * (0x0EEDFACE) right at TMainForm/TWizardForm creation. Both now serve the
+ * same drawable HICON shape LoadIconA hands out. */
+
+/* RT_GROUP_ICON (winuser.h resource type ids) in MAKEINTRESOURCE form. */
+#define SH_RT_GROUP_ICON ((const char *)(uintptr_t)14)
+
+static uint64_t sh_extract_icon_core(wn_abiword hinst, const char *exename,
+                                     uint32_t index)
+{
+    if (!exename || (uintptr_t)exename < 0x10000) {
+        wn_last_error_set(87 /*ERROR_INVALID_PARAMETER*/);
+        return 0;
+    }
+    /* Windows reads the icons of the FILE lpszExeName names; we serve
+     * loaded modules (the engine passes its own path, which is one). */
+    wn_module *m = NULL;
+    {
+        const char *bs = strrchr(exename, '\\');
+        const char *fs = strrchr(exename, '/');
+        const char *base = (bs > fs) ? bs + 1 : (fs ? fs + 1 : exename);
+        char lower[80];
+        size_t i = 0;
+        for (; base[i] && i < sizeof lower - 1; i++)
+            lower[i] = (char)tolower((unsigned char)base[i]);
+        lower[i] = 0;
+        if (*lower)
+            m = wn_module_find(lower);
+    }
+    if (!m) {
+        if (hinst)
+            m = wn_module_from_addr((const void *)(uintptr_t)hinst, NULL);
+        if (!m)
+            m = g_proc.exe;
+    }
+    uint64_t hmod = (uint64_t)(uintptr_t)m->base;
+    uint32_t count = 0;
+    if (!wn_res_type_count(hmod, SH_RT_GROUP_ICON, &count) || !count) {
+        wn_last_error_set(1813 /*ERROR_RESOURCE_NAME_NOT_FOUND*/);
+        return 0;
+    }
+    if (index == 0xFFFFFFFFu)
+        return count;         /* documented: -1 asks for the icon count */
+    if (index >= count)
+        return 1;             /* documented: missing index -> "1", not NULL */
+    uint32_t id = 0;
+    if (wn_res_type_id_at(hmod, SH_RT_GROUP_ICON, index, &id) <= 0)
+        id = 0;                /* string-named group: builtin fallback art */
+    return (uint64_t)(uintptr_t)wn_icon_handle_alloc(id, 1, hmod);
+}
+
+static WN_API uint64_t sh_ExtractIconA(wn_abiword hinst, const char *exename,
+                                       wn_abiword index)
+{
+    return sh_extract_icon_core(hinst, exename, (uint32_t)index);
+}
+
+static WN_API uint64_t sh_ExtractIconW(wn_abiword hinst,
+                                       const uint16_t *exename,
+                                       wn_abiword index)
+{
+    if (!exename || (uintptr_t)exename < 0x10000) {
+        wn_last_error_set(87 /*ERROR_INVALID_PARAMETER*/);
+        return 0;
+    }
+    size_t l = 0;
+    while (exename[l])
+        l++;
+    char *a = wn_utf16_to_utf8(exename, l);
+    uint64_t r = sh_extract_icon_core(hinst, a, (uint32_t)index);
+    free(a);
+    return r;
+}
+
+/* SHGFI_* (winuser.h values, restated so no Windows headers are needed). */
+enum {
+    SHGFI_ICON_              = 0x100,
+    SHGFI_DISPLAYNAME_       = 0x200,
+    SHGFI_TYPENAME_          = 0x400,
+    SHGFI_ATTRIBUTES_        = 0x800,
+    SHGFI_SYSICONINDEX_      = 0x4000,
+    SHGFI_USEFILEATTRIBUTES_ = 0x10,
+    FILE_ATTRIBUTE_DIRECTORY_ = 0x10
+};
+
+/* Field offsets: SHFILEINFOA/W differ by guest word size (i386 vs x64) and
+ * by char width. cb guards every write (callers pass sizeof(SHFILEINFO*):
+ * 0x160/352 for the i386 A form, 692/696 for the W forms). */
+static int sh_sfi_put_dword(uint8_t *psfi, uint32_t cb, uint32_t off, uint32_t v)
+{
+    if ((uint64_t)off + 4 > cb)
+        return 0;
+    memcpy(psfi + off, &v, 4);
+    return 1;
+}
+
+static void sh_sfi_put_text(uint8_t *psfi, uint32_t cb, uint32_t off,
+                            uint32_t cap, const char *txt, int wide)
+{
+    uint32_t o = off;
+    uint32_t limit = off + cap;
+    for (const char *p = txt; *p; p++) {
+        if (wide) {
+            if (o + 2 > limit || o + 2 > cb)
+                break;
+            uint16_t c = (uint16_t)(unsigned char)*p;
+            memcpy(psfi + o, &c, 2);
+            o += 2;
+        } else {
+            if (o + 1 > limit || o + 1 > cb)
+                break;
+            psfi[o] = (uint8_t)*p;
+            o += 1;
+        }
+    }
+    if (wide) {
+        if (o + 2 <= limit && o + 2 <= cb) {
+            uint16_t z = 0;
+            memcpy(psfi + o, &z, 2);
+        }
+    } else {
+        if (o + 1 <= limit && o + 1 <= cb)
+            psfi[o] = 0;
+    }
+}
+
+static uint32_t sh_shgetfileinfo_core(const char *path, uint32_t attrs,
+                                      uint8_t *psfi, uint32_t cb,
+                                      uint32_t flags, int wide)
+{
+    if (!path || !psfi || !cb) {
+        wn_last_error_set(87 /*ERROR_INVALID_PARAMETER*/);
+        return 0;
+    }
+    int is_dir;
+    if (flags & SHGFI_USEFILEATTRIBUTES_) {
+        is_dir = !!(attrs & FILE_ATTRIBUTE_DIRECTORY_);
+    } else {
+        char host[1024];
+        wn_path_win_to_host(path, host, sizeof host);
+        struct stat st;
+        if (stat(host, &st) != 0) {
+            wn_last_error_set(2 /*ERROR_FILE_NOT_FOUND*/);
+            return 0;
+        }
+        is_dir = S_ISDIR(st.st_mode);
+    }
+
+    if (flags & SHGFI_SYSICONINDEX_) {
+        /* No system-imagelist objects exist yet: refuse honestly instead
+         * of handing out a fake HIMAGELIST (documented gap). */
+        wn_log(WN_LOG_WARN, "shell32: SHGetFileInfo(SHGFI_SYSICONINDEX) "
+               "unsupported (no imagelist) — '%s'", path);
+        wn_last_error_set(120 /*ERROR_CALL_NOT_IMPLEMENTED*/);
+        return 0;
+    }
+
+    const int g32 = wn_wow64_guest32();
+    const uint32_t off_iicon = g32 ? 4 : 8;
+    const uint32_t off_attr  = g32 ? 8 : 12;
+    const uint32_t off_disp  = g32 ? 12 : 16;
+    const uint32_t off_type  = wide ? (g32 ? 12 + 520 : 16 + 520)
+                                   : (g32 ? 12 + 260 : 16 + 260);
+
+    if (flags & SHGFI_ICON_) {
+        /* Folder-specific pixel art is still a gap: the handle is the same
+         * drawable object LoadIconA returns (IDI_APPLICATION art). */
+        uint64_t hv = (uint64_t)(uintptr_t)wn_icon_handle_alloc(100, 1, 0);
+        if (g32) {
+            uint32_t h32 = (uint32_t)hv;
+            if (cb >= 4)
+                memcpy(psfi + 0, &h32, 4);
+        } else if (cb >= 8) {
+            memcpy(psfi + 0, &hv, 8);
+        }
+        sh_sfi_put_dword(psfi, cb, off_iicon, 0);
+    }
+    if (flags & SHGFI_DISPLAYNAME_) {
+        const char *bs = strrchr(path, '\\');
+        const char *fs = strrchr(path, '/');
+        const char *base = (bs > fs) ? bs + 1 : (fs ? fs + 1 : path);
+        sh_sfi_put_text(psfi, cb, off_disp, wide ? 520 : 260, base, wide);
+    }
+    if (flags & SHGFI_TYPENAME_) {
+        sh_sfi_put_text(psfi, cb, off_type, wide ? 160 : 80,
+                        is_dir ? "File Folder" : "Application", wide);
+    }
+    if (flags & SHGFI_ATTRIBUTES_) {
+        uint32_t sfgao = 0x40000000u /*SFGAO_FILESYSTEM*/;
+        if (is_dir)
+            sfgao |= 0x20000000u /*SFGAO_FOLDER*/;
+        sh_sfi_put_dword(psfi, cb, off_attr, sfgao);
+    }
+    return 1;
+}
+
+static WN_API uint64_t sh_SHGetFileInfoA(const char *path, wn_abiword attrs,
+                                         void *psfi, wn_abiword cb,
+                                         wn_abiword flags)
+{
+    return sh_shgetfileinfo_core(path, (uint32_t)attrs,
+                                 (uint8_t *)psfi, (uint32_t)cb,
+                                 (uint32_t)flags, 0);
+}
+
+static WN_API uint64_t sh_SHGetFileInfoW(const uint16_t *path,
+                                         wn_abiword attrs, void *psfi,
+                                         wn_abiword cb, wn_abiword flags)
+{
+    if (!path || (uintptr_t)path < 0x10000) {
+        wn_last_error_set(87 /*ERROR_INVALID_PARAMETER*/);
+        return 0;
+    }
+    size_t l = 0;
+    while (path[l])
+        l++;
+    char *a = wn_utf16_to_utf8(path, l);
+    uint64_t r = sh_shgetfileinfo_core(a ? a : "", (uint32_t)attrs,
+                                       (uint8_t *)psfi, (uint32_t)cb,
+                                       (uint32_t)flags, 1);
+    free(a);
+    return r;
+}
+
 const wn_export_entry wn_shell32_exports[] = {
     { "CommandLineToArgvW",        sh_CommandLineToArgvW },
     { "SHGetFolderPathA",          sh_SHGetFolderPathA },
@@ -429,6 +659,10 @@ const wn_export_entry wn_shell32_exports[] = {
     { "SHGetSpecialFolderPathA",   sh_SHGetSpecialFolderPathA },
     { "SHGetSpecialFolderPathW",   sh_SHGetSpecialFolderPathW },
     { "IsUserAnAdmin",             sh_IsUserAnAdmin },
+    { "ExtractIconA",              sh_ExtractIconA },
+    { "ExtractIconW",              sh_ExtractIconW },
+    { "SHGetFileInfoA",            sh_SHGetFileInfoA },
+    { "SHGetFileInfoW",            sh_SHGetFileInfoW },
     { "ShellExecuteA",             sh_ShellExecuteA },
     { "ShellExecuteW",             sh_ShellExecuteW },
     { "ShellExecuteExA",           sh_ShellExecuteExA },

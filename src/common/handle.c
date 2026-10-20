@@ -23,6 +23,7 @@ static size_t g_cap;             /* power of two */
 static size_t g_used;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void (*g_dtors[16])(void *);
+static int g_nofree[16];         /* borrowed payloads: see wn_handle_set_nofree */
 
 #define HTABLE_INIT_CAP 64
 
@@ -114,7 +115,13 @@ void wn_handle_release(wn_object *o)
         pthread_mutex_unlock(&g_lock);
         if (t < 16 && g_dtors[t])
             g_dtors[t](p);
-        free(p);
+        /* Borrowed payloads (registry keys are tree-owned and outlive every
+         * HKEY; freeing them at refcount-0 left freed nodes linked in the
+         * tree — the next RegOpenKey walk ran through recycled heap and
+         * wrote guest data over live host allocations (the session-12
+         * engine-corruption mystery). */
+        if (t < 16 && !g_nofree[t])
+            free(p);
     }
 }
 
@@ -134,4 +141,10 @@ void wn_handle_set_dtor(int type, void (*dtor)(void *))
 {
     if (type >= 0 && type < 16)
         g_dtors[type] = dtor;
+}
+
+void wn_handle_set_nofree(int type)
+{
+    if (type >= 0 && type < 16)
+        g_nofree[type] = 1;
 }

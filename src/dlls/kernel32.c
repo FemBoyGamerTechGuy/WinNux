@@ -3865,6 +3865,95 @@ static wn_module *mod_or_exe(uint64_t hmod)
     return wn_module_from_addr((const void *)(uintptr_t)hmod, NULL);
 }
 
+/* --- cross-DLL resource enumeration -----------------------------------------
+ * shell32's ExtractIcon needs "how many icon groups does this module have,
+ * and which resource id is entry #i" without synthesizing name strings.
+ * `type` follows the FindResource convention: a type-name string, or an
+ * integer id in the low word (MAKEINTRESOURCE(RT_GROUP_ICON) = (char*)14). */
+
+int wn_res_type_count(uint64_t hmod, const char *type, uint32_t *count_out)
+{
+    wn_module *m = mod_or_exe(hmod);
+    const uint8_t *base = m ? res_dir_base(m) : NULL;
+    if (!base || !type || !count_out)
+        return 0;
+    uint32_t off = res_find_in_dir(m, base, base, type);
+    if (!off)
+        return 0;
+    uint16_t nnamed, nid;
+    memcpy(&nnamed, base + off + 12, 2);
+    memcpy(&nid, base + off + 14, 2);
+    *count_out = (uint32_t)nnamed + nid;
+    return 1;
+}
+
+/* Id of the index-th entry (directory order) of the TYPE directory.
+ * 1 = numeric id written, 0 = type or index absent, -1 = string-named
+ * entry (id_out 0: callers fall back or fail honestly). */
+int wn_res_type_id_at(uint64_t hmod, const char *type, uint32_t index,
+                      uint32_t *id_out)
+{
+    wn_module *m = mod_or_exe(hmod);
+    const uint8_t *base = m ? res_dir_base(m) : NULL;
+    if (!base || !type || !id_out)
+        return 0;
+    uint32_t off = res_find_in_dir(m, base, base, type);
+    if (!off)
+        return 0;
+    uint16_t nnamed, nid;
+    memcpy(&nnamed, base + off + 12, 2);
+    memcpy(&nid, base + off + 14, 2);
+    if (index >= (uint32_t)nnamed + nid)
+        return 0;
+    uint32_t name_field;
+    memcpy(&name_field, base + off + 16 + 8 * (size_t)index, 4);
+    if (name_field & 0x80000000u) {
+        *id_out = 0;
+        return -1;
+    }
+    *id_out = name_field & 0xFFFFu;
+    return 1;
+}
+
+/* Cross-DLL (see wn_dll.h): FindResource + the DATA ENTRY's bytes in one
+ * step — the raw resource payload (mapped image bytes, valid while the
+ * module is loaded). type/name follow the FindResource convention. */
+int wn_res_lookup_bytes(uint64_t hmod, const char *type, const char *name,
+                        const uint8_t **out, uint32_t *size_out)
+{
+    wn_module *m = mod_or_exe(hmod);
+    const uint8_t *base = m ? res_dir_base(m) : NULL;
+    if (!base || !type || !name || !out || !size_out)
+        return 0;
+    uint32_t off = res_find_in_dir(m, base, base, type);
+    if (!off)
+        return 0;
+    off = res_find_in_dir(m, base, base + off, name);
+    if (!off)
+        return 0;
+    /* language level: first entry, leaf = data entry */
+    const uint8_t *dir = base + off;
+    uint16_t nnamed, nid;
+    memcpy(&nnamed, dir + 12, 2);
+    memcpy(&nid, dir + 14, 2);
+    if ((uint32_t)nnamed + nid == 0)
+        return 0;
+    uint32_t leaf_off;
+    memcpy(&leaf_off, dir + 16 + 4, 4);
+    if (leaf_off & 0x80000000u)
+        return 0;
+    const uint8_t *leaf = base + leaf_off;
+    uint32_t rva, size;
+    memcpy(&rva, leaf + 0, 4);
+    memcpy(&size, leaf + 4, 4);
+    const uint8_t *p = wn_pe_rva(&m->pe, rva, size);
+    if (!p)
+        return 0;
+    *out = p;
+    *size_out = size;
+    return 1;
+}
+
 WN_API uint64_t k32_FindResourceA(wn_abiword hmod, const char *name,
                                          const char *type)
 {
@@ -3917,6 +4006,15 @@ WN_API uint64_t k32_FindResourceA(wn_abiword hmod, const char *name,
         /* Opaque table handle: never expose the wn_res_handle* to the guest. */
         return (uint64_t)(uintptr_t)wn_handle_alloc(WN_HTYPE_RES, rh);
     }
+}
+
+/* FreeResource: Win32 is a 16-bit-compat no-op that reports success (the
+ * resource data is owned by the module; old RTLs pass either the HGLOBAL
+ * LoadResource gave them or even the HRSRC). Never closes anything. */
+static WN_API int32_t k32_FreeResource(wn_abiword hglobal)
+{
+    (void)hglobal;
+    return 1;
 }
 
 static WN_API uint64_t k32_LoadResource(wn_abiword hmod, wn_abiword hres)
@@ -4585,6 +4683,7 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "MulDiv", k32_MulDiv },
     { "FindResourceA", k32_FindResourceA },
     { "LoadResource", k32_LoadResource },
+    { "FreeResource", k32_FreeResource },
     { "LockResource", k32_LockResource },
     { "SizeofResource", k32_SizeofResource },
     { NULL, NULL },

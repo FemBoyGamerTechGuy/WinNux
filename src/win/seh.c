@@ -1156,6 +1156,48 @@ void wn_seh_raise(uint32_t code, uint32_t flags, uint32_t nparams,
         wn_log(WN_LOG_DEBUG, "seh: RaiseException(0x%08X) from %s+0x%llx",
                code, mod, (unsigned long long)rva);
     }
+    /* Parameter dump: fault raises carry none, but explicit RaiseException
+     * calls (Delphi/VCL 0x0EEDFACE, C++ EH 0xE06D7363) carry the payload
+     * the app's filter needs — and the one our log needs to decode the
+     * raise's origin. */
+    for (uint32_t i = 0; i < rec.number_parameters && i < 8; i++) {
+        char where[96];
+        wn_module_describe_addr(
+            (const void *)(uintptr_t)rec.exception_information[i],
+            where, sizeof where);
+        wn_log(WN_LOG_DEBUG, "seh:   info[%u]=0x%llx (%s)", i,
+               (unsigned long long)rec.exception_information[i], where);
+    }
+    /* Delphi raises: info[0] = raise-site address, info[1] = Exception
+     * object in Delphi 2-era RTLs (the VCL class-name shortstring rides at
+     * the raise site instead); [obj]=VMT, [obj+4]=FMessage (Pascal string:
+     * length at ptr-4, chars at ptr). Dumped via safe probes so a bogus
+     * pointer can't take the handler down. */
+    if (code == 0x0EEDFACEu && rec.number_parameters >= 2) {
+        for (int cand = 1; cand >= 0; cand--) {
+            uint32_t obj = (uint32_t)rec.exception_information[cand];
+            if (obj <= 0x10000 || !wn_ptr_readable((void *)(uintptr_t)obj, 16))
+                continue;
+            uint32_t vmt = 0, msgp = 0;
+            memcpy(&vmt, (const void *)(uintptr_t)obj, 4);
+            memcpy(&msgp, (const void *)(uintptr_t)(obj + 4), 4);
+            wn_log(WN_LOG_DEBUG, "seh:   delphi info[%d] obj=0x%x vmt=0x%x "
+                   "msg=0x%x", cand, obj, vmt, msgp);
+            if (msgp > 0x10000 &&
+                wn_ptr_readable((void *)(uintptr_t)(msgp - 4), 8)) {
+                uint32_t mlen = 0;
+                memcpy(&mlen, (const void *)(uintptr_t)(msgp - 4), 4);
+                if (mlen && mlen < 512 &&
+                    wn_ptr_readable((void *)(uintptr_t)msgp, mlen)) {
+                    char txt[257];
+                    size_t n = mlen < 256 ? mlen : 256;
+                    memcpy(txt, (const void *)(uintptr_t)msgp, n);
+                    txt[n] = 0;
+                    wn_log(WN_LOG_DEBUG, "seh:   delphi msg: \"%s\"", txt);
+                }
+            }
+        }
+    }
 
     ucontext_t uc;
     memset(&uc, 0, sizeof uc);   /* approximate context: raise site */
