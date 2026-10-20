@@ -912,12 +912,29 @@ static int32_t create_process_common(const char *app_name, char *cmd_line,
         }
     }
     char self[512];
-    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
-    if (sl <= 0) {
-        wn_last_error_set(WN_ERR_GEN_FAILURE);
-        return 0;
+    /* Emulator/dev override: under qemu-user, /proc/self/exe resolves to the
+     * EMULATOR, not this loader — child guest processes would exec it with
+     * loader args. WINNUX_CHILD_CMD (space-separated) is exec'd instead,
+     * with {run, exe, args...} appended after its tokens. run32.sh sets it
+     * to 'qemu-i386 -L <sysroot> <winnux32>' so process trees work under
+     * the qemu loop. Tokenized pre-fork: the child only execvs. */
+    char wrapbuf[512];
+    char *wrap_tok[16];
+    int nwrap = 0;
+    const char *wrap = getenv("WINNUX_CHILD_CMD");
+    if (wrap && *wrap) {
+        snprintf(wrapbuf, sizeof wrapbuf, "%s", wrap);
+        for (char *t = strtok(wrapbuf, " \t"); t && nwrap < 15;
+             t = strtok(NULL, " \t"))
+            wrap_tok[nwrap++] = t;
+    } else {
+        ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (sl <= 0) {
+            wn_last_error_set(WN_ERR_GEN_FAILURE);
+            return 0;
+        }
+        self[sl] = '\0';
     }
-    self[sl] = '\0';
 
     char dir_host[1024];
     dir_host[0] = '\0';
@@ -932,12 +949,16 @@ static int32_t create_process_common(const char *app_name, char *cmd_line,
         return 0;
     }
     if (pid == 0) {
-        /* child: chdir, then exec our own loader with the guest args */
+        /* child: chdir, then exec our own loader (or the emulator wrapper)
+         * with the guest args */
         if (dir_host[0])
             chdir(dir_host);
-        char *cargv[136];
+        char *cargv[152];
         int ca = 0;
-        cargv[ca++] = (char *)"winnux";
+        for (int i = 0; i < nwrap; i++)
+            cargv[ca++] = wrap_tok[i];
+        if (!nwrap)
+            cargv[ca++] = (char *)"winnux";
         cargv[ca++] = (char *)"run";
         cargv[ca++] = exe_win;
         for (int i = 0; i < ntok; i++) {
@@ -946,7 +967,7 @@ static int32_t create_process_common(const char *app_name, char *cmd_line,
             cargv[ca++] = tokens[i];
         }
         cargv[ca] = NULL;
-        execv(self, cargv);
+        execv(nwrap ? wrap_tok[0] : self, cargv);
         _exit(127);
     }
 
@@ -1414,49 +1435,252 @@ static WN_API uint32_t k32_GetAtomNameW(uint16_t atom, uint16_t *buf, uint32_t n
     return i;
 }
 
-/* Global/Local: fixed allocations only (documented limitation). */
+/* --- Global/Local heap -----------------------------------------------------------
+ * Faithful Win32 semantics:
+ *  - GMEM_FIXED: the handle IS the pointer (Windows guarantee).
+ *  - GMEM_MOVEABLE: an opaque handle from a registry table. GlobalLock maps
+ *    handle->pointer; the HANDLE NEVER CHANGES across GlobalReAlloc — the
+ *    block may move, the caller re-locks. A block with a live lock count is
+ *    never moved (Windows fails such a GlobalReAlloc instead).
+ * The old identity model (pointer==handle for everything) realloc'd blocks
+ * under the old Delphi/BCB RTLs (Inno's engine), which hold raw pointers
+ * into LOCKED blocks: moved memory corrupted their string/record heap —
+ * the "Enum"-as-pointer strrchr crash under winnux32, and the 0x40a998
+ * list-node write on the wow64 path, both trace to this. */
+#define GH_HANDLE_BASE 0x7A000000u   /* opaque range, never dereferenced */
+
+typedef struct {
+    uint32_t handle;    /* 0 = free slot */
+    void    *ptr;
+    size_t   size;
+    uint32_t lock;
+} gh_ent;
+
+static gh_ent g_gh[1024];
+static pthread_mutex_t g_gh_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static gh_ent *gh_find_h(uint32_t h)
+{
+    if (h < GH_HANDLE_BASE)
+        return NULL;
+    uint32_t i = (h - GH_HANDLE_BASE) >> 4;
+    if (i >= 1024 || g_gh[i].handle != h)
+        return NULL;
+    return &g_gh[i];
+}
+
+static gh_ent *gh_find_p(void *p)
+{
+    for (uint32_t i = 0; i < 1024; i++)
+        if (g_gh[i].handle && g_gh[i].ptr == p)
+            return &g_gh[i];
+    return NULL;
+}
+
+static void *gh_mem(size_t size, int zero)
+{
+    void *p = g_wow64_active ? wn_low_malloc(size) : malloc(size);
+    if (p && zero)
+        memset(p, 0, size);
+    return p;
+}
+
 static WN_API void *k32_GlobalAlloc(uint32_t flags, wn_abiword size)
 {
-    void *p;
-    if (g_wow64_active) {
-        /* 32-bit guests: low arena only (host pointers truncate) */
-        p = wn_low_malloc((size_t)size);
-        if (p && (flags & 0x40))
-            memset(p, 0, (size_t)size);
-    } else {
-        p = (flags & 0x40 /* GMEM_ZEROINIT */) ? calloc(1, (size_t)size)
-                                               : malloc((size_t)size);
+    if (!(flags & 0x2 /* GMEM_MOVEABLE */)) {
+        void *p = gh_mem((size_t)size, flags & 0x40 /* GMEM_ZEROINIT */);
+        if (!p)
+            wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
+        wn_log(WN_LOG_DEBUG, "gh: GlobalAlloc(FIXED fl=%x sz=%llx) -> %p",
+               flags, (unsigned long long)size, p);
+        return p;
     }
-    if (!p)
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = NULL;
+    for (uint32_t i = 0; i < 1024 && !e; i++)
+        if (!g_gh[i].handle)
+            e = &g_gh[i];
+    if (!e) {
+        pthread_mutex_unlock(&g_gh_mu);
         wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
-    return p;
+        return NULL;
+    }
+    e->ptr = gh_mem((size_t)size, flags & 0x40);
+    e->size = (size_t)size;
+    e->lock = 0;
+    e->handle = GH_HANDLE_BASE + ((uint32_t)(e - g_gh) << 4);
+    uint32_t h = e->handle;
+    void *ret = e->ptr ? (void *)(uintptr_t)h : NULL;
+    if (!e->ptr)
+        e->handle = 0;
+    pthread_mutex_unlock(&g_gh_mu);
+    wn_log(WN_LOG_DEBUG, "gh: GlobalAlloc(MOVE fl=%x sz=%llx) -> h=%x ptr=%p",
+           flags, (unsigned long long)size, h, e->ptr);
+    if (!ret)
+        wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
+    return ret;
 }
 
 static WN_API void *k32_GlobalLock(wn_handle h)
 {
-    return (void *)(uintptr_t)h;
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = gh_find_h((uint32_t)(uintptr_t)h);
+    void *p = NULL;
+    if (e) {
+        e->lock++;
+        p = e->ptr;
+    } else {
+        p = (void *)(uintptr_t)h;   /* GMEM_FIXED: identity */
+    }
+    pthread_mutex_unlock(&g_gh_mu);
+    wn_log(WN_LOG_DEBUG, "gh: GlobalLock(%x) -> %p",
+           (uint32_t)(uintptr_t)h, p);
+    return p;
 }
 
 static WN_API int32_t k32_GlobalUnlock(wn_handle h)
 {
-    (void)h;
-    return 1;
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = gh_find_h((uint32_t)(uintptr_t)h);
+    int32_t r = 1;
+    if (e) {
+        if (e->lock)
+            e->lock--;
+        r = e->lock ? 1 : 0;   /* FALSE on the final unlock (Win32 semantics) */
+    }
+    pthread_mutex_unlock(&g_gh_mu);
+    return r;
 }
 
 static WN_API uint64_t k32_GlobalSize(wn_handle h)
 {
-    if (g_wow64_active)
-        return (uint64_t)wn_low_usable((void *)(uintptr_t)h);
-    return malloc_usable_size((void *)(uintptr_t)h);
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = gh_find_h((uint32_t)(uintptr_t)h);
+    uint64_t r;
+    if (e) {
+        r = (uint64_t)e->size;
+    } else if (g_wow64_active) {
+        r = (uint64_t)wn_low_usable((void *)(uintptr_t)h);
+    } else {
+        r = (uint64_t)malloc_usable_size((void *)(uintptr_t)h);
+    }
+    pthread_mutex_unlock(&g_gh_mu);
+    return r;
 }
 
 static WN_API wn_handle k32_GlobalFree(wn_handle h)
 {
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = gh_find_h((uint32_t)(uintptr_t)h);
+    if (e) {
+        if (g_wow64_active)
+            wn_low_free(e->ptr);
+        else
+            free(e->ptr);
+        e->handle = 0;
+        e->ptr = NULL;
+        e->size = 0;
+        e->lock = 0;
+        pthread_mutex_unlock(&g_gh_mu);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_gh_mu);
+    /* Foreign-handle guard: opaque handle-table values (HRSRC etc.) and
+     * garbage land here; Windows rejects them with ERROR_INVALID_HANDLE —
+     * freeing them would eat recycled chunks (see LoadResource note). */
+    if ((uint32_t)(uintptr_t)h < 0x08000000) {
+        wn_log(WN_LOG_WARN, "GlobalFree: %x is not a heap handle — "
+               "rejecting", (unsigned)(uintptr_t)h);
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return h;   /* Windows: nonzero return on failure */
+    }
     if (g_wow64_active)
         wn_low_free((void *)(uintptr_t)h);
     else
         free((void *)(uintptr_t)h);
     return 0;
+}
+
+static WN_API wn_handle k32_GlobalHandle(void *p)
+{
+    if (!p)
+        return 0;
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = gh_find_p(p);
+    wn_handle h = e ? (wn_handle)(uintptr_t)e->handle
+                    : (wn_handle)(uintptr_t)p;   /* GMEM_FIXED: identity */
+    pthread_mutex_unlock(&g_gh_mu);
+    return h;
+}
+
+static WN_API wn_handle k32_GlobalReAlloc(wn_handle h, wn_abiword size,
+                                          uint32_t flags)
+{
+    /* NULL handle: a plain allocation (Windows semantics). */
+    if (!h)
+        return (wn_handle)(uintptr_t)k32_GlobalAlloc(flags, size);
+
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = gh_find_h((uint32_t)(uintptr_t)h);
+    if (!e) {
+        /* GMEM_FIXED grow: the caller adopts the RETURNED pointer (the
+         * old handle dies — same as Windows). */
+        pthread_mutex_unlock(&g_gh_mu);
+        if (size == 0)
+            return h;
+        if ((uint32_t)(uintptr_t)h < 0x08000000) {
+            wn_log(WN_LOG_WARN, "GlobalReAlloc: %x is not a heap handle "
+                   "— rejecting", (unsigned)(uintptr_t)h);
+            wn_last_error_set(WN_ERR_INVALID_HANDLE);
+            return 0;
+        }
+        void *p = (void *)(uintptr_t)h;
+        size_t old = g_wow64_active ? wn_low_usable(p)
+                                    : malloc_usable_size(p);
+        void *np = g_wow64_active ? wn_low_realloc(p, (size_t)size)
+                                  : realloc(p, (size_t)size);
+        if (!np) {
+            wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
+            return 0;
+        }
+        if ((flags & 0x40 /* GMEM_ZEROINIT */) && (size_t)size > old)
+            memset((uint8_t *)np + old, 0, (size_t)size - old);
+        return (wn_handle)(uintptr_t)np;
+    }
+
+    /* GMEM_MOVEABLE: the HANDLE never changes across the realloc. */
+    if (size == 0) {
+        pthread_mutex_unlock(&g_gh_mu);
+        return h;   /* GMEM_MODIFY convert / GMEM_DISCARD probe: no-op */
+    }
+    if (e->lock) {
+        uint32_t lc = e->lock;
+        pthread_mutex_unlock(&g_gh_mu);
+        wn_log(WN_LOG_WARN, "GlobalReAlloc: moveable handle %x still "
+               "locked (lock=%u) — refusing to move the block",
+               (unsigned)(uintptr_t)h, lc);
+        wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    size_t old = e->size;
+    void *old_ptr_for_log = e->ptr;
+    void *np = g_wow64_active ? wn_low_realloc(e->ptr, (size_t)size)
+                              : realloc(e->ptr, (size_t)size);
+    if (!np) {
+        pthread_mutex_unlock(&g_gh_mu);
+        wn_last_error_set(WN_ERR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    e->ptr = np;
+    e->size = (size_t)size;
+    if ((flags & 0x40 /* GMEM_ZEROINIT */) && (size_t)size > old)
+        memset((uint8_t *)np + old, 0, (size_t)size - old);
+    pthread_mutex_unlock(&g_gh_mu);
+    wn_log(WN_LOG_DEBUG, "gh: GlobalReAlloc(h=%x sz=%llx fl=%x) -> h=%x "
+           "ptr=%p (was %p)", (uint32_t)(uintptr_t)h,
+           (unsigned long long)size, flags, (uint32_t)(uintptr_t)h,
+           np, old_ptr_for_log);
+    return h;
 }
 
 static WN_API void *k32_LocalAlloc(uint32_t flags, wn_abiword size)
@@ -1467,6 +1691,32 @@ static WN_API void *k32_LocalAlloc(uint32_t flags, wn_abiword size)
 static WN_API wn_handle k32_LocalFree(wn_handle h)
 {
     return k32_GlobalFree(h);
+}
+
+static WN_API wn_handle k32_LocalHandle(void *p)
+{
+    return k32_GlobalHandle(p);
+}
+
+static WN_API wn_handle k32_LocalReAlloc(wn_handle h, wn_abiword size,
+                                        uint32_t flags)
+{
+    return k32_GlobalReAlloc(h, size, flags);
+}
+
+static WN_API void *k32_LocalLock(wn_handle h)
+{
+    return k32_GlobalLock(h);
+}
+
+static WN_API int32_t k32_LocalUnlock(wn_handle h)
+{
+    return k32_GlobalUnlock(h);
+}
+
+static WN_API uint64_t k32_LocalSize(wn_handle h)
+{
+    return k32_GlobalSize(h);
 }
 
 /* --- TLS ------------------------------------------------------------------------ */
@@ -1811,12 +2061,28 @@ static WN_API uint32_t k32_GetFileType(wn_handle h)
     return 1; /* DISK */
 }
 
+/* Debug-only forensics: WINNUX_KEEP_TEMP=1 makes guest deletes of files
+ * under the temp tree no-ops (success is still reported) so crashed-run
+ * artifacts — Inno's extracted engine, for disassembly — stay on disk.
+ * Set by scripts/dev runs when dissecting installer behavior. */
+static int keep_temp_hit(const char *host)
+{
+    if (!getenv("WINNUX_KEEP_TEMP"))
+        return 0;
+    return strstr(host, "/windows/temp/") != NULL || strstr(host, "\\Temp\\") != NULL;
+}
+
 static WN_API int32_t k32_DeleteFileA(const char *name)
 {
     char host[1024];
     if (wn_path_resolve_ci(name, host, sizeof host) != 0) {
         wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
         return 0;
+    }
+    if (keep_temp_hit(host)) {
+        wn_log(WN_LOG_DEBUG, "kernel32: DeleteFileA('%s') KEPT "
+               "(WINNUX_KEEP_TEMP)", name);
+        return 1;
     }
     if (unlink(host) != 0) {
         wn_last_error_set(errno == ENOENT ? WN_ERR_FILE_NOT_FOUND
@@ -1971,6 +2237,11 @@ static WN_API int32_t k32_RemoveDirectoryA(const char *name)
     if (wn_path_resolve_ci(name, host, sizeof host) != 0) {
         wn_last_error_set(WN_ERR_FILE_NOT_FOUND);
         return 0;
+    }
+    if (keep_temp_hit(host)) {
+        wn_log(WN_LOG_DEBUG, "kernel32: RemoveDirectoryA('%s') KEPT "
+               "(WINNUX_KEEP_TEMP)", name);
+        return 1;
     }
     if (rmdir(host) != 0) {
         wn_last_error_set(WN_ERR_DIR_NOT_EMPTY);
@@ -3559,12 +3830,11 @@ static uint32_t res_find_in_dir(wn_module *m, const uint8_t *dirbase,
 
 static wn_res_handle *res_make(wn_module *m, uint32_t rva, uint32_t size)
 {
-    /* HRSRC is an opaque POINTER handed to the guest and passed back in
-     * later SizeofResource/LockResource calls. A 32-bit guest truncates it
-     * to 32 bits, so under wow64 it MUST live below 4GB (LuaForWindows
-     * installer: truncated host-heap pointer -> SizeofResource segfault). */
-    wn_res_handle *h = g_wow64_active
-        ? wn_low_malloc(sizeof *h) : wn_xmalloc(sizeof *h);
+    /* HRSRC is an OPAQUE wn_handle-table value (see FindResourceA): the
+     * guest never sees this pointer, so plain host malloc is right in
+     * every build (the old low-arena scheme handed raw pointers out and
+     * old RTLs could pass them to the Global heap — see LoadResource). */
+    wn_res_handle *h = wn_xmalloc(sizeof *h);
     if (!h)
         return NULL;
     h->magic = WN_RES_MAGIC;
@@ -3572,6 +3842,20 @@ static wn_res_handle *res_make(wn_module *m, uint32_t rva, uint32_t size)
     h->rva = rva;
     h->size = size;
     return h;
+}
+
+/* HRSRC resolution: FindResource hands out opaque WN_HTYPE_RES handles;
+ * accept the legacy raw wn_res_handle* too (never handed out anymore, kept
+ * for one-build migrations). */
+static wn_res_handle *res_lookup(wn_abiword hres)
+{
+    wn_object *o = wn_handle_get((wn_handle)(uintptr_t)hres, WN_HTYPE_RES);
+    if (o)
+        return o->ptr;
+    wn_res_handle *rh = (wn_res_handle *)(uintptr_t)hres;
+    if ((uintptr_t)rh > 0x10000 && rh->magic == WN_RES_MAGIC)
+        return rh;
+    return NULL;
 }
 
 static wn_module *mod_or_exe(uint64_t hmod)
@@ -3627,41 +3911,80 @@ WN_API uint64_t k32_FindResourceA(wn_abiword hmod, const char *name,
             wn_last_error_set(1812);
             return 0;
         }
-        return (uint64_t)(uintptr_t)res_make(m, rva, size);
+        wn_res_handle *rh = res_make(m, rva, size);
+        if (!rh)
+            return 0;
+        /* Opaque table handle: never expose the wn_res_handle* to the guest. */
+        return (uint64_t)(uintptr_t)wn_handle_alloc(WN_HTYPE_RES, rh);
     }
 }
 
 static WN_API uint64_t k32_LoadResource(wn_abiword hmod, wn_abiword hres)
 {
     (void)hmod;
-    wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
-    if (!h || h->magic != WN_RES_MAGIC) {
+    wn_res_handle *rh = res_lookup(hres);
+    if (!rh) {
         wn_last_error_set(WN_ERR_INVALID_HANDLE);
         return 0;
     }
-    return hres;
+    /* LoadResource returns an HGLOBAL — a REAL Global-heap block. Old
+     * Delphi/BCB RTLs (Inno's engine) pass it to GlobalLock/GlobalSize and
+     * sometimes GlobalFree; raw wn_res_handle pointers there made those
+     * calls free/realloc FOREIGN chunks and corrupt the heap (the winnux32
+     * "Enum"-as-path crash walked exactly that recycling). */
+    void *hblk = k32_GlobalAlloc(0x2 /* GMEM_MOVEABLE */, rh->size);
+    if (!hblk)
+        return 0;
+    uint8_t *dst = k32_GlobalLock((wn_handle)(uintptr_t)hblk);
+    const void *src = wn_pe_rva(&rh->mod->pe, rh->rva, rh->size);
+    if (!dst || !src) {
+        k32_GlobalFree((wn_handle)(uintptr_t)hblk);
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    memcpy(dst, src, rh->size);
+    k32_GlobalUnlock((wn_handle)(uintptr_t)hblk);
+    wn_log(WN_LOG_DEBUG, "kernel32: LoadResource hres=%llx -> hglobal %p "
+           "(%u bytes)", (unsigned long long)hres, hblk, rh->size);
+    return (uint64_t)(uintptr_t)hblk;
 }
 
 WN_API void *k32_LockResource(wn_abiword hres)
 {
-    wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
-    if (!h || h->magic != WN_RES_MAGIC)
+    /* LoadResource's HGLOBAL: a Global-heap handle. */
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = gh_find_h((uint32_t)(uintptr_t)hres);
+    void *p = e ? e->ptr : NULL;
+    pthread_mutex_unlock(&g_gh_mu);
+    if (p)
+        return p;
+    /* FindResource's HRSRC: map straight to the image bytes (Windows
+     * accepts LockResource(hFindResource) from 16-bit-era code). */
+    wn_res_handle *rh = res_lookup(hres);
+    if (!rh)
         return NULL;
-    void *p = wn_pe_rva(&h->mod->pe, h->rva,
-                        h->size > 0xFFFF ? 0xFFFF : h->size);
-    if (!p)
+    void *ip = wn_pe_rva(&rh->mod->pe, rh->rva,
+                        rh->size > 0xFFFF ? 0xFFFF : rh->size);
+    if (!ip)
         wn_log(WN_LOG_WARN, "kernel32: resource rva 0x%x out of image",
-               h->rva);
-    return p;
+               rh->rva);
+    return ip;
 }
 
 static WN_API uint32_t k32_SizeofResource(wn_abiword hmod, wn_abiword hres)
 {
     (void)hmod;
-    wn_res_handle *h = (wn_res_handle *)(uintptr_t)hres;
-    if (!h || h->magic != WN_RES_MAGIC)
-        return 0;
-    return h->size;
+    pthread_mutex_lock(&g_gh_mu);
+    gh_ent *e = gh_find_h((uint32_t)(uintptr_t)hres);
+    uint32_t sz = e ? (uint32_t)e->size : 0;
+    pthread_mutex_unlock(&g_gh_mu);
+    if (sz)
+        return sz;
+    wn_res_handle *rh = res_lookup(hres);
+    if (rh)
+        return rh->size;
+    wn_last_error_set(WN_ERR_INVALID_HANDLE);
+    return 0;
 }
 
 static WN_API int32_t k32_Beep(uint32_t freq, uint32_t dur)
@@ -4134,7 +4457,9 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "GetVolumeInformationA", k32_GetVolumeInformationA },
     { "GlobalAlloc", k32_GlobalAlloc },
     { "GlobalFree", k32_GlobalFree },
+    { "GlobalHandle", k32_GlobalHandle },
     { "GlobalLock", k32_GlobalLock },
+    { "GlobalReAlloc", k32_GlobalReAlloc },
     { "GlobalSize", k32_GlobalSize },
     { "GlobalUnlock", k32_GlobalUnlock },
     { "GlobalAddAtomA", k32_GlobalAddAtomA },
@@ -4166,6 +4491,11 @@ const wn_export_entry wn_kernel32_exports[] = {
     { "LoadLibraryW", k32_LoadLibraryW },
     { "LocalAlloc", k32_LocalAlloc },
     { "LocalFree", k32_LocalFree },
+    { "LocalHandle", k32_LocalHandle },
+    { "LocalLock", k32_LocalLock },
+    { "LocalReAlloc", k32_LocalReAlloc },
+    { "LocalSize", k32_LocalSize },
+    { "LocalUnlock", k32_LocalUnlock },
     { "lstrcmpA", k32_lstrcmpA },
     { "lstrcmpiA", k32_lstrcmpiA },
     { "lstrcmpiW", k32_lstrcmpiW },

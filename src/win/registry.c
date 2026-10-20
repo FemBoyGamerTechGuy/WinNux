@@ -24,6 +24,11 @@ struct wn_reg_key {
     struct wn_reg_key *parent;
     struct wn_reg_key *first_child, *next_sibling;
     wn_reg_value *first_value;
+    int       deleted;           /* zombie: unlinked but alive — HKEYs may
+                                 * still reference it (Windows keeps deleted
+                                 * keys until their handles close; freeing
+                                 * the struct crashed child_find/enum
+                                 * walks through recycled heap) */
 };
 
 /* Documented global: the registry roots. */
@@ -34,6 +39,7 @@ static wn_reg_key *key_new(const char *path)
 {
     wn_reg_key *k = wn_xcalloc(1, sizeof *k);
     k->path = wn_xstrdup(path);
+    wn_log(WN_LOG_DEBUG, "reg: key_new('%s') at %p", path, (void *)k);
     return k;
 }
 
@@ -50,10 +56,22 @@ static wn_reg_key *root_of(uint32_t root)
 
 static wn_reg_key *child_find(wn_reg_key *parent, const char *name)
 {
-    for (wn_reg_key *c = parent->first_child; c; c = c->next_sibling)
+    for (wn_reg_key *c = parent->first_child; c; c = c->next_sibling) {
+        /* integrity tripwire: every path we build starts with "HK"
+         * (root names) — anything else means a corrupted chain (the
+         * winnux32 engine wrote guest pointers over key structs during
+         * Inno's LZMA phase; log loudly, never crash the host — the
+         * caller sees "not found"). */
+        if (!c->path || c->path[0] != 'H' || c->path[1] != 'K') {
+            wn_log(WN_LOG_ERR, "reg: CORRUPT child chain: parent='%s' "
+                   "child=%p path=%p", parent->path ? parent->path : "?",
+                   (void *)c, (void *)c->path);
+            return NULL;
+        }
         if (wn_strcaseeq(c->path ? strrchr(c->path, '\\') ? strrchr(c->path, '\\') + 1 : c->path : "", name)
             || wn_strcaseeq(c->path, name))
             return c;
+    }
     return NULL;
 }
 
@@ -101,6 +119,11 @@ uint32_t wn_reg_query_value(wn_reg_key *key, const char *name, uint32_t *type,
 {
     if (!key)
         return WN_ERR_INVALID_HANDLE;
+    if (key->deleted) {
+        wn_log(WN_LOG_DEBUG, "reg: query on deleted key '%s'",
+               key->path ? key->path : "?");
+        return WN_ERR_FILE_NOT_FOUND;
+    }
     for (wn_reg_value *v = key->first_value; v; v = v->next) {
         if (wn_strcaseeq(v->name, name)) {
             if (type)
@@ -129,6 +152,11 @@ uint32_t wn_reg_set_value(wn_reg_key *key, const char *name, uint32_t type,
 {
     if (!key)
         return WN_ERR_INVALID_HANDLE;
+    if (key->deleted) {
+        wn_log(WN_LOG_DEBUG, "reg: set on deleted key '%s'",
+               key->path ? key->path : "?");
+        return WN_ERR_FILE_NOT_FOUND;
+    }
     for (wn_reg_value *v = key->first_value; v; v = v->next) {
         if (wn_strcaseeq(v->name, name)) {
             free(v->data);
@@ -170,6 +198,11 @@ uint32_t wn_reg_enum_key(wn_reg_key *k, uint32_t idx, char *name, size_t cap)
 {
     if (!k)
         return WN_ERR_INVALID_HANDLE;
+    if (k->deleted) {
+        wn_log(WN_LOG_DEBUG, "reg: enum on deleted key '%s'",
+               k->path ? k->path : "?");
+        return WN_ERR_FILE_NOT_FOUND;
+    }
     uint32_t i = 0;
     for (wn_reg_key *c = k->first_child; c; c = c->next_sibling, i++) {
         if (i == idx) {
@@ -186,6 +219,11 @@ uint32_t wn_reg_enum_value(wn_reg_key *k, uint32_t idx, char *name, size_t cap,
 {
     if (!k)
         return WN_ERR_INVALID_HANDLE;
+    if (k->deleted) {
+        wn_log(WN_LOG_DEBUG, "reg: enum values on deleted key '%s'",
+               k->path ? k->path : "?");
+        return WN_ERR_FILE_NOT_FOUND;
+    }
     uint32_t i = 0;
     for (wn_reg_value *v = k->first_value; v; v = v->next, i++) {
         if (i == idx) {
@@ -357,9 +395,14 @@ uint32_t wn_reg_delete_key(wn_reg_key *parent, const char *name)
         if (wn_strcaseeq(leaf, name) || wn_strcaseeq(c->path, name)) {
             if (c->first_child)
                 return WN_ERR_ACCESS_DENIED;  /* Windows refuses non-empty keys */
+            /* ZOMBIE, never free: unlink from the tree, keep the struct —
+             * the handle table may still hand o->ptr == c to stale HKEYs,
+             * and a freed chunk gets recycled into the next strdup (the
+             * winnux32 "Enum"-as-path crash walked exactly that). */
             *pp = c->next_sibling;
-            free(c->path);
-            free(c);
+            c->next_sibling = NULL;
+            c->parent = NULL;
+            c->deleted = 1;
             return WN_ERR_SUCCESS;
         }
     }
@@ -372,6 +415,11 @@ uint32_t wn_reg_query_info(wn_reg_key *k, uint32_t *nsub, uint32_t *maxsub,
 {
     if (!k)
         return WN_ERR_INVALID_HANDLE;
+    if (k->deleted) {
+        wn_log(WN_LOG_DEBUG, "reg: query-info on deleted key '%s'",
+               k->path ? k->path : "?");
+        return WN_ERR_FILE_NOT_FOUND;
+    }
     uint32_t a = 0, b = 0, c = 0, d = 0, e = 0;
     for (wn_reg_key *ch = k->first_child; ch; ch = ch->next_sibling) {
         a++;

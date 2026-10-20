@@ -11,17 +11,24 @@ now: outer instance extracts + spawns the is-*.tmp engine, the engine reads
 its payload byte-perfect, and the parent reaps/cleans up/exits on failure.
 Remaining, in evidence order:
 
-1. ENGINE DATA CORRUPTION: the .tmp crashes writing a Delphi list node with
-   edx=0x40a998 (a READ-ONLY CODE-section address; would fault on Windows
-   too — so the value is CORRUPTED, not a mapping issue). eax=0x2e ('.'),
-   ebp=0x49d470 (a .DATA global, Delphi uses ebp-as-register), the crash
-   stack carries "...\LuaForWindows_v5.1.5-52.tmp\4000" — Inno language/
-   setup-table parsing after the LZMA decompress. Reads are proven clean
-   (CreateFileA path-logging + ReadFile size/pos logging added at DEBUG);
-   next: instrument WHO writes the object pointer (the list comes from
-   GlobalNameSpace/Classes registration), and compare against qemu-i386
-   (winnux32 — root32 sysroot REBUILT in session 12, `make winnux32` green,
-   run32.sh loop verified; the comparison is unblocked).
+1. ENGINE DATA CORRUPTION — DECODED (session 12): the crash at engine
+   0x401bb7 is the Inno engine's own SMALL-BLOCK HEAP FREELIST PUSH
+   (`mov [edx],eax`, fd->bk=bk) with edx=0x40a998 = a VMT code-table
+   address: the engine's heap bucket heads (globals at 0x49d41c/420/46c/
+   470/478) were corrupted EARLIER, and eax=0x2e ('.') is the garbage
+   "header" it read. On the winnux32/qemu path the same runaway write
+   also hits OUR host brk (registry key structs caught by the new child_find
+   "HK" tripwire: `reg: CORRUPT child chain`). Binary CAPTURED + full decode
+   in /home/z/my-project/engine-forensics/ (WINNUX_KEEP_TEMP=1 keeps temp
+   artifacts). Session 12 also landed the Windows-contract fixes that were
+   provably wrong before (Global heap GMEM_MOVEABLE model with opaque
+   handles + lock-stable semantics, LoadResource returning a REAL HGLOBAL,
+   HRSRC as opaque wn_handle values, registry key zombies, foreign-handle
+   guards in GlobalFree/GlobalReAlloc) — the crash persists, so the
+   remaining writer is something else. NEXT: qemu -g + gdb breakpoint at
+   0x401bb7, watchpoint the bucket table ds:0x49d478, walk back to the
+   first corrupting write; suspect list: an API returning a buffer the
+   engine frees into its own heap, or a size-mismatched out-write.
 2. DONE (session 12, moved to STATUS.md): nested-walk guard — a
    per-thread g_seh32_walk_active cap refuses re-entrant seh32_dispatch on
    BOTH engines (x64 wow64 + native i386), and capped raises during an

@@ -17,6 +17,7 @@ enum wn_htype {
     WN_HTYPE_CONSOLE   = 8,
     WN_HTYPE_FIND      = 9,   /* FindFirstFile search */
     WN_HTYPE_GFX       = 10,  /* GDI/user32 later */
+    WN_HTYPE_RES       = 11   /* FindResource: opaque HRSRC */
 };
 
 typedef struct wn_object {

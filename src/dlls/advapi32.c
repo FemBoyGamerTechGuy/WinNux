@@ -24,6 +24,8 @@ static WN_API int32_t adv_RegOpenKeyExA(uint32_t root, const char *path,
     (void)reserved;
     (void)access;
     wn_reg_key *k;
+    wn_log(WN_LOG_DEBUG, "adv: RegOpenKeyExA(root=%x '%s')", root,
+           path ? path : "");
     uint32_t r = wn_reg_open_key(root, path ? path : "", &k, 0);
     if (r != WN_ERR_SUCCESS) {
         wn_last_error_set(r);
@@ -119,6 +121,7 @@ static WN_API int32_t adv_RegDeleteKeyA(wn_handle h, const char *sub)
     wn_object *o = wn_handle_get(h, WN_HTYPE_REGKEY);
     if (!o)
         return 2;
+    wn_log(WN_LOG_DEBUG, "adv: RegDeleteKeyA('%s')", sub ? sub : "");
     uint32_t r = wn_reg_delete_key(o->ptr, sub ? sub : "");
     if (r != WN_ERR_SUCCESS) {
         wn_last_error_set(r);

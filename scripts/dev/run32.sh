@@ -36,4 +36,9 @@ if [ ! -d "$SYSROOT/usr/lib32" ]; then
     exit 2
 fi
 
+# Process trees: under qemu-user, /proc/self/exe is the EMULATOR, so the
+# guest's CreateProcess would exec qemu with loader args. WINNUX_CHILD_CMD
+# re-routes child spawns through the same qemu+winnux32 loop.
+export WINNUX_CHILD_CMD="$QEMU -L $SYSROOT $W32"
+
 exec "$QEMU" -L "$SYSROOT" "$W32" run "$@"

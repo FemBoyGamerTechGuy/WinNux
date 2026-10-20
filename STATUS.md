@@ -120,6 +120,45 @@ the user's native-multilib box needs only the source fixes), smoke32
 9/9 checks under qemu (TEB fs:0x18/0x20/0x34, heaps, ticks, last-error),
 64-bit suite 16/16.
 
+### Session 12, part 2: Windows-contract heap/resource/registry fixes + crash decoded
+
+Continuing the installer bring-up with the qemu/winnux32 comparison loop
+(now working: WINNUX_CHILD_CMD routes guest CreateProcess children through
+qemu — /proc/self/exe is the EMULATOR under qemu-user):
+- Global/Local heap: faithful Win32 semantics now. GMEM_FIXED handles are
+  the pointer (Windows guarantee); GMEM_MOVEABLE is an OPAQUE handle from a
+  registry table (0x7A000000-based) whose HANDLE never changes across
+  GlobalReAlloc, whose blocks never move while locked (locked reallocs
+  fail loudly, Windows-style), with real Lock/Unlock counts and
+  GlobalHandle(ptr) lookup. The old identity model realloc'd blocks under
+  the old Delphi RTLs (which hold raw pointers into locked blocks).
+  GlobalHandle/GlobalReAlloc (+ Local* twins) were missing stubs before —
+  the engine ran out of heap and raised 0xEEDFACE during init under qemu.
+  Foreign-handle guards: GlobalFree/GlobalReAlloc reject sub-0x08000000
+  values with ERROR_INVALID_HANDLE instead of free()ing garbage.
+- Resources: FindResourceA returns an opaque WN_HTYPE_RES wn_handle value;
+  LoadResource copies the resource into a REAL Global-heap block and returns
+  its HGLOBAL (the Windows contract — old RTLs pass it to
+  GlobalLock/Size/Free; the old raw wn_res_handle* made those calls
+  free/realloc FOREIGN chunks — the winnux32 "Enum"-as-path crash walked
+  exactly that chunk recycling). LockResource/SizeofResource accept both
+  the HGLOBAL and the HRSRC.
+- Registry: RegDeleteKey now ZOMBIES keys (unlink, never free) — the old
+  free() left stale HKEYs pointing into recycled chunks (use-after-free);
+  stale-handle ops on deleted keys fail cleanly; child_find has an "HK"
+  prefix tripwire that logs corrupted chains instead of crashing the host.
+- Forensics tooling: WINNUX_KEEP_TEMP=1 (temp-tree guest deletes become
+  logged no-ops) captured the is-*.tmp engine; DEBUG logs on GlobalAlloc/
+  ReAlloc/Lock, RegOpenKeyExA/RegDeleteKeyA, key_new, LoadResource.
+- CRASH DECODED (both paths): engine 0x401bb7 is Inno's small-block heap
+  FREELIST PUSH (`mov [edx],eax`) with a VMT address in the bucket head —
+  the engine's heap metadata globals (0x49d41c/420/46c/470/478) are
+  trashed by an earlier runaway write that ALSO hits host key structs.
+  Binary + disassembly notes: /home/z/my-project/engine-forensics/.
+VERIFIED: suite 16/16, smoke32 9/9 under qemu, `make`+`make winnux32`
+link clean; x64 installer run reproduces the (now-decoded) engine crash
+through the SEH walk to a clean failure lifecycle.
+
 ### The installer state after all of this
 
 The process TREE now works end-to-end: outer exe extracts -> spawns the
