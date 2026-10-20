@@ -63,8 +63,16 @@ typedef struct wn_window {
     uint64_t hinstance;
     uint64_t userdata;
     char title[128];          /* UTF-8 mirror of the window text */
-    uint16_t wtext[512];      /* canonical text (UTF-16) for WM_GETTEXTW */
+    uint16_t *wtext;           /* canonical text (UTF-16, NUL-terminated,
+                                 DYNAMIC) for WM_GETTEXT(W)/paint; licenses
+                                 stream 20KB+ through EM_STREAMIN — the old
+                                 fixed 512-char cell showed only the head */
     int visible;
+    int zero_sized;            /* created 0x0 (VCL TApplication owner):
+                                 Windows shows nothing for a pixel-less
+                                 window, but a mapped 1x1 gains a WM frame
+                                 + taskbar entry under X11 — stay unmapped
+                                 until it actually grows */
     int in_destroy;
     int paint_pending;
     struct { int l, t, r, b; } dirty;    /* damage rect; l<0 = clean */
@@ -132,6 +140,18 @@ static void compose_child(wn_window *child);
 static void present_root(wn_window *w);
 static void u32_dirty_window_tree(uint64_t hwnd);
 static void win_screen_origin(wn_window *w, int *x, int *y);
+static int64_t ctl_get_text(wn_window *w, char *out, size_t cap);
+static int64_t ctl_get_text_w(wn_window *w, uint16_t *out, size_t cap16);
+static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
+                                  wn_abiword wp, wn_abiword_s lp);
+
+/* window text messages (also re-listed with the control messages later) */
+#ifndef WN_WM_SETTEXT
+#define WN_WM_SETTEXT_FIRST    0x000C
+#define WN_WM_SETTEXT          0x000C
+#define WN_WM_GETTEXT          0x000D
+#define WN_WM_GETTEXTLENGTH    0x000E
+#endif
 static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
                                         wn_abiword wp, wn_abiword_s lp);
 static WN_API int32_t u32_MessageBoxW(wn_abiword hwnd, const uint16_t *text,
@@ -536,6 +556,10 @@ static WN_API int32_t u32_ShowWindow(wn_abiword hwnd, int32_t cmd)
         if (cmd == 0 /* SW_HIDE */) {
             if (w->bwin->mapped && be->win_hide)
                 be->win_hide(w->bwin);
+        } else if (w->zero_sized && w->cw <= 1 && w->ch <= 1) {
+            /* Zero-sized window (created 0x0, still 1x1): Windows shows
+             * NOTHING for it; mapping under X11 gives it a WM frame +
+             * taskbar entry — the ghost 1x1 "Setup" window report. */
         } else if (be->win_show) {
             be->win_show(w->bwin);
         }
@@ -588,6 +612,14 @@ static void user32_move_resize(uint64_t hwnd, int x, int y, int w, int h,
             win->bwin->height = win->ch = h;
             win->bwin->stride = w * 4;
             compose_children_of(hwnd);
+            /* a zero-sized window that GREW becomes a real, mappable
+             * window (Windows would show it from now on) */
+            if (win->zero_sized && (w > 1 || h > 1)) {
+                win->zero_sized = 0;
+                if (win->visible && !win->bwin->mapped && be &&
+                    be->win_show)
+                    be->win_show(win->bwin);
+            }
         } else if (do_move && win->bwin) {
             const wn_backend *be = wn_backend_get();
             if (be && be->win_move_resize)
@@ -890,16 +922,14 @@ static void user32_set_wtext_utf8(wn_window *w, const char *s)
 {
     uint16_t *t = wn_utf8_to_utf16_n(s ? s : "", s ? strlen(s) : 0);
     if (!t) {
+        /* allocation failure: keep a safe empty buffer for readers */
+        free(w->wtext);
+        w->wtext = wn_xmalloc(sizeof(uint16_t));
         w->wtext[0] = 0;
         return;
     }
-    size_t i = 0;
-    while (t[i] && i < 511) {
-        w->wtext[i] = t[i];
-        i++;
-    }
-    w->wtext[i] = 0;
-    free(t);
+    free(w->wtext);
+    w->wtext = t;
 }
 
 /* internal SetFocus: posts kill/set notifications, updates g_focus_hwnd */
@@ -1014,6 +1044,7 @@ uint64_t user32_desktop(void)
     wn_window *win = wn_xcalloc(1, sizeof *win);
     win->cls = NULL;
     win->is_desktop = 1;
+    user32_set_wtext_utf8(win, "");   /* dynamic wtext: never NULL */
     win->style = 0;
     /* REAL screen size: putty's centre_dialog measures the desktop via
      * GetWindowRect(GetDesktopWindow()) and the old hardcoded 1280x800
@@ -1835,6 +1866,11 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
     win->owner = parent;              /* owner != parent: stays top-level */
     win->wx = x;
     win->wy = y;
+    /* Created 0x0? (Delphi's hidden TApplication owner is a WS_POPUP 0x0
+     * tool window — under Windows it covers no pixels, but VCL still creates
+     * it WS_VISIBLE.) Mark it: it must never be MAPPED while it stays
+     * pixel-less, or a real WM frames it as a ghost toplevel. */
+    win->zero_sized = (w <= 0 || h <= 0);
     /* Windows size contract: w/h of 0 means a ZERO-sized window (Delphi's
      * hidden TApplication owner is exactly that — a WS_POPUP 0x0 tool
      * window; inflating it to 640x480 made it a visible framed toplevel:
@@ -1983,6 +2019,8 @@ static WN_API int32_t u32_DestroyWindow(wn_abiword hwnd)
     free(w->items);
     w->items = NULL;
     w->n_items = w->items_cap = 0;
+    free(w->wtext);                  /* dynamic canonical text */
+    w->wtext = NULL;
     if (w->is_child) {
         /* Child surfaces are ours; the backend never saw them. */
         free(w->bwin->pixels);
@@ -2339,6 +2377,58 @@ static WN_API uint64_t u32_DefWindowProcA(wn_abiword hwnd, uint32_t msg,
     case 0x0081 /* WM_NCCREATE */:
         /* DefWindowProc returns TRUE to let creation proceed. */
         return 1;
+    case WN_WM_SETTEXT: {
+        /* VCL sets form captions through Perform(WM_SETTEXT) —
+         * TControl.SetTextBuf — NOT the SetWindowText API. Without this
+         * branch the Inno wizard stayed titleless under the WM (the
+         * "(Window without title)" field report) while the hidden
+         * TApplication owner — whose title arrives via the API — showed
+         * as the ghost "Setup" window. */
+        wn_window *w = win_from_hwnd(hwnd);
+        if (!w)
+            return 0;
+        char *a = NULL;
+        const char *src = "";
+        if (w->is_uni) {
+            const uint16_t *ws = (const uint16_t *)(uintptr_t)lp;
+            size_t n16 = 0;
+            if (ws)
+                while (n16 < 65536 && ws[n16])
+                    n16++;
+            a = ws ? wn_utf16_to_utf8(ws, n16) : NULL;
+            src = a ? a : "";
+        } else {
+            src = (const char *)(uintptr_t)lp;
+        }
+        snprintf(w->title, sizeof w->title, "%s", src ? src : "");
+        user32_set_wtext_utf8(w, src ? src : "");
+        if (!w->parent) {
+            const wn_backend *be = wn_backend_get();
+            if (be && be->win_set_title && w->bwin)
+                be->win_set_title(w->bwin, w->title);
+        }
+        if (w->parent && w->visible)
+            compose_child(w);
+        free(a);
+        return 1;
+    }
+    case WN_WM_GETTEXT: {
+        wn_window *w = win_from_hwnd(hwnd);
+        if (!w || !lp || wp == 0)
+            return 0;
+        if (w->is_uni)
+            return ctl_get_text_w(w, (uint16_t *)(uintptr_t)lp, (size_t)wp);
+        return ctl_get_text(w, (char *)(uintptr_t)lp, (size_t)wp);
+    }
+    case WN_WM_GETTEXTLENGTH: {
+        wn_window *w = win_from_hwnd(hwnd);
+        if (!w)
+            return 0;
+        size_t n = 0;
+        while (w->wtext[n])
+            n++;
+        return (int64_t)n;
+    }
     default:
         return 0;
     }
@@ -2367,6 +2457,14 @@ static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
               w->subclass || w->subclass32))
         return call_guest_wndproc(w, (uint64_t)hwnd, msg,
                                   (uint64_t)wp, (int64_t)lp);
+    /* Builtin-class window (a guest-registered class ALWAYS carries a
+     * proc; a NULL proc marks OURS): ctl_proc IS the class proc — that
+     * is where BM_/EM_/LB_/CB_ semantics and the painting live. Windows'
+     * SendMessage reaches the control's wndproc; routing these to
+     * DefWindowProc silently swallowed control messages (EM_STREAMIN
+     * never ran on bare builtin richedits). */
+    if (w && w->cls && !w->cls->proc && !w->cls->proc32)
+        return ctl_proc(hwnd, msg, wp, lp);
     return u32_DefWindowProcA(hwnd, msg, wp, lp);
 }
 
@@ -2604,8 +2702,26 @@ static void compose_children_of(uint64_t parent)
 typedef enum { CTL_BUTTON, CTL_STATIC, CTL_EDIT, CTL_LISTBOX, CTL_COMBO,
                CTL_SCROLLBAR, CTL_TREEVIEW } ctl_kind;
 
+/* case-insensitive substring test for VCL subclass class-name matching */
+static int u32_cls_has(const char *cls, const char *tok)
+{
+    size_t lt = strlen(tok);
+    for (; *cls; cls++) {
+        size_t i = 0;
+        while (i < lt && cls[i] && tok[i] &&
+               ((cls[i] >= 'A' && cls[i] <= 'Z' ? cls[i] + 32 : cls[i]) ==
+                (tok[i] >= 'A' && tok[i] <= 'Z' ? tok[i] + 32 : tok[i])))
+            i++;
+        if (i == lt)
+            return 1;
+    }
+    return 0;
+}
+
 static ctl_kind ctl_kind_of(const char *cls)
 {
+    if (!cls || !cls[0])
+        return CTL_SCROLLBAR;
     if (wn_strcaseeq(cls, "Button"))         return CTL_BUTTON;
     if (wn_strcaseeq(cls, "Static"))         return CTL_STATIC;
     if (wn_strcaseeq(cls, "Edit"))           return CTL_EDIT;
@@ -2616,6 +2732,25 @@ static ctl_kind ctl_kind_of(const char *cls)
     if (wn_strcaseeq(cls, "ListBox"))        return CTL_LISTBOX;
     if (wn_strcaseeq(cls, "ComboBox"))       return CTL_COMBO;
     if (wn_strcaseeq(cls, "SysTreeView32"))  return CTL_TREEVIEW;
+    /* Delphi VCL registers each TWinControl subclass under its OWN class
+     * name (CreateSubClass: 'TNewRadioButton' wraps the original BUTTON
+     * proc — the session-17 proc32 contract). Exact-name matching sent
+     * them all to the generic branch: raw TextOutA captions with a
+     * literal '&', no check glyph, no 3D frames, no wrapping — the
+     * "(&accept)" field report. Token matching (most specific first)
+     * restores the ORIGINAL standard control's semantics. */
+    if (u32_cls_has(cls, "RadioButton"))   return CTL_BUTTON;
+    if (u32_cls_has(cls, "CheckBox"))      return CTL_BUTTON;
+    if (u32_cls_has(cls, "GroupBox"))      return CTL_BUTTON;
+    if (u32_cls_has(cls, "CheckListBox"))  return CTL_LISTBOX;
+    if (u32_cls_has(cls, "ListBox"))       return CTL_LISTBOX;
+    if (u32_cls_has(cls, "ComboBox"))      return CTL_COMBO;
+    if (u32_cls_has(cls, "TreeView"))      return CTL_TREEVIEW;
+    if (u32_cls_has(cls, "StaticText"))    return CTL_STATIC;
+    if (u32_cls_has(cls, "RichEdit"))      return CTL_EDIT;
+    if (u32_cls_has(cls, "Memo"))          return CTL_EDIT;
+    if (u32_cls_has(cls, "Edit"))          return CTL_EDIT;
+    if (u32_cls_has(cls, "Button"))        return CTL_BUTTON;
     return CTL_SCROLLBAR;
 }
 
@@ -2646,6 +2781,9 @@ extern WN_API uint32_t g32_SetBkColor(wn_handle hdc, uint32_t color);
 #define BM_CLICK      0x00F5
 /* EM_ 0x00BA.. */
 #define EM_GETSEL     0x00B0
+#define EM_STREAMIN   0x0449          /* WM_USER+73: SF_TEXT/SF_RTF stream */
+#define WN_SF_TEXT    0x0001u
+#define WN_SF_RTF     0x0002u
 #define EM_SETSEL     0x00B1
 #define EM_REPLACESEL 0x00C2
 #define EM_SETLIMITTEXT 0x00C5
@@ -3179,23 +3317,15 @@ static void ctl_set_text(wn_window *w, const char *utf8)
 {
     const char *s = utf8 ? utf8 : "";
     snprintf(w->title, sizeof w->title, "%s", s);
-    /* FULL text into wtext — title is a 127-char display mirror, but
-     * multi-line viewers (Inno's license memo via WM_SETTEXT) hold far
-     * more; truncating through title cut the license to its first line. */
-    uint16_t *t = wn_utf8_to_utf16_n(s, strlen(s));
-    if (t) {
-        size_t i = 0;
-        while (t[i] && i < 511) {
-            w->wtext[i] = t[i];
-            i++;
-        }
-        w->wtext[i] = 0;
-        free(t);
-        w->caret = (int)(i < 511 ? i : 511);
-        return;
-    }
-    user32_set_wtext_utf8(w, w->title);
-    w->caret = (int)(strlen(w->title) < 511 ? strlen(w->title) : 511);
+    /* FULL text into wtext (dynamic) — title stays a 127-char display
+     * mirror, but multi-line viewers (Inno's license memo via WM_SETTEXT,
+     * the richedit viewer via EM_STREAMIN) hold 20KB+; truncating through
+     * title cut the license to its head. */
+    user32_set_wtext_utf8(w, s);
+    size_t n = 0;
+    while (w->wtext[n])
+        n++;
+    w->caret = (int)(n < 511 ? n : 511);
 }
 
 static int64_t ctl_get_text(wn_window *w, char *out, size_t cap)
@@ -3204,7 +3334,10 @@ static int64_t ctl_get_text(wn_window *w, char *out, size_t cap)
      * (title is a 127-char mirror — WM_GETTEXT on the license memo must
      * round-trip the whole text, not its truncated head). */
     if (w->wtext[0]) {
-        char *a = wn_utf16_to_utf8(w->wtext, 511);
+        size_t n16 = 0;
+        while (w->wtext[n16])
+            n16++;
+        char *a = wn_utf16_to_utf8(w->wtext, n16);
         if (a) {
             snprintf(out, cap, "%s", a);
             free(a);
@@ -3234,10 +3367,13 @@ static void ctl_edit_char(wn_window *w, uint16_t ch)
     size_t n = 0;
     while (w->wtext[n])
         n++;
-    if (n + 1 >= 511)
-        return;
     if (w->caret < 0 || (size_t)w->caret > n)
         w->caret = (int)n;
+    /* dynamic growth: one char at a time is rare (typing); realloc up */
+    uint16_t *grown = wn_xrealloc(w->wtext, (n + 2) * sizeof(uint16_t));
+    if (!grown)
+        return;
+    w->wtext = grown;
     /* insert at caret (memmove in uint16 units) */
     for (size_t i = n; i > (size_t)w->caret; i--)
         w->wtext[i] = w->wtext[i - 1];
@@ -3264,6 +3400,217 @@ static void ctl_paint_check(wn_handle hdc, int x, int y, int state, int radio)
     extern WN_API void g32_DrawCtlFrame(wn_handle hdc, int x, int y,
                                         int radio, int state);
     g32_DrawCtlFrame(hdc, x, y, radio, state);
+}
+
+/* --- RTF -> plain text (EM_STREAMIN, SF_RTF) ---------------------------------
+ * Inno Setup feeds the license page through EM_STREAMIN+SF_RTF: the guest
+ * installs an EDITSTREAM callback and Windows PULLS the RTF bytes through
+ * it. The message was silently ignored before, so the license body never
+ * rendered ("the license text is invisible" report). The stripper keeps
+ * the visible text: drops destination groups ({\fonttbl}, {\colortbl},
+ * {\generator}...), decodes \par/\line to newlines, \'hh bytes, \uN,
+ * escaped braces; converts the CP1252 result to UTF-8 for wtext. */
+typedef struct { unsigned char *p; size_t n, cap; } rtf_buf;
+
+static int rtf_put(rtf_buf *b, int c)
+{
+    if (b->n + 1 >= b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 8192;
+        unsigned char *np = wn_xrealloc(b->p, nc);
+        if (!np)
+            return 0;
+        b->p = np;
+        b->cap = nc;
+    }
+    b->p[b->n++] = (unsigned char)c;
+    return 1;
+}
+
+static int rtf_hex4(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* control words whose whole GROUP carries no visible content */
+static int rtf_is_destination(const unsigned char *w, size_t wl)
+{
+    static const char *skip[] = { "fonttbl", "colortbl", "stylesheet",
+        "generator", "info", "pict", "object", "header", "footer",
+        "headerl", "headerr", "headerf", "footnote", "filetbl",
+        "listtable", "listoverridetable", "rsidtbl", "latentstyles",
+        "datastore", "xmlnstbl", "theme", "colorschememapping",
+        "mmathPr", "wgrffmtfilter", "listpicture", "panose", "fname",
+        "company", "title", "subject", "author", "operator", "keywords",
+        "comment", "doccomm", "creatim", "revtim", "printim", "buptim",
+        "version", "nofchars", "nofwords", "edmins", "id", "hlinkbase",
+        "cchs", "vern", NULL };
+    for (int i = 0; skip[i]; i++) {
+        size_t sl = strlen(skip[i]);
+        if (wl == sl && memcmp(w, skip[i], sl) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* CP1252 bytes -> UTF-8 (RTF body bytes are ANSI/CP1252). */
+static char *rtf_cp1252_to_utf8(const unsigned char *in, size_t n)
+{
+    char *out = wn_xmalloc(n * 3 + 4);
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t c = in[i];
+        if (c >= 0x80 && c <= 0x9F) {
+            /* the CP1252 specials (0x80..0x9F); unmapped holes keep U+FFFD */
+            static const uint16_t hi[32] = {
+                0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+                0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F,
+                0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178
+            };
+            c = hi[c - 0x80];
+        }
+        if (c == 0x81 || c == 0x8D || c == 0x8F || c == 0x90 || c == 0x9D)
+            c = 0xFFFD;
+        if (c < 0x80) {
+            out[o++] = (char)c;
+        } else if (c < 0x800) {
+            out[o++] = (char)(0xC0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            out[o++] = (char)(0xE0 | (c >> 12));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+/* RTF bytes -> malloc'd UTF-8 plain text (NULL on OOM). */
+static char *rtf_to_text(const unsigned char *in, size_t in_n)
+{
+    rtf_buf o = { NULL, 0, 0 };
+    /* per-group skip flags (destination groups swallow their content) */
+    int skip[128];
+    int depth = 0;
+    skip[0] = 0;
+    size_t i = 0;
+    if (!in || !in_n)
+        return wn_xstrdup("");
+    if (!rtf_put(&o, 0))     /* ensure a buffer exists */
+        return NULL;
+    o.n = 0;
+    while (i < in_n && depth >= 0) {
+        unsigned char c = in[i];
+        if (c == '{') {
+            if (depth < 126) { depth++; skip[depth] = skip[depth - 1]; }
+            i++;
+            continue;
+        }
+        if (c == '}') {
+            if (depth > 0) depth--;
+            i++;
+            continue;
+        }
+        if (c == '\\') {
+            if (i + 1 >= in_n)
+                break;
+            unsigned char d = in[i + 1];
+            if (d == '\\' || d == '{' || d == '}') {   /* escaped literal */
+                if (!skip[depth]) rtf_put(&o, d);
+                i += 2;
+                continue;
+            }
+            if (d == '~') { if (!skip[depth]) rtf_put(&o, ' '); i += 2; continue; }
+            if (d == '*') { skip[depth] = 1; i += 2; continue; }  /* \* dest */
+            if (d == '-' || d == '_') { i += 2; continue; }        /* soft hyph */
+            if (d == '\'') {                                       /* \'hh */
+                int h1 = (i + 2 < in_n) ? rtf_hex4(in[i + 2]) : -1;
+                int h2 = (i + 3 < in_n) ? rtf_hex4(in[i + 3]) : -1;
+                if (h1 >= 0 && h2 >= 0) {
+                    if (!skip[depth]) rtf_put(&o, (h1 << 4) | h2);
+                    i += 4;
+                    continue;
+                }
+                i += 2;
+                continue;
+            }
+            /* control word: \word[+-]?digits?  [one optional space] */
+            i++;
+            size_t ws = i;
+            while (i < in_n && ((in[i] >= 'a' && in[i] <= 'z') ||
+                                (in[i] >= 'A' && in[i] <= 'Z')))
+                i++;
+            size_t wl = i - ws;
+            long num = 0;
+            int have_num = 0;
+            size_t ds = i;
+            if (i < in_n && in[i] == '-') i++;
+            if (i < in_n && in[i] >= '0' && in[i] <= '9') {
+                size_t ns = i;
+                while (i < in_n && in[i] >= '0' && in[i] <= '9') i++;
+                for (size_t k = ns; k < i; k++)
+                    num = num * 10 + (in[k] - '0');
+                have_num = 1;
+            }
+            if (i < in_n && in[i] == ' ')
+                i++;
+            (void)ds;
+            if (wl && rtf_is_destination(in + ws, wl)) {
+                skip[depth] = 1;
+                continue;
+            }
+            if (skip[depth])
+                continue;
+            if (wl == 3 && memcmp(in + ws, "par", 3) == 0)
+                rtf_put(&o, '\n');
+            else if (wl == 4 && memcmp(in + ws, "line", 4) == 0)
+                rtf_put(&o, '\n');
+            else if (wl == 4 && memcmp(in + ws, "sect", 4) == 0)
+                rtf_put(&o, '\n');
+            else if (wl == 4 && memcmp(in + ws, "page", 4) == 0)
+                rtf_put(&o, '\n');
+            else if (wl == 3 && memcmp(in + ws, "tab", 3) == 0)
+                rtf_put(&o, '\t');
+            else if (wl == 1 && in[ws] == 'u' && have_num) {
+                /* \uN: one UTF-16 code unit. Surrogate pairs are rare in
+                 * license text — lone surrogates become U+FFFD. */
+                uint32_t cp = (uint32_t)num;
+                if (cp >= 0xD800 && cp <= 0xDFFF)
+                    cp = 0xFFFD;
+                if (cp < 0x80) {
+                    rtf_put(&o, (int)cp);
+                } else if (cp < 0x800) {
+                    rtf_put(&o, (int)(0xC0 | (cp >> 6)));
+                    rtf_put(&o, (int)(0x80 | (cp & 0x3F)));
+                } else {
+                    rtf_put(&o, (int)(0xE0 | (cp >> 12)));
+                    rtf_put(&o, (int)(0x80 | ((cp >> 6) & 0x3F)));
+                    rtf_put(&o, (int)(0x80 | (cp & 0x3F)));
+                }
+                /* the substitution byte(s) after \uN (\uc default 1):
+                 * drop the next raw char if it is a plain literal */
+                if (i < in_n && in[i] != '\\' && in[i] != '{' && in[i] != '}')
+                    i++;
+            }
+            continue;
+        }
+        if (c == '\r' || c == '\n') {   /* raw CR/LF: RTF layout only */
+            i++;
+            continue;
+        }
+        if (!skip[depth])
+            rtf_put(&o, c);
+        i++;
+    }
+    if (!o.p)
+        return NULL;
+    char *utf8 = rtf_cp1252_to_utf8(o.p, o.n);
+    free(o.p);
+    return utf8;
 }
 
 static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
@@ -3401,9 +3748,15 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
             break;
         }
         case CTL_EDIT: {
-            if (w->style & 0x4 /*ES_MULTILINE: the license/memo viewers —
-                                 Inno's TNewMemo is an EDIT superclass and
-                                 its whole multi-line text lives in wtext */) {
+            /* Rich edits and memos are MULTI-LINE BY CLASS (VCL may omit
+             * the ES_MULTILINE style bit — Inno's TRichEditViewer renders
+             * through TEdit). Style-bit OR class-name decides; falling
+             * back to the single-line branch drew the 127-char title
+             * mirror instead of the streamed license (one clipped line).*/
+            int is_memo = (w->style & 0x4) != 0 ||
+                          u32_cls_has(cls, "RichEdit") ||
+                          u32_cls_has(cls, "Memo");
+            if (is_memo) {
                 int32_t mr[4] = { 4, 2, W - 4, H - 2 };
                 g32_DrawTextW(hdc, w->wtext, -1, mr,
                               0x10 /*DT_WORDBREAK*/ | 0x100 /*DT_NOPREFIX*/);
@@ -3426,7 +3779,11 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
                 /* resource painting handled via STM_SETIMAGE later */
             } else {
                 int32_t tr[4] = { 4, 0, W - 4, H };
-                uint32_t fmt = 0x20 | 0x24;   /* statics parse prefixes */
+                /* Windows statics WRAP by default (no DT_SINGLELINE): the
+                 * wizard's long instruction labels need their 2nd line.
+                 * Top-align: VCENTER would clip BOTH lines when the block
+                 * grows taller than the control. */
+                uint32_t fmt = 0x10 /*WORDBREAK|LEFT|TOP*/;
                 if ((w->style & 0x3) == 0x1) fmt |= 2;          /* RIGHT */
                 else if ((w->style & 0x3) == 0x2) fmt |= 6;     /* CENTER */
                 g32_DrawTextA(hdc, w->title, -1, tr, fmt);
@@ -3627,7 +3984,7 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         /* honest line count for multi-line viewers (VCL/Inno's license
          * memo layout queries it; "1" broke page setup) */
         int64_t n = 1;
-        for (size_t i = 0; w->wtext[i] && i < 512; i++)
+        for (size_t i = 0; w->wtext[i]; i++)
             if (w->wtext[i] == '\n')
                 n++;
         return n;
@@ -3637,6 +3994,138 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         ctl_repaint(w);
         ctl_notify(w, 0x0300 /* EN_CHANGE */);
         return 0;
+    }
+    case EM_STREAMIN: {
+        /* The license viewer's feed: Windows PULLS bytes through the
+         * guest's EDITSTREAM callback, in chunks, until it returns
+         * *pcb == 0 (or an error code). Buffers must be GUEST-addressable
+         * — the 32-bit callback receives them as 32-bit pointers, so they
+         * come from the low heap on the x64 host. The 4-arg stdcall shape
+         * matches the wndproc bridge exactly (i386 native: direct call). */
+        if (k != CTL_EDIT)
+            return 0;
+        uint32_t flags = (uint32_t)wp;
+        /* EDITSTREAM layout is GUEST-ARCH dependent:
+         * i386: { u32 cookie; u32 error; u32 pfn } (12 bytes)
+         * x64:  { u32 cookie; u32 error; u64 pfn } (16 bytes)
+         * 32-bit guests need low-heap buffers so the callback receives
+         * real 32-bit pointers; 64-bit guests are called natively. */
+        int g32 = u32_guest32();
+        uint8_t *chunk = NULL;
+        int32_t *pcb = NULL;
+        uint64_t cookie = 0, pfn = 0;
+        size_t err_off = 0;
+        if (g32) {
+            uint32_t *es = (uint32_t *)(uintptr_t)lp;
+            if (!es || !es[2])
+                return 0;
+            cookie = es[0];
+            pfn = es[2];
+            err_off = 4;
+            chunk = wn_low_malloc(8192);
+            pcb = wn_low_malloc(sizeof(int32_t));
+        } else {
+            uint32_t *eh = (uint32_t *)(uintptr_t)lp;
+            if (!eh || !eh[2])
+                return 0;
+            cookie = eh[0];
+            memcpy(&pfn, (const void *)(lp + 8), sizeof pfn);
+            err_off = 4;
+            chunk = wn_xmalloc(8192);
+            pcb = wn_xmalloc(sizeof(int32_t));
+        }
+        if (!chunk || !pcb) {
+            if (g32) { wn_low_free(chunk); wn_low_free(pcb); }
+            else { free(chunk); free(pcb); }
+            return 0;
+        }
+        rtf_buf acc = { NULL, 0, 0 };
+        size_t total = 0;
+        for (;;) {
+            *pcb = 0;
+            uint64_t cr;
+            if (g32)
+                cr = wn_wow64_call_wndproc32(
+                    (uint32_t)pfn, (uint32_t)cookie,
+                    (uint32_t)(uintptr_t)chunk, 8192,
+                    (uint32_t)(uintptr_t)pcb);
+            else
+                /* x64 guest: Win64 ABI (ms_abi) — a plain host fn-pointer
+                 * type would pass args in SysV registers. */
+                cr = ((WN_API uint64_t (*)(uint64_t, uint64_t, uint64_t,
+                                           uint64_t))
+                      (uintptr_t)pfn)(cookie, (uint64_t)(uintptr_t)chunk,
+                                     8192, (uint64_t)(uintptr_t)pcb);
+            if (cr != 0) {
+                /* Windows copies the callback's error into dwError */
+                *(uint32_t *)(uintptr_t)(lp + err_off) = (uint32_t)cr;
+                break;
+            }
+            int32_t got = *pcb;
+            if (got <= 0)
+                break;
+            if (total + (size_t)got > (4u << 20))
+                break;                      /* runaway stream: cut it off */
+            while (acc.n + (size_t)got + 1 >= acc.cap) {
+                size_t nc = acc.cap ? acc.cap * 2 : 16384;
+                unsigned char *np = wn_xrealloc(acc.p, nc);
+                if (!np)
+                    break;
+                acc.p = np;
+                acc.cap = nc;
+            }
+            if (acc.n + (size_t)got + 1 >= acc.cap)
+                break;                      /* OOM: stop cleanly */
+            memcpy(acc.p + acc.n, chunk, (size_t)got);
+            acc.n += (size_t)got;
+            total += (size_t)got;
+        }
+        if (g32) { wn_low_free(chunk); wn_low_free(pcb); }
+        else { free(chunk); free(pcb); }
+        /* RichEdits auto-detect content: bytes WITHOUT the {\rtf
+         * signature are PLAIN TEXT even when the caller said SF_RTF —
+         * Inno streams license.txt under the SF_RTF flag and VCL relies
+         * on the control's leniency. The RTF path drops raw CR/LF as
+         * "layout only", which glued every paragraph of plain text
+         * together ("PUC-Rio.Permission"). */
+        int is_rtf = 0;
+        if ((flags & WN_SF_RTF) && acc.n >= 5) {
+            is_rtf = (acc.p[0] == '{' && acc.p[1] == '\\' &&
+                      (acc.p[2] | 0x20) == 'r' &&
+                      (acc.p[3] | 0x20) == 't' &&
+                      (acc.p[4] | 0x20) == 'f');
+        }
+        char *text = NULL;
+        if (is_rtf) {
+            text = rtf_to_text(acc.p ? acc.p : (const unsigned char *)"",
+                               acc.p ? acc.n : 0);
+        } else {
+            /* plain text: CRLF/CR -> LF, then CP1252 -> UTF-8 */
+            size_t out_n = 0;
+            unsigned char *tmp = wn_xmalloc(acc.n + 1);
+            for (size_t q = 0; q < acc.n; q++) {
+                unsigned char c = acc.p[q];
+                if (c == '\r') {
+                    if (q + 1 < acc.n && acc.p[q + 1] == '\n')
+                        continue;                    /* CRLF -> LF */
+                    tmp[out_n++] = '\n';             /* lone CR -> LF */
+                    continue;
+                }
+                tmp[out_n++] = c;
+            }
+            text = rtf_cp1252_to_utf8(tmp, out_n);
+            free(tmp);
+        }
+        free(acc.p);
+        wn_log(WN_LOG_DEBUG, "user32: EM_STREAMIN(%s) %zu bytes -> %zu chars",
+               is_rtf ? "rtf" : "text", total,
+               text ? strlen(text) : (size_t)0);
+        if (text) {
+            ctl_set_text(w, text);
+            free(text);
+        }
+        ctl_repaint(w);
+        return (uint64_t)total;
     }
     case LB_INSERTSTRING: {
         char *a = (lp && (wp & 1)) ? wn_utf16_to_utf8((const uint16_t *)(uintptr_t)lp, 4096)
@@ -4523,6 +5012,15 @@ static WN_API int32_t u32_GetWindowTextA(wn_abiword hwnd, char *buf, int32_t max
     return (int32_t)strlen(buf);
 }
 
+/* IsWindowVisible: the WINDOW's show state (not the WS_VISIBLE bit, not
+ * "is an ancestor visible"). A zero-sized popup stays visible=TRUE — the
+ * flag is the contract; the X11 backend simply never maps it. */
+static WN_API int32_t u32_IsWindowVisible(wn_abiword hwnd)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    return (w && w->visible) ? 1 : 0;
+}
+
 /* --- cursors + icons ------------------------------------------------------------
  * LoadCursor/LoadIcon return handle-backed resources; the standard IDC_/IDI_
  * names draw from built-in pixel art. Exe resource icons load through
@@ -5394,7 +5892,12 @@ static WN_API int32_t u32_GetWindowTextLengthA(wn_abiword hwnd)
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
         return 0;
-    return (int32_t)strlen(w->title);
+    /* Windows returns the FULL text length (the window may carry a
+     * multi-line payload in wtext, not the 127-char title mirror). */
+    size_t n = 0;
+    while (w->wtext[n])
+        n++;
+    return (int32_t)n;
 }
 
 static WN_API int32_t u32_GetWindowTextLengthW(wn_abiword hwnd)
@@ -6473,6 +6976,7 @@ const wn_export_entry wn_user32_exports[] = {
     { "SetDlgItemTextA", u32_SetDlgItemTextA },
     { "SetWindowTextA", u32_SetWindowTextA },
     { "GetWindowTextA", u32_GetWindowTextA },
+    { "IsWindowVisible", u32_IsWindowVisible },
     { "GetWindowLongPtrA", u32_GetWindowLongPtrA },
     { "SetWindowLongPtrA", u32_SetWindowLongPtrA },
     { "MessageBoxA", u32_MessageBoxA },

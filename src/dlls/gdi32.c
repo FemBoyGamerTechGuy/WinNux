@@ -1581,6 +1581,27 @@ static WN_API wn_handle g32_CreatePalette(const void *logpal)
     return gdi_new(o);
 }
 
+/* Palette selection on a 32bpp true-color surface model: no hardware
+ * palette exists. Windows contract: SelectPalette returns the palette
+ * previously selected into the DC (GetStockObject(DEFAULT_PALETTE) = 1
+ * when none was) and RealizePalette returns how many entries were mapped
+ * (0 for a no-op). Inno's RTF viewer stores the old handle to restore —
+ * the returning-0 stub made GetLastError=120 noise and a NULL restore. */
+static WN_API wn_handle g32_SelectPalette(wn_handle hdc, wn_handle hpal,
+                                          wn_abiword force_bkgnd)
+{
+    (void)hdc;
+    (void)hpal;
+    (void)force_bkgnd;
+    return (wn_handle)1;        /* DEFAULT_PALETTE */
+}
+
+static WN_API int32_t g32_RealizePalette(wn_handle hdc)
+{
+    (void)hdc;
+    return 0;                   /* no entries remapped (true-color) */
+}
+
 static WN_API int32_t g32_SetStretchBltMode(wn_handle hdc, int32_t mode)
 {
     (void)hdc;
@@ -2216,26 +2237,46 @@ static int32_t draw_text_common(gdi_obj *dc, const uint16_t *s, size_t n,
     } else {
         u_line = -1;
     }
-    /* wrap: split at spaces/newlines when WORDBREAK */
+    /* wrap: DT_WORDBREAK breaks at WORD boundaries (the last space that
+     * still fits), not at the exact overflow pixel — the old hard break
+     * split "hereby" as "here"/"by" in the license text. A single word
+     * wider than the rect still hard-breaks (Windows does too). */
     int max_w = r[2] - r[0];
+    int wrap = (f & 0x10) != 0;
     int lines = 1;
     int widest = 0;
-    int cur = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (s[i] == '\n') {
-            if (cur > widest) widest = cur;
-            cur = 0;
-            lines++;
+    size_t i2 = 0;
+    for (;;) {
+        if (i2 >= n)
+            break;
+        if (s[i2] == u'\n') {           /* newline NOT after a drawn line */
+            i2++;                        /* (the terminator of a drawn line */
+            lines++;                     /* is consumed inside that step) */
             continue;
         }
-        cur += adv;
-        if ((f & 0x10) && max_w > adv && cur > max_w) {
-            if (cur - adv > widest) widest = cur - adv;
-            cur = adv;
-            lines++;
+        size_t len = 0;
+        int wpx = 0;
+        size_t sp = 0;                  /* last line-break candidate */
+        while (i2 + len < n && s[i2 + len] != u'\n') {
+            if (wrap && max_w > adv && wpx + adv > max_w && len > 0)
+                break;
+            wpx += adv;
+            if (s[i2 + len] == u' ')
+                sp = len + 1;           /* break AFTER the space */
+            len++;
+        }
+        /* broke mid-word? roll back to the last space if one exists */
+        if (wrap && sp > 0 && sp < len &&
+            i2 + len < n && s[i2 + len] != u'\n')
+            len = sp;
+        if ((int)len * adv > widest)
+            widest = (int)len * adv;
+        i2 += len;
+        if (i2 < n && s[i2] == u'\n') {
+            i2++;                       /* terminator of THIS line: it  */
+            lines++;                    /* also STARTS the next line   */
         }
     }
-    if (cur > widest) widest = cur;
     int text_h = lines * cell_h;
     if (calc) {
         r[2] = r[0] + widest;
@@ -2248,19 +2289,31 @@ static int32_t draw_text_common(gdi_obj *dc, const uint16_t *s, size_t n,
         y0 = r[3] - text_h;
     else if (f & 0x20 /*VCENTER*/)
         y0 = r[1] + (r[3] - r[1] - text_h) / 2;
-    /* draw line by line */
+    /* draw line by line (same breaker as the measure pass) */
     size_t i = 0;
     int line_idx = 0;
-    while (i < n && line_idx < lines) {
+    while (line_idx < lines) {
+        if (i >= n)
+            break;
+        if (s[i] == u'\n') {            /* empty line */
+            i++;
+            line_idx++;
+            continue;
+        }
         size_t start = i, len = 0;
         int wpx = 0;
-        while (i < n && s[i] != '\n') {
-            if ((f & 0x10) && max_w > adv && wpx + adv > max_w)
+        size_t sp = 0;
+        while (i + len < n && s[i + len] != u'\n') {
+            if (wrap && max_w > adv && wpx + adv > max_w && len > 0)
                 break;
             wpx += adv;
+            if (s[i + len] == u' ')
+                sp = len + 1;
             len++;
-            i++;
         }
+        if (wrap && sp > 0 && sp < len &&
+            i + len < n && s[i + len] != u'\n')
+            len = sp;
         int x0 = r[0];
         if ((f & 2) /*RIGHT*/)
             x0 = r[2] - wpx;
@@ -2277,9 +2330,11 @@ static int32_t draw_text_common(gdi_obj *dc, const uint16_t *s, size_t n,
             fill_rect_rgb(dc, x0 + pre, uy, x0 + pre + (chw ? chw : adv),
                           uy + 1, colorref_to_u32(dc->dc.text_color));
         }
-        if (i < n && s[i] == '\n')
-            i++;
-        line_idx++;
+        i += len;
+        if (i < n && s[i] == u'\n')
+            i++;                           /* terminator of THIS line: the */
+        line_idx++;                       /* loop-top '\n' branch handles  */
+        continue;                         /* the ones BETWEEN lines only */
     }
     return text_h;
 }
@@ -2370,6 +2425,23 @@ WN_API int32_t g32_DefaultFontHeight(void)
 }
 
 /* checkbox / radio frames, Windows-classic style */
+
+/* filled disc raster (center cx,cy, radius r) — the radio-button glyph */
+static void g32_fill_disc(wn_handle hdc, int cx, int cy, int r, uint32_t rgb)
+{
+    wn_handle b = g32_CreateSolidBrush(rgb);
+    for (int dy = -r; dy <= r; dy++) {
+        /* half-width from the circle equation, clamped >= 0 */
+        int hw = 0;
+        int rr = r * r - dy * dy;
+        for (hw = r; hw > 0 && hw * hw > rr; hw--)
+            ;
+        int32_t row[4] = { cx - hw, cy + dy, cx + hw + 1, cy + dy + 1 };
+        g32_FillRect(hdc, row, b);
+    }
+    wn_handle_close(b);
+}
+
 WN_API void g32_DrawCtlFrame(wn_handle hdc, int x, int y, int radio, int state)
 {
     gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
@@ -2378,7 +2450,18 @@ WN_API void g32_DrawCtlFrame(wn_handle hdc, int x, int y, int radio, int state)
     uint32_t box = state ? 0 : 0x00FFFFFF;
     uint32_t mark = state ? 0x00000000 : 0x00000000;
     uint32_t shad = 0x00808080;
-    /* shadow + box */
+    if (radio) {
+        /* radio = RING + dot — the classic glyph; the old square read as
+         * a checkbox (the "(I)"-glyph field report). Disc layering:
+         * drop shadow, dark ring, light interior, checked dot. */
+        g32_fill_disc(hdc, x + 7, y + 7, 6, shad);       /* +1,+1 shadow */
+        g32_fill_disc(hdc, x + 6, y + 6, 6, 0x00606060); /* ring */
+        g32_fill_disc(hdc, x + 6, y + 6, 4, 0x00FFFFFF); /* interior */
+        if (state)
+            g32_fill_disc(hdc, x + 6, y + 6, 3, mark);   /* the dot */
+        return;
+    }
+    /* checkbox: shadow + box */
     int r_[4];
     r_[0] = x + 1; r_[1] = y + 1; r_[2] = x + 13; r_[3] = y + 13;
     wn_handle b1 = g32_CreateSolidBrush(shad);
@@ -2390,19 +2473,13 @@ WN_API void g32_DrawCtlFrame(wn_handle hdc, int x, int y, int radio, int state)
     wn_handle_close(b2);
     if (state) {
         wn_handle b3 = g32_CreateSolidBrush(mark);
-        if (radio) {
-            r_[0] = x + 3; r_[1] = y + 3; r_[2] = x + 9; r_[3] = y + 9;
-        } else {
-            /* check mark: two thick strokes */
-            int32_t m1[4] = { x + 2, y + 6, x + 4, y + 8 };
-            int32_t m2[4] = { x + 4, y + 8, x + 9, y + 3 };
-            g32_FillRect(hdc, m1, b3);
-            g32_FillRect(hdc, m2, b3);
-            wn_handle_close(b3);
-            return;
-        }
-        g32_FillRect(hdc, r_, b3);
+        /* check mark: two thick strokes */
+        int32_t m1[4] = { x + 2, y + 6, x + 4, y + 8 };
+        int32_t m2[4] = { x + 4, y + 8, x + 9, y + 3 };
+        g32_FillRect(hdc, m1, b3);
+        g32_FillRect(hdc, m2, b3);
         wn_handle_close(b3);
+        return;
     }
 }
 
@@ -2465,6 +2542,8 @@ const wn_export_entry wn_gdi32_exports[] = {
     { "CreateBrushIndirect", g32_CreateBrushIndirect },
     { "CreateDIBitmap", g32_CreateDIBitmap },
     { "CreatePalette", g32_CreatePalette },
+    { "SelectPalette", g32_SelectPalette },
+    { "RealizePalette", g32_RealizePalette },
     { "CreatePenIndirect", g32_CreatePenIndirect },
     { "CreateCompatibleBitmap", g32_CreateCompatibleBitmap },
     { "CreateCompatibleDC", g32_CreateCompatibleDC },

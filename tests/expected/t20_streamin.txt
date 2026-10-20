@@ -1,0 +1,8 @@
+0
+T20 WM_SETTEXT titles the toplevel
+T20 plain text under SF_RTF: paragraphs intact, CRLF->LF
+T20 RTF stripped: fonttbl gone, \par -> LF
+T20 SF_TEXT stream round-trips
+T20 VCL-named radio keeps BUTTON semantics
+T20 zero-sized popup: visible flag kept
+T20 OK

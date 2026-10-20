@@ -1281,11 +1281,17 @@ uint64_t wn_wow64_call_wndproc32(uint32_t proc32, uint32_t a0, uint32_t a1,
                                  uint32_t a2, uint32_t a3)
 {
     /* Guest procs are NATIVE code on this build — call directly through a
-     * stdcall function pointer (the 4-arg stdcall shape is WN_API here). */
+     * stdcall function pointer (the 4-arg stdcall shape is WN_API here).
+     *
+     * The i386 ABI defines only EAX for DWORD/LRESULT returns: the upper
+     * half of RAX is whatever the callee left there. Truncate to 32 bits
+     * or a "return 0" callback (Inno's EM_STREAMIN reader: pcb=1088 but
+     * garbage-high cr looked like an error) poisons every != 0 check. */
     typedef WN_API uint64_t (*p4)(uint32_t, uint32_t, uint32_t, uint32_t);
     if (!proc32)
         return 0;
-    return ((p4)(uintptr_t)proc32)(a0, a1, a2, a3);
+    uint64_t r = ((p4)(uintptr_t)proc32)(a0, a1, a2, a3);
+    return (uint64_t)(uint32_t)r;
 }
 
 
