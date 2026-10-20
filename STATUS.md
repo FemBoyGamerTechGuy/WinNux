@@ -113,7 +113,7 @@ the way), verified by a full synthetic-input E2E under qemu-i386 + Xvfb:
 Suite 23/23 (t21_baseline, t22_msgbox, t23_scrollbars new; all .gui cases
 under Xvfb). E2E under qemu-i386 + Xvfb: wizard paints with uniform text
 pitch, license page + viewer scrollbar verified, close -> real Exit
-Setup? box -> Yes -> clean exit rc=2. Commit <TO_FILL> pushed and
+Setup? box -> Yes -> clean exit rc=2. Commit 2047966 (code commit; this docs commit on top) pushed and
 verified (origin/main == HEAD).
 
 ## Date: 2026-10-20 (session 19: THE LICENSE PAGE IS REAL — EM_STREAMIN feed, VCL class-kind tokens, caption/titles/ghost-window chain)

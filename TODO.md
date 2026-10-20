@@ -7,7 +7,7 @@ put it here. Never silently drop items; move them to STATUS.md when done.
 
 ## P0 — installer bring-up (session 20 state)
 
-THE WIZARD IS INTERACTIVE (session 20, commit <TO_FILL>): the close flow
+THE WIZARD IS INTERACTIVE (session 20, commit 2047966 (code commit; this docs commit on top)): the close flow
 is COMPLETE and E2E-verified (WM_DELETE_WINDOW -> WM_SYSCOMMAND(SC_CLOSE)
 -> Inno confirm -> REAL modal Exit-Setup box -> Yes -> IDYES -> clean
 rc=2 exit), the text baseline is fixed (baseline-aligned atlas +
