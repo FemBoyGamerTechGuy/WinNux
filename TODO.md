@@ -4,35 +4,45 @@ Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
 
-## P0 — installer bring-up (session 18 state)
 
-THE WIZARD PAINTS (session 18, commit b73c782): one visible window, the
-license page fully rendered (text, radios, buttons, sidebar image), idles
-clean. The white window / two windows / dead-close-button report is closed
-root-and-branch: i386 X11 event overlays, SW_HIDE mapping, 0x0-window
-inflation, the SetWindowPos SWP_SHOWWINDOW early-return, the child paint
-pipeline, and the GDI clip/origin/DIB family — full decode chain in
-session-18 STATUS.md. New P0 = interact with the real pixels:
+## P0 — installer bring-up (session 20 state)
 
-0. CLICK THROUGH (the pixels are real now — session 19 closed the license
-   page: EM_STREAMIN feed, VCL class kinds, captions, titles, one window):
-   synthetic input via scripts/dev xtree click mode. Welcome Next ->
-   license radio (BM_SETCHECK already real) -> components checklist ->
-   dir page -> install. Expect ScrollWindowEx scrolling, the progress
-   bar, and richedit scrolling (the license viewer shows the first
-   screenful; EM_LINESCROLL/SetScrollPos are the next contracts) as the
-   next pieces.
-1. DONE (session 19, commit 295f6cf): the license body renders — Inno
-   feeds it via EM_STREAMIN+SF_RTF with plain-text bytes; the stream
-   loop + RTF stripper + plain-text auto-detect landed, gated by
-   t20_streamin (20/20). Remaining polish: viewer scrolling (see 0).
-2. /S SILENT PATH + lua.exe smoke test (unchanged from session 17).
-3. Session-11 wow64 width-bug pattern audit: STILL OPEN, and this session
-   added fresh per-arch surfaces (x11_backend offsets, ScrollWindowEx
-   prcUpdate RECT) — all guest-RECT layouts are arch-independent (4x LONG).
-4. i686 32-bit smoke suite under run32.sh (unchanged; now also covers the
-   new GDI clip/origin paths).
+THE WIZARD IS INTERACTIVE (session 20, commit <TO_FILL>): the close flow
+is COMPLETE and E2E-verified (WM_DELETE_WINDOW -> WM_SYSCOMMAND(SC_CLOSE)
+-> Inno confirm -> REAL modal Exit-Setup box -> Yes -> IDYES -> clean
+rc=2 exit), the text baseline is fixed (baseline-aligned atlas +
+SetTextAlign/ExtTextOut/GetPixel + tmAscent consistency, t21 pins it for
+BOTH font paths), real scrollbars landed (SCROLLINFO/SBM_/EM_LINESCROLL/
+paint/input/wheel, t23), stub logging is deduped with an atexit summary,
+and the input/state API batch is real (GetKeyState/GetAsyncKeyState/
+GetWindowThreadProcessId/EnumWindows/EnumThreadWindows/WM_MOUSEWHEEL).
+
+0. WIZARD CLICK-THROUGH: welcome/license/components pages ADVANCE under
+   synthetic clicks; the DIRECTORY page freezes on Next (the click
+   dispatches, Inno does not move pages — no error box, no log noise).
+   Debug trace exists (winnux32 + WINNUX_LOG=debug under qemu; see the
+   session-20 worklog notes for the exact run). The components page
+   needed a checklist item click BEFORE Next would advance (state
+   contract suspicion: Inno re-reads checklist state via LB_ and our
+   answers leave it "nothing selected" until a click lands).
+   -> hunt the dir-page Next handler's wait/branch; then Finish flow,
+   files-in-prefix check, and the installed lua.exe smoke run.
+1. /S SILENT PATH + lua.exe smoke test (unchanged; the /S path shares
+   the same engine as the interactive flow).
+2. wow64-engine crash (session-11 carryover): under WINNUX_WOW64=1 the
+   Inno ENGINE faults writing to its own RO section at tmp+0x1bb7
+   (addr 0x40a998). The wizard runs ONLY on the i386 runtime (winnux32,
+   which the acceptance command re-execs). Root-cause this next if the
+   x64 path matters for users.
+3. RichEdit viewer scrolling polish: EM_LINESCROLL/GETFIRSTVISIBLELINE
+   are real; VCL also drives the viewer via WM_VSCROLL codes from the
+   ADORNMENT bar (verified painted). Wire the license page's keyboard
+   (PgUp/PgDn/arrow keys) through IsDialogMessage if the wizard needs it.
+4. i686 32-bit smoke suite under run32.sh (the sandbox runs i386 via
+   qemu-user now; the toolchain/root32 sysroot is REPRODUCIBLE from
+   scripts/bootstrap_root32.sh + the libX11 debs).
 Older P0 notes (session 11/12 handoff):
+
 
 The reported PeekMessage pump bug is FIXED+verified; the LuaForWindows /S run
 now: outer instance extracts + spawns the is-*.tmp engine, the engine reads

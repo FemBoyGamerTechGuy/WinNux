@@ -255,8 +255,6 @@ static const struct { const char *dll, *name; uint8_t nargs; } g_stub_pop_table[
     { "user32.dll", "EnableMenuItem", 3 },
     { "gdi32.dll", "EnumFontFamiliesExA", 5 },
     { "gdi32.dll", "EnumFontFamiliesExW", 5 },
-    { "user32.dll", "EnumThreadWindows", 3 },
-    { "user32.dll", "EnumWindows", 2 },
     { "user32.dll", "EqualRect", 2 },
     { "gdi32.dll", "ExtCreatePen", 11 },
     { "gdi32.dll", "ExtFloodFill", 5 },
@@ -274,7 +272,6 @@ static const struct { const char *dll, *name; uint8_t nargs; } g_stub_pop_table[
     { "kernel32.dll", "GetDiskFreeSpaceA", 5 },
     { "user32.dll", "GetIconInfo", 2 },
     { "user32.dll", "GetKeyNameTextA", 3 },
-    { "user32.dll", "GetKeyState", 1 },
     { "user32.dll", "GetLastActivePopup", 1 },
     { "kernel32.dll", "GetLogicalDrives", 0 },
     { "user32.dll", "GetMenu", 1 },
@@ -284,18 +281,15 @@ static const struct { const char *dll, *name; uint8_t nargs; } g_stub_pop_table[
     { "user32.dll", "GetMessagePos", 0 },
     { "gdi32.dll", "GetObjectA", 3 },
     { "gdi32.dll", "GetPaletteEntries", 4 },
-    { "gdi32.dll", "GetPixel", 3 },
     { "kernel32.dll", "GetPrivateProfileStringA", 6 },
     { "kernel32.dll", "GetProfileStringA", 5 },
     { "user32.dll", "GetPropA", 2 },
-    { "user32.dll", "GetScrollPos", 2 },
     { "kernel32.dll", "GetShortPathNameA", 3 },
     { "user32.dll", "GetSubMenu", 2 },
     { "user32.dll", "GetSystemMenu", 2 },
     { "gdi32.dll", "GetSystemPaletteEntries", 4 },
     { "user32.dll", "GetWindow", 2 },
     { "user32.dll", "GetWindowRgn", 2 },
-    { "user32.dll", "GetWindowThreadProcessId", 2 },
     { "kernel32.dll", "GlobalAddAtomA", 1 },
     { "kernel32.dll", "GlobalDeleteAtom", 1 },
     { "kernel32.dll", "GlobalHandle", 1 },
@@ -439,17 +433,25 @@ WN_STUBIMPL_DECL void wn_stub_entry_impl(wn_abiword info_p, wn_abiword a1,
         (void)!write(2, info->name, strlen(info->name));
         (void)!write(2, "\n", 1);
     }
-    if (wn_log_level() >= WN_LOG_TRACE || info->hits == 1 || info->hits % 1000 == 0) {
+    wn_last_error_set(120 /* ERROR_CALL_NOT_IMPLEMENTED */);
+    /* Dedupe: the detailed incident line is logged once per
+     * (dll, api, caller site); every later hit from that site only
+     * bumps the site counter (the atexit stub summary in log.c prints
+     * the totals). The old every-1000th re-log flooded installer runs
+     * and buried the real errors. */
+    char where[96] = "?";
+    wn_module_describe_addr((const void *)(uintptr_t)guest_ret, where,
+                            sizeof where);
+    if (info->hits == 1) {
         wn_log(WN_LOG_ERR, "STUB %s!%s(args: 0x%llx 0x%llx 0x%llx 0x%llx)",
                info->dll, info->name,
                (unsigned long long)a1, (unsigned long long)a2,
                (unsigned long long)a3, (unsigned long long)a4);
-        char where[96] = "?";
-        wn_module_describe_addr((const void *)(uintptr_t)guest_ret, where, sizeof where);
         wn_log(WN_LOG_ERR, "STUB %s!%s called from %s -> returning 0, "
-               "GetLastError=120", info->dll, info->name, where);
-        wn_last_error_set(120 /* ERROR_CALL_NOT_IMPLEMENTED */);
+               "GetLastError=120 (deduped: later hits are counted per site)",
+               info->dll, info->name, where);
     }
+    wn_stub_site_note(info->dll, info->name, where);
 }
 
 static void ensure_region(void)

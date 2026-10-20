@@ -66,6 +66,10 @@ typedef struct gdi_dc_state {
      * org-shifted draw landed at the wrong place (wizard stalled after the
      * first label). Defaults (0,0) = identity, so nothing else changes. */
     int worg_x, worg_y, vporg_x, vporg_y;
+    /* SetTextAlign mode (TA_*; default 0 = TOP|LEFT|NOUPDATECP). TextOut
+     * and ExtTextOut read it — TA_BASELINE y = the BASELINE row, so the
+     * ascent source must match the blit path (see font_ascent). */
+    uint32_t text_align;
 } gdi_dc_state;
 
 typedef struct gdi_obj {
@@ -329,6 +333,67 @@ static int draw_text16(gdi_obj *dc, int x, int y,
     return cx - x;
 }
 
+/* Baseline row for the DC font, in pixels: THE single source shared by
+ * the blit path (FT: face ascender; atlas: WN_FONT_BASELINE scaled by
+ * cell height, exactly how draw_glyph_cell maps rows), by TA_BASELINE /
+ * TA_BOTTOM origin math, and by GetTextMetricsA — so what you measure is
+ * what you draw (the field report: "letters vertically misaligned, some
+ * higher and some lower"). */
+static int font_ascent(gdi_obj *dc, int *descent, int *height)
+{
+    gdi_obj *f = dc->dc.cur_font ? dc->dc.cur_font : default_font(dc);
+    if (f && f->kind == GDI_FONT && f->font.ft_slot >= 0 &&
+        wn_ft_available()) {
+        int asc, desc, hgt, avg;
+        wn_ft_metrics(f->font.ft_slot, &asc, &desc, &hgt, &avg);
+        if (descent) *descent = desc;
+        if (height) *height = hgt;
+        return asc;
+    }
+    int cell_h, adv;
+    font_metrics(dc, &cell_h, &adv);
+    int asc = cell_h * WN_FONT_BASELINE / WN_FONT_CELL_H;
+    if (asc < 1) asc = 1;
+    if (asc > cell_h - 1) asc = cell_h - 1;
+    if (descent) *descent = cell_h - asc;
+    if (height) *height = cell_h;
+    return asc;
+}
+
+/* Resolve a TextOut/ExtTextOut origin per the DC's TA_ mode. x/y arrive
+ * LOGICAL (caller space); width is the measured string width. On return
+ * x/y are the TOP-LEFT of the line box (what draw_text16 expects).
+ * Returns 1 when the caller must advance the current position. */
+/* logical-space MoveTo (TA_UPDATECP advance) — no guest out-pointer */
+static void MoveToEx_plain(gdi_obj *dc, int x, int y)
+{
+    dc->dc.cur_x = x;
+    dc->dc.cur_y = y;
+}
+
+static int align_text_origin(gdi_obj *dc, int *x, int *y, int width)
+{
+    uint32_t ta = dc->dc.text_align;
+    int used_cp = 0;
+    if (ta & 1 /*TA_UPDATECP*/) {
+        *x = dc->dc.cur_x;
+        *y = dc->dc.cur_y;
+        used_cp = 1;
+    }
+    if ((ta & 6) == 6 /*TA_CENTER*/)
+        *x -= width / 2;
+    else if (ta & 2 /*TA_RIGHT*/)
+        *x -= width;
+    if (ta & 24 /*TA_BASELINE*/) {
+        int desc, hgt;
+        *y -= font_ascent(dc, &desc, &hgt);
+    } else if (ta & 8 /*TA_BOTTOM*/) {
+        int desc, hgt;
+        *y -= font_ascent(dc, &desc, &hgt) + desc;
+    }
+    return used_cp;
+}
+
 /* Default DC font lazily materialized so cur_font is always valid. */
 static gdi_obj *default_font(gdi_obj *dc)
 {
@@ -451,7 +516,7 @@ WN_API int32_t g32_ReleaseDC(wn_abiword hwnd, wn_handle hdc)
 
 /* --- memory DCs + DIB sections ----------------------------------------------------------- */
 
-static WN_API wn_handle g32_CreateCompatibleDC(wn_handle hdc)
+WN_API wn_handle g32_CreateCompatibleDC(wn_handle hdc)
 {
     (void)hdc;
     gdi_obj *dc = wn_xcalloc(1, sizeof *dc);
@@ -1248,6 +1313,52 @@ WN_API int32_t g32_SetBkMode(wn_handle hdc, int32_t mode)
     return old;
 }
 
+WN_API uint32_t g32_SetTextAlign(wn_handle hdc, uint32_t mode)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return 0;
+    uint32_t old = dc->dc.text_align;
+    dc->dc.text_align = mode;
+    return old;
+}
+
+static WN_API uint32_t g32_GetTextAlign(wn_handle hdc)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    return dc ? dc->dc.text_align : 0;
+}
+
+static WN_API uint32_t g32_GetTextColor(wn_handle hdc)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    return dc ? dc->dc.text_color : 0;
+}
+
+static WN_API uint32_t g32_GetBkColor(wn_handle hdc)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    return dc ? dc->dc.bk_color : 0;
+}
+
+/* measured string width (device px) for TA_ placement */
+static int text_width_of(gdi_obj *dc, const uint16_t *w, size_t n)
+{
+    int adv_total = 0;
+    gdi_obj *f = dc->dc.cur_font ? dc->dc.cur_font : default_font(dc);
+    if (f && f->kind == GDI_FONT && f->font.ft_slot >= 0 &&
+        wn_ft_available()) {
+        for (size_t i = 0; i < n; i++) {
+            const wn_ft_glyph_t *g = wn_ft_glyph(f->font.ft_slot, w[i]);
+            adv_total += g ? g->adv_x : 0;
+        }
+        return adv_total;
+    }
+    int cell_h, adv;
+    font_metrics(dc, &cell_h, &adv);
+    return (int)n * adv;
+}
+
 WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
                                    const char *s, int32_t count)
 {
@@ -1257,8 +1368,17 @@ WN_API int32_t g32_TextOutA(wn_handle hdc, int x, int y,
     size_t n = count < 0 ? strlen(s) : (size_t)count;
     if (!dc->dc.cur_font)
         dc->dc.cur_font = default_font(dc);
+    uint16_t w[4096];
+    size_t m = n < 4096 ? n : 4096;
+    if (!m)
+        return 1;   /* nothing to draw: success, position untouched */
+    for (size_t i = 0; i < m; i++)
+        w[i] = (unsigned char)s[i];
+    int adv_cp = align_text_origin(dc, &x, &y, text_width_of(dc, w, m));
     dc_xlate(&dc->dc, &x, &y);
-    draw_text_into(dc, x, y, s, n);
+    draw_text_into(dc, x, y, s, m);
+    if (adv_cp)
+        MoveToEx_plain(dc, x + text_width_of(dc, w, m), y);
     return 1;
 }
 
@@ -1277,9 +1397,138 @@ static WN_API int32_t g32_TextOutW(wn_handle hdc, int x, int y,
     }
     if (!dc->dc.cur_font)
         dc->dc.cur_font = default_font(dc);
+    int adv_cp = align_text_origin(dc, &x, &y, text_width_of(dc, s, n));
     dc_xlate(&dc->dc, &x, &y);
     draw_text16(dc, x, y, s, n);
+    if (adv_cp)
+        MoveToEx_plain(dc, x + text_width_of(dc, s, n), y);
     return 1;
+}
+
+/* --- ExtTextOut ------------------------------------------------------------
+ * The VCL label path (TextRect -> ExtTextOutA) was a returning-0 stub:
+ * whole label families never painted. ETO_OPAQUE fills lprc with the
+ * background color, ETO_CLIPPED intersects the DC clip, and lpDx gives
+ * per-char device placements (char i at origin + lpDx[0..i]). SetTextAlign
+ * applies exactly as in TextOut. */
+static int32_t ext_text_out_common(gdi_obj *dc, int x, int y,
+                                   uint32_t opts, const int32_t *rect,
+                                   const uint16_t *s, size_t n,
+                                   const int32_t *lpDx)
+{
+    if (!dc)
+        return 0;
+    if (!dc->dc.cur_font)
+        dc->dc.cur_font = default_font(dc);
+    int rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+    if (rect) {
+        rx0 = rect[0]; ry0 = rect[1]; rx1 = rect[2]; ry1 = rect[3];
+        if (opts & 2 /*ETO_OPAQUE*/) {
+            int l = rx0, t = ry0, r = rx1, b = ry1;
+            dc_xlate_rect(&dc->dc, &l, &t, &r, &b);
+            fill_rect_rgb(dc, l, t, r, b, colorref_to_u32(dc->dc.bk_color));
+        }
+    }
+    /* alignment (logical space) */
+    int adv_cp = 0;
+    int have_dx = lpDx && n > 0;
+    if (!have_dx) {
+        adv_cp = align_text_origin(dc, &x, &y, text_width_of(dc, s, n));
+    } else {
+        /* Windows: with lpDx the origin is still TA_-adjusted (width =
+         * lpDx[n-1]); TA_UPDATECP then uses the cumulative advance. */
+        int width = lpDx[n - 1];
+        adv_cp = align_text_origin(dc, &x, &y, width);
+    }
+    dc_xlate(&dc->dc, &x, &y);
+    /* clip save */
+    int saved_clip = dc->dc.has_clip;
+    int sl = dc->dc.clip_l, st = dc->dc.clip_t, sr = dc->dc.clip_r,
+        sb = dc->dc.clip_b;
+    if (rect && (opts & 4 /*ETO_CLIPPED*/)) {
+        int l = rx0, t = ry0, r = rx1, b = ry1;
+        dc_xlate_rect(&dc->dc, &l, &t, &r, &b);
+        if (!dc->dc.has_clip) {
+            dc->dc.has_clip = 1;
+            dc->dc.clip_l = l; dc->dc.clip_t = t;
+            dc->dc.clip_r = r; dc->dc.clip_b = b;
+        } else {
+            if (l > dc->dc.clip_l) dc->dc.clip_l = l;
+            if (t > dc->dc.clip_t) dc->dc.clip_t = t;
+            if (r < dc->dc.clip_r) dc->dc.clip_r = r;
+            if (b < dc->dc.clip_b) dc->dc.clip_b = b;
+        }
+    }
+    if (have_dx) {
+        /* per-char placement: char i at x + lpDx[i-1] (cumulative) */
+        int cx = x;
+        for (size_t i = 0; i < n; i++) {
+            if (s[i]) {
+                uint16_t one[2] = { s[i], 0 };
+                draw_text16(dc, cx + (i ? lpDx[i - 1] : 0), y, one, 1);
+            }
+            cx = x + lpDx[i];
+        }
+    } else {
+        draw_text16(dc, x, y, s, n);
+    }
+    /* clip restore */
+    if (rect && (opts & 4)) {
+        dc->dc.has_clip = saved_clip;
+        dc->dc.clip_l = sl; dc->dc.clip_t = st;
+        dc->dc.clip_r = sr; dc->dc.clip_b = sb;
+    }
+    if (adv_cp) {
+        int width = have_dx ? (n ? lpDx[n - 1] : 0)
+                            : text_width_of(dc, s, n);
+        MoveToEx_plain(dc, x + width, y);
+    }
+    return 1;
+}
+
+static WN_API int32_t g32_ExtTextOutA(wn_handle hdc, int x, int y,
+                                      uint32_t opts, const void *rect,
+                                      const char *s, int32_t count,
+                                      const int32_t *lpdx)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !s)
+        return 0;
+    size_t n = count < 0 ? strlen(s) : (size_t)count;
+    uint16_t w[4096];
+    size_t m = n < 4096 ? n : 4096;
+    for (size_t i = 0; i < m; i++)
+        w[i] = (unsigned char)s[i];
+    int32_t rbuf[4];
+    const int32_t *r = NULL;
+    if (rect) {
+        memcpy(rbuf, rect, sizeof rbuf);
+        r = rbuf;
+    }
+    return ext_text_out_common(dc, x, y, opts, r, w, m, lpdx);
+}
+
+static WN_API int32_t g32_ExtTextOutW(wn_handle hdc, int x, int y,
+                                      uint32_t opts, const void *rect,
+                                      const uint16_t *s, int32_t count,
+                                      const int32_t *lpdx)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc || !s)
+        return 0;
+    size_t n = count < 0 ? 0 : (size_t)count;
+    if (count < 0) {
+        n = 0;
+        while (s[n] && n < 4096)
+            n++;
+    }
+    int32_t rbuf[4];
+    const int32_t *r = NULL;
+    if (rect) {
+        memcpy(rbuf, rect, sizeof rbuf);
+        r = rbuf;
+    }
+    return ext_text_out_common(dc, x, y, opts, r, s, n, lpdx);
 }
 
 WN_API uint32_t g32_SetPixel(wn_handle hdc, int32_t x, int32_t y, uint32_t color)
@@ -1342,6 +1591,21 @@ static WN_API int32_t g32_LineTo(wn_handle hdc, int32_t x, int32_t y)
     dc->dc.cur_x = x;
     dc->dc.cur_y = y;
     return 1;
+}
+
+WN_API uint32_t g32_GetPixel(wn_handle hdc, int32_t x, int32_t y)
+{
+    gdi_obj *dc = gdi_get(hdc, GDI_DC_WINDOW);
+    if (!dc)
+        return 0;
+    dc_xlate(&dc->dc, &x, &y);
+    if (x < 0 || y < 0 || x >= dc->dc.w || y >= dc->dc.h)
+        return 0;
+    if (!dc->dc.pixels)
+        return 0;
+    int dy = dc->dc.dib_bottom_up ? dc->dc.h - 1 - y : y;
+    uint8_t *px = dc->dc.pixels + (size_t)dy * dc->dc.stride + (size_t)x * 4;
+    return (uint32_t)px[2] | ((uint32_t)px[1] << 8) | ((uint32_t)px[0] << 16);
 }
 
 WN_API int32_t g32_Rectangle(wn_handle hdc, int l, int t, int r, int b)
@@ -1800,9 +2064,17 @@ static WN_API int32_t g32_GetTextMetricsA(wn_handle hdc, void *tm)
         ((uint8_t *)tm)[0x34] = 0x00;
         return 1;
     }
+    /* Atlas branch: the SAME baseline row the blit renders at
+     * (WN_FONT_BASELINE scaled) — H's ink bottom is exactly
+     * top + tmAscent - 1. The old cell_h-3/3 pair was invented and
+     * mismatched the glyphs ("ascent" put TA_BASELINE text in the
+     * wrong row). */
+    int asc = cell_h * WN_FONT_BASELINE / WN_FONT_CELL_H;
+    if (asc < 1) asc = 1;
+    if (asc > cell_h - 1) asc = cell_h - 1;
     v[0] = cell_h;                        /* tmHeight */
-    v[1] = cell_h - 3;                    /* tmAscent */
-    v[2] = 3;                             /* tmDescent */
+    v[1] = asc;                           /* tmAscent */
+    v[2] = cell_h - asc;                  /* tmDescent */
     v[3] = 2;                             /* tmInternalLeading */
     v[4] = 0;                             /* tmExternalLeading */
     v[5] = adv;                           /* tmAveCharWidth */
@@ -2563,6 +2835,13 @@ const wn_export_entry wn_gdi32_exports[] = {
     { "GetTextExtentPointW", g32_GetTextExtentPointW },
     { "GetCurrentPositionEx", g32_GetCurrentPositionEx },
     { "GetTextMetricsA", g32_GetTextMetricsA },
+    { "SetTextAlign", g32_SetTextAlign },
+    { "GetTextAlign", g32_GetTextAlign },
+    { "GetTextColor", g32_GetTextColor },
+    { "GetBkColor", g32_GetBkColor },
+    { "ExtTextOutA", g32_ExtTextOutA },
+    { "ExtTextOutW", g32_ExtTextOutW },
+    { "GetPixel", g32_GetPixel },
     { "GetTextMetricsW", g32_GetTextMetricsW },
     { "EnumFontsA", g32_EnumFontsA },
     { "EnumFontsW", g32_EnumFontsW },

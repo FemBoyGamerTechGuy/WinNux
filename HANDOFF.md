@@ -1,3 +1,62 @@
+
+# HANDOFF.md — session 20 addendum
+
+## What changed (2026-10-21)
+- Close/exit flow: REAL modal MessageBox engine (user32.c, msgbox_*)
+  + WM_SYSCOMMAND(SC_CLOSE) chain from X11 WM_DELETE_WINDOW. E2E: the
+  Inno "Exit Setup?" box appears, synthetic Yes -> IDYES -> clean exit
+  (rc=2). WINNUX_MSGBOX_AUTO answers the default button headlessly
+  (t22 pins return values incl. MessageBoxIndirectA/W).
+- Text baseline: gen_font.py renders the atlas on ONE baseline row
+  (WN_FONT_BASELINE=12; self-checks H==x bottoms, uniform descenders);
+  SetTextAlign/GetTextAlign + TA math in TextOut/ExtTextOut (new,
+  was a stub); GetPixel real; GetTextMetrics ascent from the same row;
+  t21_baseline (.gui, .env WINNUX_NO_FT=1 for the atlas path).
+- Scrollbars: per-window sb_* fields + full API set + SBM_ + paint
+  (real controls + WS_VSCROLL/HSCROLL adornments) + hit-test input +
+  wheel + EM_LINESCROLL/EM_SCROLL/EM_GETFIRSTVISIBLELINE. t23 pins.
+  Watch: WM_VSCROLL=0x115, WM_HSCROLL=0x0114 (do not swap again).
+  The adornment must paint BEFORE g32_ReleaseDC (it silently no-ops
+  with the released handle — cost an hour).
+- ctl_priv is now TAGGED (CTL_PRIV_TV/MSGBOX): DestroyWindow dispatches;
+  the msgbox ctx is freed by the box's own DestroyWindow. Never add an
+  untagged payload.
+- Input/state: GetKeyState/GetAsyncKeyState/GetWindowThreadProcessId/
+  EnumWindows/EnumThreadWindows/WM_MOUSEWHEEL(ETO...)/GetKeyboardType
+  real; WN_BEV_KEYMODS reconciles X11 modifiers; stub logging dedupes
+  per (dll,api,caller) with an atexit summary (wn_stub_site_note).
+- Build: Makefile M32LDFLAGS embeds the sysroot loader when the host
+  lacks /lib/ld-linux.so.2. scripts/bootstrap_root32.sh rebuilds the
+  whole i386 sysroot from debs (libc6-i386, libc6-dev-i386,
+  lib32gcc-14-dev + i386 libX11/libxcb/libXau/libXdmcp from the trixie
+  Packages index) INCLUDING the ld-script rewrite. qemu-user debs go to
+  toolchain/qemu. run32.sh contract unchanged.
+
+## Open leads for next session
+1. WIZARD DIR PAGE: the click-through freezes at the directory page
+   (components advanced after clicking a checklist row first). Debug
+   trace recipe:
+     sh scripts/e2e_clickthrough_A2.sh   (full run, WINNUX_LOG=debug)
+   The dir Next click DISPATCHES (log shows WM_LBUTTONUP at the button)
+   but Inno never switches pages; no error box, log quiet afterwards.
+   Suspects: ExistsDir/GetFileAttributes on "C:\Program Files (x86)\Lua\5.1",
+   or the components-state re-read making Inno loop.
+2. wow64 ENGINE crash (session-11 carryover): write to RO at
+   luaforwindows tmp+0x1bb7 addr 0x40a998 under WINNUX_WOW64=1. The
+   wizard only runs via winnux32 (qemu here) — keep it that way until
+   root-caused.
+3. Components page: Next only advanced AFTER a synthetic click INSIDE
+   the checklist. Check LB_GETITEMDATA/LB_GETSEL answers for VCL's
+   TNewCheckListBox state objects.
+
+## How to run the wizard E2E (this sandbox)
+    sh /home/z/my-project/scripts/e2e_final.sh       # close-flow: box + Yes + clean rc=2
+    sh /home/z/my-project/scripts/e2e_clickthrough_A2.sh  # page-walk + freeze repro
+Xvfb :95 + xtree (built at /tmp/xtree; sources scripts/dev/xtree.c) +
+qemu-i386 from toolchain/qemu. ALL of it must run in ONE bash call —
+the sandbox reaps background processes between invocations.
+
+
 # HANDOFF.md — what was happening, and the next 3 steps
 
 Read this before continuing. Pair with STATUS.md (what works + proof) and

@@ -50,6 +50,7 @@ enum wn_backend_ev {
     WN_BEV_MOUSE_BUTTON,
     WN_BEV_TEXT,
     WN_BEV_CONFIGURE,       /* position/size from the WM (x, y, w, h) */
+    WN_BEV_KEYMODS,         /* modifier mask CHANGED: val = X11 state */
 };
 
 typedef struct wn_bwin {

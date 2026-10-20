@@ -88,6 +88,10 @@ typedef struct wn_window {
     int is_uni;               /* created via the W entry point */
     /* GWLP storage: 0..cbWndExtra bytes (fixed slots first, see docs) */
     uint64_t extra[16];
+    /* per-window scroll state (V and H bars): classic SCROLLINFO
+     * min/max/pos/page. Edits reuse top_item as first-visible LINE. */
+    int sb_min[2], sb_max[2], sb_pos[2], sb_page[2];   /* [0]=V [1]=H */
+    uint8_t sb_on[2];         /* WS_VSCROLL/HSCROLL actually shown */
     /* control state (Button/Edit/ListBox/ComboBox/ScrollBar + comctl32) */
     uint32_t check;           /* BST_ state */
     int caret;                /* edit: caret position (chars) */
@@ -100,6 +104,13 @@ typedef struct wn_window {
                               * NULL = all zero) */
     uint8_t *sel_bits;        /* list: multi-select state (LB_SETSEL/GETSEL) */
     void *ctl_priv;           /* comctl32 private data (tree nodes etc.) */
+    uint8_t ctl_priv_kind;    /* WHICH payload ctl_priv is: a control-type
+                               * blind DestroyWindow interpreted a msgbox
+                               * ctx as treeview nodes and freed wild
+                               * pointers (teardown SIGSEGV, rc=139). */
+#define CTL_PRIV_NONE   0
+#define CTL_PRIV_TV     1
+#define CTL_PRIV_MSGBOX 2
     /* dialog support */
     int is_dialog;
     int dlg_done;
@@ -156,6 +167,36 @@ static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
                                         wn_abiword wp, wn_abiword_s lp);
 static WN_API int32_t u32_MessageBoxW(wn_abiword hwnd, const uint16_t *text,
                                      const uint16_t *caption, uint32_t type);
+static WN_API int32_t u32_MessageBoxA(wn_abiword hwnd, const char *text,
+                                     const char *caption, uint32_t type);
+
+/* MessageBox engine (defined late in this file; ctl_proc's host-dialog
+ * branch needs the context type early). */
+#define WN_IDOK       1
+#define WN_IDCANCEL   2
+#define WN_IDABORT    3
+#define WN_IDRETRY    4
+#define WN_IDIGNORE   5
+#define WN_IDYES      6
+#define WN_IDNO       7
+typedef struct msgbox_ctx {
+    int32_t  result;
+    int      done;
+    uint32_t type;
+    int      icon_kind;      /* 0 none, 1 error, 2 question, 3 warn, 4 info */
+    int      n_buttons;
+    int      ids[3];
+    char     labels[3][20];
+    char     mnem[3];        /* Alt+letter mnemonic (0 = none) */
+    int      default_idx;
+    int      icon_x, icon_y;
+    uint64_t owner;
+} msgbox_ctx;
+static void msgbox_paint_icon(wn_handle hdc, msgbox_ctx *m);
+static void msgbox_draw_glyph(wn_handle hdc, char c, int x, int y,
+                              int w, int h);
+static int  msgbox_has_cancel(msgbox_ctx *m);
+static int  msgbox_close_answer(msgbox_ctx *m);
 
 /* GUEST arch layout query: every layout-sensitive struct read/write in this
  * file must follow the GUEST'S architecture, not the host build. The x86-64
@@ -308,7 +349,40 @@ wn_bwin *wn_user32_bwin_for(void *backend_priv)
 /* cursor + keyboard-state tracking (GetCursorPos/GetKeyboardState). */
 static int g_mouse_x = -1, g_mouse_y = -1;
 static uint8_t g_key_state[256];
+/* GetKeyState semantics: low byte = TOGGLED (Caps/Num/Scroll/Insert),
+ * high byte = DOWN. Toggles flip on each key press of those keys. */
+static uint8_t g_key_toggle[256];
+/* GetAsyncKeyState: bit0 = "pressed since the last GetAsyncKeyState". */
+static uint8_t g_key_async_edge[256];
 static uint32_t g_last_msg_time;
+
+/* Is VK one of the Windows toggle keys? (0x14 VK_CAPITAL, 0x90
+ * VK_NUMLOCK, 0x91 VK_SCROLL, 0x2D VK_INSERT, 0x46 'F', 0x2C
+ * VK_SNAPSHOT keep their GetKeyState low-byte semantics on Windows
+ * only for the classic four; we flip the classic set.) */
+static int vk_is_toggle(uint32_t vk)
+{
+    return vk == 0x14 || vk == 0x90 || vk == 0x91 || vk == 0x2D;
+}
+
+/* X11 modifier mask -> VK down-state reconcile (XKeyEvent.state bits:
+ * Shift=1, Lock=2, Control=4, Mod1=8). Dispatched by the backend
+ * whenever the mask CHANGES, so a modifier held before our launch
+ * (or eaten by a WM grab) is still reported truthfully. */
+static void key_reconcile_mods(int mask)
+{
+    static const struct { int xbit; uint32_t vk; } map[] = {
+        { 1, 0x10 /*VK_SHIFT*/ }, { 4, 0x11 /*VK_CONTROL*/ },
+        { 8, 0x12 /*VK_MENU*/ },
+    };
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++) {
+        int down = (mask & map[i].xbit) != 0;
+        if (down)
+            g_key_state[map[i].vk / 8] |= (uint8_t)(1u << (map[i].vk % 8));
+        else
+            g_key_state[map[i].vk / 8] &= (uint8_t)~(1u << (map[i].vk % 8));
+    }
+}
 
 /* --- input translation --------------------------------------------------------- */
 
@@ -336,6 +410,11 @@ uint32_t wn_user32_vk_from_keysym(uint32_t ks)
     case 0xFFE1: case 0xFFE2: return 0x10;
     case 0xFFE3: case 0xFFE4: return 0x11;
     case 0xFFE9: case 0xFFEA: return 0x12;
+    case 0xFFE5: return 0x14;             /* CapsLock -> VK_CAPITAL */
+    case 0xFF7F: return 0x90;             /* NumLock -> VK_NUMLOCK */
+    case 0xFF14: return 0x91;             /* ScrollLock -> VK_SCROLL */
+    case 0xFF61: return 0x2C;             /* PrintScreen (sysreq) */
+    case 0xFFE7: case 0xFFE8: return 0x5B;/* Super -> LWIN */
     default: return 0;
     }
 }
@@ -401,18 +480,31 @@ void wn_backend_event_cb(const wn_backend_event *ev)
                               ((uint64_t)(uint16_t)ev->y << 16)));
         break;
     case WN_BEV_CLOSE:
-        post_msg(h, WN_WM_CLOSE, 0, 0);
+        /* X11 WM_DELETE_WINDOW == the title-bar X / Alt+F4. Windows
+         * delivers WM_SYSCOMMAND(SC_CLOSE) and DefWindowProc derives
+         * WM_CLOSE from it; apps that intercept (Inno's Exit-Setup
+         * confirm) see exactly one close request. */
+        deliver_now(h, 0x0112 /*WM_SYSCOMMAND*/, 0xF060 /*SC_CLOSE*/, 0);
+        break;
+    case WN_BEV_KEYMODS:
+        key_reconcile_mods(ev->val);
         break;
     case WN_BEV_KEY:
     case WN_BEV_KEYUP: {
         uint32_t vk = wn_user32_vk_from_keysym((uint32_t)ev->val);
         if (vk) {
-            /* keyboard-state tracking for GetKeyboardState */
+            /* keyboard-state tracking for GetKeyboardState/GetKeyState:
+             * down bit for every key, toggle flip + async edge on
+             * press (GetKeyState low byte, GetAsyncKeyState bit0). */
             if (vk < 256) {
-                if (ev->type == WN_BEV_KEY)
+                if (ev->type == WN_BEV_KEY) {
                     g_key_state[vk / 8] |= (uint8_t)(1u << (vk % 8));
-                else
+                    g_key_async_edge[vk / 8] |= (uint8_t)(1u << (vk % 8));
+                    if (vk_is_toggle(vk))
+                        g_key_toggle[vk / 8] ^= (uint8_t)(1u << (vk % 8));
+                } else {
                     g_key_state[vk / 8] &= (uint8_t)~(1u << (vk % 8));
+                }
             }
             /* keyboard goes to the FOCUS window, not the event window */
             uint64_t target = g_focus_hwnd ? g_focus_hwnd : h;
@@ -448,6 +540,54 @@ void wn_backend_event_cb(const wn_backend_event *ev)
         uint64_t wp = 1 /* MK_LBUTTON */;
         if (ev->val2 == 1)      msg = ev->val ? WN_WM_LBUTTONDOWN : WN_WM_LBUTTONUP;
         else if (ev->val2 == 3) { msg = ev->val ? WN_WM_RBUTTONDOWN : WN_WM_RBUTTONUP; wp = 2; }
+        else if (ev->val2 == 4 || ev->val2 == 5 || ev->val2 == 6 ||
+                 ev->val2 == 7) {
+            /* X11 wheel buttons. Windows: WM_MOUSEWHEEL goes to the
+             * window under the cursor, wParam = delta<<16 | keys,
+             * lParam = signed screen coords. */
+            if (!ev->val)   /* only on press; X11 wheel has no release */
+                break;
+            int up = (ev->val2 == 4 || ev->val2 == 6);
+            uint32_t delta = up ? 120u : 0xFF88u;   /* +-120 */
+            uint32_t hmsg = (ev->val2 == 6 || ev->val2 == 7);
+            uint32_t keys = 0;
+            if (g_key_state[0x10 / 8] & (1u << (0x10 % 8))) keys |= 4;
+            if (g_key_state[0x11 / 8] & (1u << (0x11 % 8))) keys |= 8;
+            uint32_t wheel_msg = hmsg ? 0x020E /*WM_MOUSEHWHEEL*/
+                                      : 0x020A /*WM_MOUSEWHEEL*/;
+            /* deepest visible child under the cursor, like clicks */
+            uint64_t target = h;
+            int mx = (int)(int16_t)ev->x, my = (int)(int16_t)ev->y;
+            for (int depth = 0; depth < 8; depth++) {
+                uint64_t next = 0;
+                for (int i = 0; i < g_hwnd_count; i++) {
+                    wn_window *c = g_hwnds[i].win;
+                    if (!c || c->parent != target || !c->visible ||
+                        c->in_destroy)
+                        continue;
+                    if (mx >= c->wx && my >= c->wy &&
+                        mx < c->wx + c->cw && my < c->wy + c->ch) {
+                        next = (uint64_t)(uintptr_t)g_hwnds[i].h;
+                        break;
+                    }
+                }
+                if (!next)
+                    break;
+                target = next;
+            }
+            int ox, oy;
+            wn_window *tw = win_from_hwnd(target);
+            if (tw) {
+                win_screen_origin(tw, &ox, &oy);
+            } else {
+                ox = oy = 0;
+            }
+            post_msg(target, wheel_msg,
+                     ((uint64_t)keys << 16) | (delta & 0xFFFF),
+                     (int64_t)(((uint64_t)(uint16_t)(ox + mx)) |
+                       ((uint64_t)(uint16_t)(oy + my) << 16)));
+            break;
+        }
         if (msg) {
             /* Disabled top-level windows eat no input: putty disables its
              * config box while the About modal is up, and X11 still
@@ -2011,9 +2151,19 @@ static WN_API int32_t u32_DestroyWindow(wn_abiword hwnd)
          * EOutOfResources('Error creating window'). */
         call_guest_wndproc(w, hwnd, 0x82 /*WM_NCDESTROY*/, 0, 0);
     }
-    /* control payloads (tree view nodes, list items) */
-    if (w->ctl_priv)
-        tv_free(w);
+    /* control payloads: DISPATCH ON THE TAG — ctl_priv has more than
+     * one owner now (treeview nodes, msgbox ctx). The old unconditional
+     * tv_free() walked a msgbox_ctx as tv_data and freed wild pointers:
+     * the wizard answered Yes, then teardown SIGSEGV'd (rc=139). */
+    if (w->ctl_priv) {
+        if (w->ctl_priv_kind == CTL_PRIV_TV)
+            tv_free(w);
+        else if (w->ctl_priv_kind == CTL_PRIV_MSGBOX) {
+            free(w->ctl_priv);
+            w->ctl_priv = NULL;
+        }
+        /* unknown tag: leak on purpose — never free blind */
+    }
     for (int i = 0; i < w->n_items; i++)
         free(w->items[i]);
     free(w->items);
@@ -2364,6 +2514,27 @@ static WN_API uint64_t u32_DefWindowProcA(wn_abiword hwnd, uint32_t msg,
                                           wn_abiword wp, wn_abiword_s lp)
 {
     switch (msg) {
+    case 0x0112 /* WM_SYSCOMMAND */: {
+        /* The Windows close chain: X / Alt+F4 -> WM_SYSCOMMAND(SC_CLOSE)
+         * -> DefWindowProc sends WM_CLOSE -> DestroyWindow. SC_MINIMIZE
+         * / SC_MAXIMIZE / SC_RESTORE go through ShowWindow so an app
+         * posting system commands (VCL system menus) behaves. */
+        switch (wp & 0xFFF0) {
+        case 0xF060 /*SC_CLOSE*/:
+            return u32_SendMessageA(hwnd, WN_WM_CLOSE, 0, 0);
+        case 0xF020 /*SC_MINIMIZE*/:
+            u32_ShowWindow(hwnd, 6 /*SW_MINIMIZE*/);
+            return 0;
+        case 0xF030 /*SC_MAXIMIZE*/:
+            u32_ShowWindow(hwnd, 3 /*SW_MAXIMIZE*/);
+            return 0;
+        case 0xF120 /*SC_RESTORE*/:
+            u32_ShowWindow(hwnd, 9 /*SW_RESTORE*/);
+            return 0;
+        default:
+            return 0;   /* SC_MOVE/SC_SIZE: WM owns geometry */
+        }
+    }
     case WN_WM_CLOSE:
         u32_DestroyWindow(hwnd);
         return 0;
@@ -2448,10 +2619,34 @@ static WN_API uint64_t u32_SendMessageA(wn_abiword hwnd, uint32_t msg,
     wn_window *w = win_from_hwnd(hwnd);
     if (!w && hwnd) {
         /* stale-handle counter: a message to a destroyed hwnd means the
-         * guest kept a dead FHandle (the Inno recreate flow's crash class). */
-        wn_log(WN_LOG_WARN, "user32: SendMessageA(msg=%u) to DEAD hwnd "
-               "0x%llx — handled by DefWindowProc", msg,
-               (unsigned long long)hwnd);
+         * guest kept a dead FHandle (the Inno recreate flow's crash
+         * class). Deduped: the (hwnd, msg) pair logs ONCE (the
+         * installer's 0x496-to-0xac1 spam buried real errors); the
+         * answer contract is unchanged — DefWindowProc returns 0. */
+        static struct { uint64_t hwnd; uint32_t msg; uint32_t hits; }
+            dead_note[8];
+        int slot = -1;
+        for (int i = 0; i < 8; i++) {
+            if (dead_note[i].hwnd == hwnd && dead_note[i].msg == msg) {
+                slot = i;
+                break;
+            }
+            if (dead_note[i].hits == 0 && slot < 0)
+                slot = i;
+        }
+        if (slot >= 0) {
+            if (dead_note[slot].hits)
+                dead_note[slot].hits++;
+            else {
+                dead_note[slot].hwnd = hwnd;
+                dead_note[slot].msg = msg;
+                dead_note[slot].hits = 1;
+                wn_log(WN_LOG_WARN, "user32: SendMessageA(msg=%u) to DEAD"
+                       " hwnd 0x%llx — handled by DefWindowProc"
+                       " (further hits deduped)",
+                       msg, (unsigned long long)hwnd);
+            }
+        }
     }
     if (w && ((w->cls && (w->cls->proc || w->cls->proc32)) ||
               w->subclass || w->subclass32))
@@ -2702,6 +2897,7 @@ static void compose_children_of(uint64_t parent)
 typedef enum { CTL_BUTTON, CTL_STATIC, CTL_EDIT, CTL_LISTBOX, CTL_COMBO,
                CTL_SCROLLBAR, CTL_TREEVIEW } ctl_kind;
 
+
 /* case-insensitive substring test for VCL subclass class-name matching */
 static int u32_cls_has(const char *cls, const char *tok)
 {
@@ -2827,6 +3023,157 @@ extern WN_API uint32_t g32_SetBkColor(wn_handle hdc, uint32_t color);
 #define SBM_SETRANGE     0x00E2
 #define SBM_GETRANGE     0x00E3
 
+/* --- scroll geometry + painting + input ------------------------------- */
+#define WN_SBW 17                        /* SM_CXVSCROLL classic width */
+#define WN_WM_HSCROLL 0x0114
+#define WN_WM_VSCROLL 0x0115
+#define WN_WM_MOUSEWHEEL 0x020A
+/* SB_ codes (wparam low word) */
+#define SB_LINEUP       0
+#define SB_LINEDOWN     1
+#define SB_PAGEUP       2
+#define SB_PAGEDOWN     3
+#define SB_THUMBPOSITION 4
+#define SB_THUMBTRACK   5
+#define SB_ENDSCROLL    7
+/* SCROLLINFO fields (all DWORD — guest-layout independent) */
+#define SIF_RANGE  0x1
+#define SIF_PAGE   0x2
+#define SIF_POS    0x4
+#define SIF_ALL    0x17
+
+/* clamp the bar's position into [min, max-page+1] */
+static void sb_clamp(wn_window *w, int bar)
+{
+    int span = w->sb_max[bar] - w->sb_min[bar];
+    int lim = span > w->sb_page[bar] ? w->sb_max[bar] - (w->sb_page[bar] - 1)
+                                     : w->sb_min[bar];
+    if (w->sb_pos[bar] < w->sb_min[bar])
+        w->sb_pos[bar] = w->sb_min[bar];
+    if (w->sb_pos[bar] > lim)
+        w->sb_pos[bar] = lim;
+}
+
+/* thumb rect for bar[0]=V / [1]=H inside a WxH control */
+static void sb_thumb_rect(wn_window *w, int bar, int W, int H,
+                          int *tx, int *ty, int *tw, int *th)
+{
+    if (bar == 0) {
+        int track = H - 2 * WN_SBW;
+        int span = w->sb_max[0] - w->sb_min[0];
+        int movable = span > w->sb_page[0] ? span - (w->sb_page[0] - 1) : 1;
+        int tlen = w->sb_page[0] > 0 && span > 0
+                     ? (track * w->sb_page[0]) / (span + 1) : WN_SBW;
+        if (tlen < 8) tlen = 8;
+        if (tlen > track) tlen = track;
+        int tpos = movable > 1
+                     ? ((w->sb_pos[0] - w->sb_min[0]) * (track - tlen))
+                        / movable : 0;
+        *tx = W - WN_SBW; *ty = WN_SBW + tpos; *tw = WN_SBW; *th = tlen;
+    } else {
+        int track = W - 2 * WN_SBW;
+        int span = w->sb_max[1] - w->sb_min[1];
+        int movable = span > w->sb_page[1] ? span - (w->sb_page[1] - 1) : 1;
+        int tlen = w->sb_page[1] > 0 && span > 0
+                     ? (track * w->sb_page[1]) / (span + 1) : WN_SBW;
+        if (tlen < 8) tlen = 8;
+        if (tlen > track) tlen = track;
+        int tpos = movable > 1
+                     ? ((w->sb_pos[1] - w->sb_min[1]) * (track - tlen))
+                        / movable : 0;
+        *tx = WN_SBW + tpos; *ty = H - WN_SBW; *tw = tlen; *th = WN_SBW;
+    }
+}
+
+/* paint one scrollbar strip inside (0,0,W,H); bar 0 = V (right edge),
+ * bar 1 = H (bottom edge). Arrows are drawn as pixel triangles. */
+static void sb_paint(wn_handle hdc, wn_window *w, int bar, int W, int H)
+{
+    uint32_t track_rgb = 0x00D4D0C8 /*COLOR_SCROLLBAR*/, btn = 0x00D4D0C8;
+    int l, t, r, b;
+    if (bar == 0) {
+        l = W - WN_SBW; t = 0; r = W; b = H;
+    } else {
+        l = 0; t = H - WN_SBW; r = W; b = H;
+    }
+    int32_t rect[4] = { l, t, r, b };
+    wn_handle tb = g32_CreateSolidBrush(track_rgb);
+    g32_FillRect(hdc, rect, tb);
+    wn_handle_close(tb);
+    /* arrow triangles: two filled rects narrowing to a point */
+    int ax0 = l + 2, ax1 = r - 2;
+    if (bar == 0) {
+        int ay0 = t + 2, ay1 = t + WN_SBW - 2;
+        wn_handle ab = g32_CreateSolidBrush(0);
+        for (int i = 0; i < 6; i++) {
+            int32_t tri[4] = { ax0 + i, ay0 + i, ax1 - i,
+                               ay0 + i + 1 };
+            g32_FillRect(hdc, tri, ab);
+            int32_t tri2[4] = { ax0 + i, ay1 - i, ax1 - i,
+                                 ay1 - i + 1 };
+            g32_FillRect(hdc, tri2, ab);
+        }
+        wn_handle_close(ab);
+    } else {
+        int ax = l + 2, bx = l + WN_SBW - 2;
+        wn_handle ab = g32_CreateSolidBrush(0);
+        for (int i = 0; i < 6; i++) {
+            int32_t tri[4] = { ax + i, t + 2 + i, ax + i + 1,
+                               b - 2 - i };
+            g32_FillRect(hdc, tri, ab);
+            int32_t tri2[4] = { bx - i, t + 2 + i, bx - i + 1,
+                                b - 2 - i };
+            g32_FillRect(hdc, tri2, ab);
+        }
+        wn_handle_close(ab);
+    }
+    (void)btn;
+    /* thumb */
+    int tx, ty, tw, th;
+    sb_thumb_rect(w, bar, W, H, &tx, &ty, &tw, &th);
+    int32_t tr[4] = { tx, ty, tx + tw, ty + th };
+    wn_handle hb = g32_CreateSolidBrush(0x00A0A0A0);
+    g32_FillRect(hdc, tr, hb);
+    wn_handle_close(hb);
+    int32_t fr[4] = { tx + 1, ty + 1, tx + tw - 1, ty + th - 1 };
+    wn_handle fb = g32_CreateSolidBrush(0x00E8E8E8);
+    g32_FillRect(hdc, fr, fb);
+    wn_handle_close(fb);
+}
+
+/* apply an SB_ code to a window's own scroll state (V only here);
+ * returns the new position or -1 when nothing changed. */
+static int sb_apply(wn_window *w, int bar, uint32_t sb)
+{
+    int before = w->sb_pos[bar];
+    switch (sb) {
+    case SB_LINEUP:   w->sb_pos[bar] -= 1; break;
+    case SB_LINEDOWN: w->sb_pos[bar] += 1; break;
+    case SB_PAGEUP:   w->sb_pos[bar] -= (w->sb_page[bar] > 0
+                                           ? w->sb_page[bar] : 1); break;
+    case SB_PAGEDOWN: w->sb_pos[bar] += (w->sb_page[bar] > 0
+                                           ? w->sb_page[bar] : 1); break;
+    case SB_THUMBPOSITION:
+    case SB_THUMBTRACK:
+        break;                       /* pos already set by the drag */
+    default:
+        return -1;
+    }
+    sb_clamp(w, bar);
+    if (w->sb_pos[bar] == before)
+        return -1;
+    return w->sb_pos[bar];
+}
+
+/* does this window paint a scrollbar strip? (style-driven) */
+static int sb_bar_visible(wn_window *w, int bar)
+{
+    if (w->sb_on[bar])
+        return 1;
+    uint32_t bit = bar == 0 ? 0x00200000u /*WS_VSCROLL*/ : 0x00100000u;
+    return (w->style & bit) != 0;
+}
+
 static void ctl_notify(wn_window *w, uint32_t code)
 {
     wn_log(WN_LOG_TRACE, "user32: ctl_notify id=%llu code=%u -> parent",
@@ -2916,6 +3263,7 @@ static tv_data *tv_of(wn_window *w)
         tv->root_first = tv->root_last = -1;
         tv->sel = -1;
         w->ctl_priv = tv;
+        w->ctl_priv_kind = CTL_PRIV_TV;
     }
     return w->ctl_priv;
 }
@@ -3619,6 +3967,64 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
     wn_window *w = win_from_hwnd(hwnd);
     if (!w)
         return 0;
+    /* HOST-managed dialog (is_dialog with NO guest dlgproc): the
+     * MessageBox engine's box. Same DefDlgProc paint semantics (face +
+     * children), plus: WM_COMMAND(BN_CLICKED) records the answer,
+     * WM_CLOSE/SC_CLOSE answer with Cancel/OK. ctl_priv carries the
+     * msgbox context. (ctx type + helpers defined later in this file;
+     * declared at the top.) */
+    if (w->is_dialog && !w->dlgproc && !w->dlgproc32 && w->ctl_priv) {
+        msgbox_ctx *m = w->ctl_priv;
+        switch (msg) {
+        case WN_WM_PAINT: {
+            wn_handle hdc = g32_GetDC(hwnd);
+            if (hdc) {
+                int32_t rect[4] = { 0, 0, w->cw, w->ch };
+                wn_handle bg = g32_CreateSolidBrush(0x00C8D0D4 /*face*/);
+                g32_FillRect(hdc, rect, bg);
+                wn_handle_close(bg);
+                msgbox_paint_icon(hdc, m);
+            }
+            compose_children_of(hwnd);
+            const wn_backend *be = wn_backend_get();
+            if (be && be->present && w->bwin)
+                be->present(w->bwin);
+            w->dirty.l = -1;
+            w->paint_pending = 0;
+            return 0;
+        }
+        case WN_WM_COMMAND: {
+            uint32_t code = (uint32_t)((uint64_t)wp >> 16);
+            uint32_t id = (uint32_t)((uint64_t)wp & 0xFFFF);
+            if (code == 0 /*BN_CLICKED*/) {
+                for (int i = 0; i < m->n_buttons; i++) {
+                    if (m->ids[i] == (int)id) {
+                        m->result = m->ids[i];
+                        m->done = 1;
+                        post_msg(hwnd, 0, 0, 0);   /* wake the modal loop */
+                        break;
+                    }
+                }
+            }
+            return 0;
+        }
+        case WN_WM_CLOSE:
+            m->result = msgbox_close_answer(m);
+            m->done = 1;
+            post_msg(hwnd, 0, 0, 0);
+            return 0;
+        case 0x0112 /*WM_SYSCOMMAND*/:
+            if (((uint32_t)wp & 0xFFF0) == 0xF060 /*SC_CLOSE*/) {
+                m->result = msgbox_close_answer(m);
+                m->done = 1;
+                post_msg(hwnd, 0, 0, 0);
+                return 0;
+            }
+            return 0;
+        default:
+            return u32_DefWindowProcA(hwnd, msg, wp, lp);
+        }
+    }
     /* #32770 dialog: every message goes to the guest dlgproc (WM_COMMAND
      * from child controls, WM_CLOSE, ...). Without this the dialog was a
      * black hole: clicks produced WM_COMMANDs that vanished in ctl_proc's
@@ -3668,6 +4074,14 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         if (!hdc)
             return 0;
         int W = w->cw, H = w->ch;
+        int has_v = sb_bar_visible(w, 0) && k != CTL_BUTTON &&
+                    k != CTL_STATIC;
+        int has_h = sb_bar_visible(w, 1) && k != CTL_BUTTON &&
+                    k != CTL_STATIC;
+        if (has_v)
+            W -= WN_SBW;             /* content never under the strip */
+        if (has_h)
+            H -= WN_SBW;
         int32_t rect[4] = { 0, 0, W, H };
         uint32_t face = (k == CTL_EDIT || k == CTL_LISTBOX || k == CTL_TREEVIEW)
                           ? 0x00FFFFFF : 0x00C8D0D4;
@@ -3757,7 +4171,11 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
                           u32_cls_has(cls, "RichEdit") ||
                           u32_cls_has(cls, "Memo");
             if (is_memo) {
-                int32_t mr[4] = { 4, 2, W - 4, H - 2 };
+                /* scroll: top_item = first visible LINE; the text is
+                 * drawn shifted up by that many rows (per-pixel clip
+                 * keeps the window bounds). */
+                int sy = (w->top_item > 0 ? w->top_item : 0) * rh;
+                int32_t mr[4] = { 4, 2 - sy, W - 4, H - 2 - sy };
                 g32_DrawTextW(hdc, w->wtext, -1, mr,
                               0x10 /*DT_WORDBREAK*/ | 0x100 /*DT_NOPREFIX*/);
             } else {
@@ -3828,10 +4246,30 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
             break;
         }
         case CTL_SCROLLBAR:
+            /* real 'ScrollBar' controls paint the whole bar; unknown
+             * VCL classes (mapped here by ctl_kind_of's fallback) keep
+             * the old default face+frame. */
+            if (w->cls && wn_strcaseeq(w->cls->name, "ScrollBar")) {
+                sb_paint(hdc, w, (w->style & 2 /*SBS_HORZ*/) ? 1 : 0,
+                         w->cw, w->ch);
+                break;
+            }
+            /* FALLTHROUGH */
         default:
             if (w->title[0])
                 g32_TextOutA(hdc, 4, (H - rh) / 2, w->title, -1);
             break;
+        }
+        /* window-style adornment bars (Edit/RichEdit/ListBox/...) —
+         * painted while the DC is still LIVE (after this comes
+         * ReleaseDC; the first placement used the released handle and
+         * silently painted nothing). */
+        if ((has_v || has_h) && k != CTL_SCROLLBAR) {
+            int W2 = w->cw, H2 = w->ch;
+            if (has_v)
+                sb_paint(hdc, w, 0, W2, has_h ? H2 - WN_SBW : H2);
+            if (has_h)
+                sb_paint(hdc, w, 1, has_v ? W2 - WN_SBW : W2, H2);
         }
         g32_ReleaseDC(is_groupbox && w->parent ? w->parent : hwnd, hdc);
         /* Paint completed: clear the pending flag so generate_paints()
@@ -3859,6 +4297,7 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
             present_root(w);
             return 0;
         }
+        g32_SetTextColor(hdc, 0);
         compose_child(w);
         return 0;
     }
@@ -3870,7 +4309,201 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         }
         return 0;
     }
+    case WN_WM_MOUSEMOVE: {
+        /* thumb drag: the captured scrollbar tracks the pointer */
+        if (g_capture_hwnd == (uint64_t)(uintptr_t)hwnd_of_window(w) &&
+            sb_bar_visible(w, 0)) {
+            int my = (int)(int16_t)((uint64_t)lp >> 16);
+            int tx, ty, tw, th;
+            sb_thumb_rect(w, 0, w->cw, w->ch, &tx, &ty, &tw, &th);
+            int tracklo = WN_SBW, trackhi = w->ch - WN_SBW;
+            int span = w->sb_max[0] - w->sb_min[0];
+            int movable = span > w->sb_page[0]
+                            ? span - (w->sb_page[0] - 1) : 1;
+            int tl = trackhi - tracklo - th;
+            if (tl < 1) tl = 1;
+            int rel = my - tracklo - th / 2;
+            if (rel < 0) rel = 0;
+            if (rel > tl) rel = tl;
+            w->sb_pos[0] = w->sb_min[0] +
+                            (movable > 1 ? (rel * movable + tl / 2) / tl
+                                         : 0);
+            sb_clamp(w, 0);
+            ctl_repaint(w);
+            if (w->parent)
+                post_msg(w->parent, WN_WM_VSCROLL,
+                         SB_THUMBTRACK |
+                         ((uint64_t)w->sb_pos[0] << 16),
+                         (int64_t)(uintptr_t)hwnd_of_window(w));
+            return 0;
+        }
+        return 0;
+    }
+    case WN_WM_LBUTTONUP: {
+        if (g_capture_hwnd == (uint64_t)(uintptr_t)hwnd_of_window(w) &&
+            sb_bar_visible(w, 0)) {
+            u32_ReleaseCapture();
+            if (w->parent)
+                post_msg(w->parent, WN_WM_VSCROLL,
+                         SB_ENDSCROLL, (int64_t)(uintptr_t)
+                         hwnd_of_window(w));
+            return 0;
+        }
+        return 0;
+    }
+    case WN_WM_MOUSEWHEEL: {
+        /* wheel: 3 lines per notch (Windows default) */
+        int delta = (int)(int16_t)((uint64_t)wp >> 16);
+        if (delta) {
+            int dir = delta > 0 ? SB_LINEUP : SB_LINEDOWN;
+            int steps = (delta > 0 ? delta : -delta) / 40 + 1;
+            for (int i = 0; i < steps * 3; i++)
+                sb_apply(w, 0, (uint32_t)dir);
+            ctl_repaint(w);
+            if (w->parent)
+                post_msg(w->parent, WN_WM_VSCROLL,
+                         SB_THUMBPOSITION |
+                         ((uint64_t)w->sb_pos[0] << 16),
+                         (int64_t)(uintptr_t)hwnd_of_window(w));
+        }
+        return 0;
+    }
+    case WN_WM_VSCROLL:
+    case WN_WM_HSCROLL: {
+        /* the window scrolls ITSELF (edit/list adornments); scrollbar
+         * CONTROL children never reach here (input goes to parent) */
+        int bar = msg == WN_WM_VSCROLL ? 0 : 1;
+        uint32_t code = (uint32_t)((uint64_t)wp & 0xFFFF);
+        if (bar == 0 && k == CTL_EDIT) {
+            /* edits scroll by LINES (internal range management) */
+            int step = 1;
+            if (code == SB_PAGEUP || code == SB_PAGEDOWN)
+                step = w->ch > 0 ? w->ch / 16 : 5;
+            int dir = (code == SB_LINEUP || code == SB_PAGEUP) ? -1 : 1;
+            int before = w->top_item;
+            if (code == SB_THUMBPOSITION || code == SB_THUMBTRACK)
+                w->top_item = (int)(int16_t)((uint64_t)wp >> 16);
+            else
+                w->top_item += dir * step;
+            if (w->top_item < 0)
+                w->top_item = 0;
+            w->sb_pos[0] = w->top_item;
+            if (w->sb_max[0] > w->sb_min[0])
+                sb_clamp(w, 0);
+            if (w->top_item != before)
+                ctl_repaint(w);
+        } else if (bar == 0 && k == CTL_LISTBOX && sb_apply(w, 0, code) >= 0) {
+            w->top_item = w->sb_pos[0];
+            ctl_repaint(w);
+        } else if (sb_apply(w, bar, code) >= 0) {
+            ctl_repaint(w);
+        }
+        return 0;
+    }
     case WN_WM_LBUTTONDOWN: {
+        {
+            /* scrollbar hit-test FIRST (strip of edits/lists/plain
+             * windows + whole 'ScrollBar' controls): arrows = line,
+             * bands = page, thumb = drag with capture. */
+            int mx = (int)(int16_t)((uint64_t)lp & 0xFFFF);
+            int my = (int)(int16_t)((uint64_t)lp >> 16);
+            int is_sb_ctl = k == CTL_SCROLLBAR && w->cls &&
+                            wn_strcaseeq(w->cls->name, "ScrollBar");
+            if (is_sb_ctl || sb_bar_visible(w, 0)) {
+                int bar = 0;
+                int sx, sy, sw, sh;
+                if (is_sb_ctl) {
+                    sx = 0; sy = 0; sw = w->cw; sh = w->ch;
+                    bar = (w->style & 2 /*SBS_HORZ*/) ? 1 : 0;
+                    if (bar == 0) { sw = w->cw; }
+                } else {
+                    sx = w->cw - WN_SBW; sy = 0;
+                    sw = WN_SBW; sh = w->ch;
+                }
+                int inside = mx >= sx && mx < sx + sw &&
+                             my >= sy && my < sy + sh;
+                if (bar == 1) {
+                    sx = 0; sy = w->ch - WN_SBW; sw = w->cw;
+                    sh = WN_SBW;
+                    inside = mx >= sx && mx < sx + sw &&
+                             my >= sy && my < sy + sh;
+                }
+                if (inside) {
+                    int tx, ty, tw, th;
+                    int track0 = is_sb_ctl ? 0 : WN_SBW;
+                    sb_thumb_rect(w, bar, w->cw, w->ch, &tx, &ty,
+                                  &tw, &th);
+                    int tracklo, trackhi, poslo;
+                    if (bar == 0) {
+                        tracklo = (is_sb_ctl ? 0 : WN_SBW);
+                        trackhi = w->ch - (is_sb_ctl ? 0 : WN_SBW);
+                        poslo = my;
+                    } else {
+                        tracklo = (is_sb_ctl ? 0 : WN_SBW);
+                        trackhi = w->cw - (is_sb_ctl ? 0 : WN_SBW);
+                        poslo = mx;
+                    }
+                    (void)track0;
+                    uint32_t code = SB_PAGEUP;
+                    int on_thumb = 0;
+                    if (bar == 0)
+                        on_thumb = my >= ty && my < ty + th;
+                    else
+                        on_thumb = mx >= tx && mx < tx + tw;
+                    if (on_thumb) {
+                        /* begin drag: capture + track live */
+                        g_capture_hwnd = (uint64_t)(uintptr_t)
+                                         hwnd_of_window(w);
+                        u32_SetCapture((wn_abiword)g_capture_hwnd);
+                        /* trackpos: center the thumb on the pointer */
+                        int span = w->sb_max[bar] - w->sb_min[bar];
+                        int movable = span > w->sb_page[bar]
+                            ? span - (w->sb_page[bar] - 1) : 1;
+                        int tl = (bar == 0) ? (trackhi - tracklo - th)
+                                             : (trackhi - tracklo - tw);
+                        int rel = poslo - tracklo - ((bar == 0) ? th : tw) / 2;
+                        if (rel < 0) rel = 0;
+                        if (rel > tl) rel = tl;
+                        w->sb_pos[bar] = w->sb_min[bar] +
+                                         (movable > 1
+                                            ? (rel * movable + tl / 2) / tl
+                                            : 0);
+                        sb_clamp(w, bar);
+                        code = SB_THUMBTRACK;
+                    } else if (poslo < (bar == 0 ? ty : tx)) {
+                        code = SB_PAGEUP;
+                    } else {
+                        code = SB_PAGEDOWN;
+                    }
+                    /* arrow zones: first/last WN_SBW of the track */
+                    if (!on_thumb) {
+                        if (bar == 0) {
+                            if (my < WN_SBW)
+                                code = SB_LINEUP;
+                            else if (my >= w->ch - WN_SBW)
+                                code = SB_LINEDOWN;
+                        } else {
+                            if (mx < WN_SBW)
+                                code = SB_LINEUP;
+                            else if (mx >= w->cw - WN_SBW)
+                                code = SB_LINEDOWN;
+                        }
+                    }
+                    if (sb_apply(w, bar, code) >= 0 || on_thumb) {
+                        ctl_repaint(w);
+                        if (w->parent)
+                            post_msg(w->parent,
+                                     bar == 0 ? WN_WM_VSCROLL
+                                              : WN_WM_HSCROLL,
+                                     code | ((uint64_t)w->sb_pos[bar]
+                                              << 16),
+                                     (int64_t)(uintptr_t)
+                                     hwnd_of_window(w));
+                    }
+                    return 0;
+                }
+            }
+        }
         switch (k) {
         case CTL_BUTTON: {
             uint32_t bs = w->style & 0xF;
@@ -3945,6 +4578,73 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         default:
             return 0;
         }
+    }
+    /* --- edit scrolling (RichEdit viewer contracts) ----------------- */
+    case 0x00B6 /*EM_LINESCROLL*/: {
+        if (k != CTL_EDIT)
+            return 0;
+        /* RichEdit semantics: wp = VERTICAL lines, lp = horizontal */
+        int lines = (int32_t)(uint32_t)((uint64_t)wp & 0xFFFFFFFF);
+        w->top_item += lines;
+        if (w->top_item < 0)
+            w->top_item = 0;
+        w->sb_pos[0] = w->top_item;   /* bar thumb follows the lines */
+        if (w->sb_max[0] > w->sb_min[0])
+            sb_clamp(w, 0);
+        ctl_repaint(w);
+        return 1;
+    }
+    case 0x00B5 /*EM_SCROLL*/: {
+        if (k != CTL_EDIT)
+            return 0;
+        /* line-based (internal) — no external range required */
+        uint32_t code = (uint32_t)((uint64_t)wp & 0xFFFF);
+        int step = 1;
+        if (code == SB_PAGEUP || code == SB_PAGEDOWN)
+            step = w->ch > 0 ? w->ch / 16 : 5;
+        int dir = (code == SB_LINEUP || code == SB_PAGEUP) ? -1 : 1;
+        w->top_item += dir * (code == SB_THUMBPOSITION ||
+                              code == SB_THUMBTRACK
+                              ? 0 : step);
+        if (code == SB_THUMBPOSITION || code == SB_THUMBTRACK)
+            w->top_item = (int)(int16_t)((uint64_t)wp >> 16);
+        if (w->top_item < 0)
+            w->top_item = 0;
+        w->sb_pos[0] = w->top_item;
+        if (w->sb_max[0] > w->sb_min[0])
+            sb_clamp(w, 0);
+        ctl_repaint(w);
+        return (uint64_t)(uint16_t)w->sb_pos[0];
+    }
+    case 0x00CE /*EM_GETFIRSTVISIBLELINE*/:
+        return (uint64_t)w->top_item;
+    /* --- SBM_ (scrollbar CONTROL messages) --------------------------- */
+    case SBM_SETPOS:
+        w->sb_pos[0] = (int)(uint32_t)((uint64_t)wp);
+        sb_clamp(w, 0);
+        ctl_repaint(w);
+        return (uint64_t)(uint32_t)w->sb_pos[0];
+    case SBM_GETPOS:
+        return (uint64_t)(uint32_t)w->sb_pos[0];
+    case SBM_SETRANGE: {
+        /* wp = min, lp = max (16-bit SBM_SETRANGE pairs) */
+        int mn = (int)(int16_t)(uint64_t)wp;
+        int mx = (int)(int16_t)(uint64_t)lp;
+        int old = w->sb_pos[0];
+        w->sb_min[0] = mn;
+        w->sb_max[0] = mx;
+        sb_clamp(w, 0);
+        ctl_repaint(w);
+        return (uint64_t)(uint32_t)old;   /* previous pos (win16 contract) */
+    }
+    case SBM_GETRANGE: {
+        /* lp = DWORD* pair [min, max] */
+        int32_t *out = (int32_t *)(uintptr_t)lp;
+        if (out) {
+            out[0] = w->sb_min[0];
+            out[1] = w->sb_max[0];
+        }
+        return 1;
     }
     case BM_GETCHECK:   return (uint64_t)w->check;
     case BM_SETCHECK:   w->check = (uint32_t)wp & 3; ctl_repaint(w); return 0;
@@ -4283,15 +4983,6 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         w->top_item = (int)(int32_t)wp;
         ctl_repaint(w);
         return 0;
-    case SBM_SETPOS: {
-        int64_t old = w->sel;
-        w->sel = (int)(int32_t)wp;
-        ctl_repaint(w);
-        return old;
-    }
-    case SBM_GETPOS: return (uint64_t)w->sel;
-    case SBM_SETRANGE: return 0;
-    case SBM_GETRANGE: return 0;
     /* --- SysTreeView32 messages (TVM_*) --- */
     case TVM_INSERTITEMA_:
     case TVM_INSERTITEMW_:
@@ -5727,6 +6418,278 @@ static WN_API int32_t u32_ShowCursor(int32_t show)
     return g_cursor_count;
 }
 
+/* --- scroll APIs -------------------------------------------------------- *
+ * SCROLLINFO (guest layout, all DWORDs — arch-independent):
+ *   cbSize@0 fMask@4 nMin@8 nMax@12 nPage@16 nPos@20 nTrackPos@24. */
+#define SB_VERT 0
+#define SB_HORZ 1
+#define SB_CTL  2
+
+static wn_window *sb_of(wn_abiword hwnd, int code, int *bar)
+{
+    wn_window *w = hwnd ? win_from_hwnd((uint64_t)hwnd) : NULL;
+    if (!w)
+        return NULL;
+    /* SB_CTL: the window itself is a scrollbar control */
+    if (bar)
+        *bar = code == SB_CTL ? ((w->style & 2 /*SBS_HORZ*/) ? 1 : 0)
+                              : (code == SB_HORZ ? 1 : 0);
+    return w;
+}
+
+static WN_API int32_t u32_SetScrollInfo(wn_abiword hwnd, int32_t code,
+                                        const void *info, int32_t redraw)
+{
+    int bar;
+    wn_window *w = sb_of(hwnd, code, &bar);
+    if (!w || !info)
+        return 0;
+    const uint32_t *si = info;
+    uint32_t mask = si[1];                    /* fMask */
+    if (mask & SIF_RANGE) {
+        w->sb_min[bar] = (int)si[2];
+        w->sb_max[bar] = (int)si[3];
+    }
+    if (mask & SIF_PAGE)
+        w->sb_page[bar] = (int)si[4];
+    if (mask & SIF_POS)
+        w->sb_pos[bar] = (int)si[5];
+    sb_clamp(w, bar);
+    if (mask & 0x1 /*SIF_RANGE*/)
+        w->sb_on[bar] = 1;                    /* managed: show the bar */
+    if (redraw)
+        ctl_repaint(w);
+    wn_last_error_set(0);
+    return (int32_t)w->sb_pos[bar];
+}
+
+static WN_API int32_t u32_GetScrollInfo(wn_abiword hwnd, int32_t code,
+                                        void *info)
+{
+    int bar;
+    wn_window *w = sb_of(hwnd, code, &bar);
+    if (!w || !info)
+        return 0;
+    uint32_t *si = info;
+    if (si[0] < 28)                           /* cbSize sanity */
+        return 0;
+    uint32_t mask = si[1];
+    if (mask & SIF_RANGE) {
+        si[2] = (uint32_t)w->sb_min[bar];
+        si[3] = (uint32_t)w->sb_max[bar];
+    }
+    if (mask & SIF_PAGE)
+        si[4] = (uint32_t)w->sb_page[bar];
+    if (mask & SIF_POS) {
+        si[5] = (uint32_t)w->sb_pos[bar];
+        si[6] = (uint32_t)w->sb_pos[bar];    /* nTrackPos */
+    }
+    return 1;
+}
+
+static WN_API int32_t u32_SetScrollPos(wn_abiword hwnd, int32_t code,
+                                       int32_t pos, int32_t redraw)
+{
+    int bar;
+    wn_window *w = sb_of(hwnd, code, &bar);
+    if (!w)
+        return 0;
+    int old = w->sb_pos[bar];
+    w->sb_pos[bar] = pos;
+    sb_clamp(w, bar);
+    if (redraw)
+        ctl_repaint(w);
+    return old;
+}
+
+static WN_API int32_t u32_GetScrollPos(wn_abiword hwnd, int32_t code)
+{
+    int bar;
+    wn_window *w = sb_of(hwnd, code, &bar);
+    return w ? w->sb_pos[bar] : 0;
+}
+
+static WN_API int32_t u32_SetScrollRange(wn_abiword hwnd, int32_t code,
+                                        int32_t mn, int32_t mx,
+                                        int32_t redraw)
+{
+    int bar;
+    wn_window *w = sb_of(hwnd, code, &bar);
+    if (!w)
+        return 0;
+    w->sb_min[bar] = mn;
+    w->sb_max[bar] = mx;
+    sb_clamp(w, bar);
+    if (redraw)
+        ctl_repaint(w);
+    return 1;
+}
+
+static WN_API int32_t u32_GetScrollRange(wn_abiword hwnd, int32_t code,
+                                        int32_t *mn, int32_t *mx)
+{
+    int bar;
+    wn_window *w = sb_of(hwnd, code, &bar);
+    if (!w)
+        return 0;
+    if (mn)
+        *mn = w->sb_min[bar];
+    if (mx)
+        *mx = w->sb_max[bar];
+    return 1;
+}
+
+static WN_API int32_t u32_ShowScrollBar(wn_abiword hwnd, int32_t code,
+                                        int32_t show)
+{
+    int bar;
+    wn_window *w = sb_of(hwnd, code, &bar);
+    if (!w)
+        return 0;
+    if (show) {
+        w->style |= (bar == 0 ? 0x00200000u : 0x00100000u);
+        w->sb_on[bar] = 1;
+    } else {
+        w->style &= ~(bar == 0 ? 0x00200000u : 0x00100000u);
+        w->sb_on[bar] = 0;
+    }
+    ctl_repaint(w);
+    return 1;
+}
+
+static WN_API int32_t u32_EnableScrollBar(wn_abiword hwnd, int32_t code,
+                                          uint32_t arrows)
+{
+    (void)code;
+    (void)arrows;
+    wn_window *w = hwnd ? win_from_hwnd((uint64_t)hwnd) : NULL;
+    return w ? 1 : 0;      /* v1: always enabled (ESB_ENABLE_BOTH) */
+}
+
+/* --- key state / window identity / enumeration ------------------------ */
+
+/* GetKeyState(vk) -> SHORT: high byte = DOWN now, low byte = toggled
+ * (Caps/Num/Scroll/Insert flip on each press). Real state: the X11
+ * backend feeds every key event and reconciles modifier masks. */
+static WN_API int16_t u32_GetKeyState(int32_t vk)
+{
+    if (vk < 0 || vk > 255)
+        return 0;
+    short r = 0;
+    if (g_key_state[vk / 8] & (1u << (vk % 8)))
+        r = (short)(int16_t)0xFF00u;    /* down: high bit set (0x8000) */
+    if (vk_is_toggle((uint32_t)vk) &&
+        (g_key_toggle[vk / 8] & (1u << (vk % 8))))
+        r |= 1;
+    wn_last_error_set(0);
+    return r;
+}
+
+/* GetAsyncKeyState(vk) -> SHORT: 0x8000 = down at call time, bit0 =
+ * pressed at least once since the LAST GetAsyncKeyState for that key. */
+static WN_API int16_t u32_GetAsyncKeyState(int32_t vk)
+{
+    if (vk < 0 || vk > 255)
+        return 0;
+    short r = 0;
+    if (g_key_state[vk / 8] & (1u << (vk % 8)))
+        r = (short)(int16_t)0xFF00u;
+    if (g_key_async_edge[vk / 8] & (1u << (vk % 8))) {
+        r |= 1;
+        g_key_async_edge[vk / 8] &= (uint8_t)~(1u << (vk % 8));
+    }
+    wn_last_error_set(0);
+    return r;
+}
+
+/* GetWindowThreadProcessId: return the owning thread id (the GUI
+ * thread), write the process id to the optional out slot (caller-width
+ * DWORD; the in-process guest's 4-byte slot must not be widened). */
+static WN_API uint32_t u32_GetWindowThreadProcessId(wn_abiword hwnd,
+                                                    uint32_t *pid_out)
+{
+    wn_window *w = hwnd ? win_from_hwnd((uint64_t)hwnd) : NULL;
+    uint32_t pid = (uint32_t)getpid();
+    if (pid_out)
+        *pid_out = pid;
+    if (!hwnd)
+        return 0;
+    if (!w)
+        return 0;               /* stale handle: no thread, pid written */
+    /* single-GUI-thread model: the thread that owns every window */
+    wn_last_error_set(0);
+    return (uint32_t)getpid();  /* thread id == pid in the host model;
+                                 * guests compare against
+                                 * GetCurrentThreadId() which equals it */
+}
+
+/* Guest ENUM callback (2-arg stdcall: hwnd, lParam) through the wow64
+ * bridge. The 4-arg bridge is safe for narrower callees: the guest pops
+ * its own 8 bytes and the bridge resyncs esp from the return state. */
+static int call_guest_enum_cb(uint64_t proc, uint64_t hwnd, uint64_t lp)
+{
+    if (!proc)
+        return 0;
+    if (u32_guest32())
+        return wn_wow64_call_wndproc32((uint32_t)(uint64_t)proc,
+                                       (uint32_t)hwnd, (uint32_t)lp, 0, 0)
+               ? 1 : 0;
+    typedef WN_API wn_abiword (*cb2)(wn_abiword, wn_abiword_s);
+    return ((cb2)(uintptr_t)proc)((wn_abiword)hwnd, (wn_abiword_s)lp) ? 1 : 0;
+}
+
+/* EnumWindows / EnumThreadWindows: walk the live window registry.
+ * v1 thread model: every window belongs to the single GUI thread, so
+ * tid == current thread matches all top-level windows (the Windows
+ * contract for the caller's own thread), other tids see none. */
+static WN_API int32_t enum_windows_common(uint32_t tid, wn_abiword proc,
+                                          wn_abiword lp, int top_only)
+{
+    if (!proc)
+        return 0;
+    uint32_t cur = (uint32_t)getpid();   /* GUI-thread id (host model) */
+    if (tid && tid != cur)
+        return 1;   /* nothing owned by that thread — success, zero enum */
+    /* snapshot first: the callback may create/destroy windows */
+    uint64_t list[WN_USER32_MAX_WINDOWS];
+    int n = 0;
+    for (int i = 0; i < g_hwnd_count && n < WN_USER32_MAX_WINDOWS; i++) {
+        wn_window *w = g_hwnds[i].win;
+        if (!w || w->in_destroy)
+            continue;
+        if (top_only && w->parent)
+            continue;
+        list[n++] = (uint64_t)(uintptr_t)g_hwnds[i].h;
+    }
+    for (int i = 0; i < n; i++) {
+        if (!call_guest_enum_cb((uint64_t)proc, list[i], (uint64_t)lp))
+            return 0;              /* callback asked to stop */
+    }
+    wn_last_error_set(0);
+    return 1;
+}
+
+static WN_API int32_t u32_EnumWindows(wn_abiword proc, wn_abiword lp)
+{
+    return enum_windows_common(0, proc, lp, 1);
+}
+
+static WN_API int32_t u32_EnumThreadWindows(uint32_t tid, wn_abiword proc,
+                                           wn_abiword lp)
+{
+    return enum_windows_common(tid, proc, lp, 1);
+}
+
+static WN_API int32_t u32_GetKeyboardType(int32_t kind)
+{
+    switch (kind) {
+    case 0: return 4;    /* KT-enhanced */
+    case 1: return 12;   /* IBM PC-AT 102-key */
+    case 2: return 0;    /* no subtypes */
+    default: return 2;   /* function keys count */
+    }
+}
+
 static WN_API int32_t u32_GetCursorPos(void *pt)
 {
     if (!pt)
@@ -5988,6 +6951,19 @@ static WN_API int32_t u32_MessageBoxIndirectW(const void *params)
     const uint16_t *text = params ? *(const uint16_t **)(const void *)(p + 0x18) : NULL;
     const uint16_t *cap = params ? *(const uint16_t **)(const void *)(p + 0x20) : NULL;
     return u32_MessageBoxW(hwnd, text, cap,
+                           params ? *(const uint32_t *)(const void *)(p + 0x28) : 0);
+}
+
+static WN_API int32_t u32_MessageBoxIndirectA(const void *params)
+{
+    /* MSGBOXPARAMSA: same layout as W, char* text/caption. Delphi's
+     * VCL dialogs (Application.MessageBox path) use the A form. */
+    const uint8_t *p = params;
+    wn_abiword hwnd = params
+        ? *(wn_abiword *)(const void *)(p + 0x8) : 0;
+    const char *text = params ? *(const char **)(const void *)(p + 0x18) : NULL;
+    const char *cap = params ? *(const char **)(const void *)(p + 0x20) : NULL;
+    return u32_MessageBoxA(hwnd, text, cap,
                            params ? *(const uint32_t *)(const void *)(p + 0x28) : 0);
 }
 
@@ -6435,127 +7411,9 @@ static WN_API wn_abiword u32_RemovePropA(wn_abiword hwnd, wn_abiword key)
     return 0;
 }
 
-/* --- scroll state ----------------------------------------------------------------
- * Per-window SB_HORZ/SB_VERT position ranges. SCROLLINFO is all DWORDs
- * (cbSize@0 fMask@4 nMin@8 nMax@0xC nPage@0x10 nPos@0x14 nTrackPos@0x18):
- * identical layout in both guest word sizes. */
-static struct {
-    uint64_t hwnd;
-    int32_t min[2], max[2], pos[2], page[2];
-} g_scrollbars[WN_USER32_MAX_WINDOWS];
+/* scroll state: per-window sb_* fields (wn_window) since the
+ * scrollbar rework; the old global-slot table was removed. */
 
-static int scroll_slot(uint64_t hwnd, int create)
-{
-    for (int i = 0; i < WN_USER32_MAX_WINDOWS; i++)
-        if (g_scrollbars[i].hwnd == hwnd)
-            return i;
-    if (!create)
-        return -1;
-    for (int i = 0; i < WN_USER32_MAX_WINDOWS; i++)
-        if (!g_scrollbars[i].hwnd) {
-            g_scrollbars[i].hwnd = hwnd;
-            return i;
-        }
-    return -1;
-}
-
-#define SIF_RANGE_ 0x0001
-#define SIF_PAGE_  0x0002
-#define SIF_POS_   0x0004
-#define SB_HORZ_   0
-#define SB_VERT_   1
-
-static WN_API int32_t u32_SetScrollInfo(wn_abiword hwnd, int32_t bar,
-                                        const void *info, int32_t redraw)
-{
-    (void)redraw;
-    if (bar != SB_HORZ_ && bar != SB_VERT_)
-        return 0;
-    int i = scroll_slot(hwnd, 1);
-    if (i < 0)
-        return 0;
-    const uint32_t *si = info;
-    if (!si || si[0] < 0x14)
-        return 0;
-    uint32_t mask = si[1];
-    int b = bar;
-    if (mask & SIF_RANGE_) {
-        g_scrollbars[i].min[b] = (int32_t)si[2];
-        g_scrollbars[i].max[b] = (int32_t)si[3];
-    }
-    if (mask & SIF_PAGE_)
-        g_scrollbars[i].page[b] = (int32_t)si[4];
-    if (mask & SIF_POS_)
-        g_scrollbars[i].pos[b] = (int32_t)si[5];
-    if (g_scrollbars[i].max[b] < g_scrollbars[i].min[b])
-        g_scrollbars[i].max[b] = g_scrollbars[i].min[b];
-    if (g_scrollbars[i].pos[b] < g_scrollbars[i].min[b])
-        g_scrollbars[i].pos[b] = g_scrollbars[i].min[b];
-    if (g_scrollbars[i].pos[b] > g_scrollbars[i].max[b])
-        g_scrollbars[i].pos[b] = g_scrollbars[i].max[b];
-    return g_scrollbars[i].pos[b];
-}
-
-static WN_API int32_t u32_GetScrollInfo(wn_abiword hwnd, int32_t bar, void *info)
-{
-    if (bar != SB_HORZ_ && bar != SB_VERT_)
-        return 0;
-    int i = scroll_slot(hwnd, 0);
-    uint32_t *si = info;
-    if (!si || si[0] < 0x14)
-        return 0;
-    uint32_t mask = si[1];
-    if (i >= 0) {
-        int b = bar;
-        if (mask & SIF_RANGE_) {
-            si[2] = (uint32_t)g_scrollbars[i].min[b];
-            si[3] = (uint32_t)g_scrollbars[i].max[b];
-        }
-        if (mask & SIF_PAGE_)
-            si[4] = (uint32_t)g_scrollbars[i].page[b];
-        if (mask & SIF_POS_)
-            si[5] = (uint32_t)g_scrollbars[i].pos[b];
-        if (mask & 0x0010 /*SIF_TRACKPOS*/)
-            si[6] = (uint32_t)g_scrollbars[i].pos[b];
-    } else {
-        if (mask & SIF_RANGE_) {
-            si[2] = 0;
-            si[3] = 100;
-        }
-        if (mask & SIF_PAGE_)
-            si[4] = 1;
-        if (mask & SIF_POS_)
-            si[5] = 0;
-        if (mask & 0x0010)
-            si[6] = 0;
-    }
-    return 1;
-}
-
-static WN_API int32_t u32_GetScrollPos(wn_abiword hwnd, int32_t bar)
-{
-    if (bar != SB_HORZ_ && bar != SB_VERT_)
-        return 0;
-    int i = scroll_slot(hwnd, 0);
-    return i >= 0 ? g_scrollbars[i].pos[bar] : 0;
-}
-
-static WN_API int32_t u32_SetScrollPos(wn_abiword hwnd, int32_t bar,
-                                       int32_t pos, int32_t redraw)
-{
-    (void)redraw;
-    if (bar != SB_HORZ_ && bar != SB_VERT_)
-        return 0;
-    int i = scroll_slot(hwnd, 1);
-    if (i < 0)
-        return 0;
-    int old = g_scrollbars[i].pos[bar];
-    g_scrollbars[i].pos[bar] = pos;
-    return old;
-}
-
-/* SendNotifyMessage: same-thread windows get it synchronously (Windows only
- * defers cross-thread sends); our runtime is single-threaded per guest. */
 static WN_API wn_abiword_s u32_SendNotifyMessageA(wn_abiword hwnd,
                                                   uint32_t msg,
                                                   wn_abiword wp,
@@ -6768,24 +7626,330 @@ static WN_API uint32_t u32_MsgWaitForMultipleObjects(uint32_t count,
 /* --- export table ----------------------------------------------------------------- */
 
 
-/* MessageBox: no dialog engine yet, so the box is PRINTED (loudly) and we
- * answer IDOK. This keeps apps running and makes their complaints visible
- * in the log - a deliberate diagnostic aid, not a fake window. */
+/* ==================== MessageBox engine ====================================
+ * A REAL modal box (the old stub printed the text and answered IDOK —
+ * neither IDYES nor IDNO, so Inno's 'Exit Setup?' confirm made the
+ * wizard ignore every close attempt: the field "closing hangs the
+ * wizard" report). The box is a #32770 window with a Static text child,
+ * an icon block on the face, and standard Button children; the modal
+ * pump runs inside MessageBoxA/W exactly like DialogBoxParamA's. */
+/* (ctx type + ID defines + helper prototypes: top of this file.) */
+
+static int msgbox_has_cancel(msgbox_ctx *m)
+{
+    for (int i = 0; i < m->n_buttons; i++)
+        if (m->ids[i] == WN_IDCANCEL)
+            return 1;
+    return 0;
+}
+
+/* WM_CLOSE / SC_CLOSE on the box: Windows answers IDCANCEL when the box
+ * HAS a cancel-style button, else IDOK (MB_YESNO's X is disabled on
+ * real Windows; ours answers IDNO — same "don't exit" outcome). */
+static int msgbox_close_answer(msgbox_ctx *m)
+{
+    if (msgbox_has_cancel(m))
+        return WN_IDCANCEL;
+    for (int i = 0; i < m->n_buttons; i++)
+        if (m->ids[i] == WN_IDNO)
+            return WN_IDNO;
+    return WN_IDOK;
+}
+
+/* Icon block on the box face: colored plate + white glyph letter. */
+static void msgbox_paint_icon(wn_handle hdc, msgbox_ctx *m)
+{
+    if (!m->icon_kind)
+        return;
+    static const uint32_t plate[5] = {
+        0, 0x000000CC /*red*/, 0x00CCAA00 /*blue-*/, 0x0000CCCC /*yellow*/,
+        0x00CCAA00,
+    };
+    static const char glyph[5] = { 0, 'X', '?', '!', 'i' };
+    int x = m->icon_x, y = m->icon_y, s = 32;
+    wn_handle b = g32_CreateSolidBrush(plate[m->icon_kind]);
+    int32_t r[4] = { x, y, x + s, y + s };
+    g32_FillRect(hdc, r, b);
+    wn_handle_close(b);
+    g32_SetBkMode(hdc, 1 /*TRANSPARENT*/);
+    g32_SetTextColor(hdc, 0x00FFFFFF);
+    msgbox_draw_glyph(hdc, glyph[m->icon_kind], x + 6, y + 4, s - 8, s - 8);
+}
+
+/* 1-char draw helper with a proper NUL terminator. */
+static void msgbox_draw_glyph(wn_handle hdc, char c, int x, int y, int w,
+                              int h)
+{
+    char two[2] = { c, 0 };
+    int32_t tr[4] = { x, y, x + w, y + h };
+    g32_DrawTextA(hdc, two, -1, tr, 0x20 | 0x24 /*SINGLELINE|VCENTER*/);
+}
+
+/* Standard button set for a uType. */
+static void msgbox_buttons(uint32_t type, int ids[3], char labels[3][20],
+                           int *n_out)
+{
+    int n = 0;
+    switch (type & 0xF) {
+    case 0x0 /*MB_OK*/:      ids[n]=WN_IDOK;   snprintf(labels[n],20,"OK"); n++; break;
+    case 0x1 /*MB_OKCANCEL*/:
+        ids[n]=WN_IDOK;     snprintf(labels[n],20,"OK"); n++;
+        ids[n]=WN_IDCANCEL; snprintf(labels[n],20,"Cancel"); n++; break;
+    case 0x2 /*MB_ABORTRETRYIGNORE*/:
+        ids[n]=WN_IDABORT;  snprintf(labels[n],20,"&Abort"); n++;
+        ids[n]=WN_IDRETRY;  snprintf(labels[n],20,"&Retry"); n++;
+        ids[n]=WN_IDIGNORE; snprintf(labels[n],20,"&Ignore"); n++; break;
+    case 0x3 /*MB_YESNOCANCEL*/:
+        ids[n]=WN_IDYES;    snprintf(labels[n],20,"&Yes"); n++;
+        ids[n]=WN_IDNO;     snprintf(labels[n],20,"&No"); n++;
+        ids[n]=WN_IDCANCEL; snprintf(labels[n],20,"Cancel"); n++; break;
+    case 0x4 /*MB_YESNO*/:
+        ids[n]=WN_IDYES;    snprintf(labels[n],20,"&Yes"); n++;
+        ids[n]=WN_IDNO;     snprintf(labels[n],20,"&No"); n++; break;
+    case 0x5 /*MB_RETRYCANCEL*/:
+        ids[n]=WN_IDRETRY;  snprintf(labels[n],20,"&Retry"); n++;
+        ids[n]=WN_IDCANCEL; snprintf(labels[n],20,"Cancel"); n++; break;
+    case 0x6 /*MB_CANCELTRYCONTINUE*/:
+        ids[n]=WN_IDCANCEL; snprintf(labels[n],20,"Cancel"); n++;
+        ids[n]=10/*IDTRYAGAIN*/; snprintf(labels[n],20,"&Try Again"); n++;
+        ids[n]=11/*IDCONTINUE*/; snprintf(labels[n],20,"&Continue"); n++; break;
+    default:
+        ids[n]=WN_IDOK;   snprintf(labels[n],20,"OK"); n++; break;
+    }
+    *n_out = n;
+}
+
+/* Headless/auto answer: the DEFAULT button of the type (matches what a
+ * user pressing Enter would do). */
+static int msgbox_auto_answer(const msgbox_ctx *m)
+{
+    if (m->n_buttons <= 0)
+        return WN_IDOK;
+    int idx = m->default_idx;
+    if (idx < 0 || idx >= m->n_buttons)
+        idx = 0;
+    return m->ids[idx];
+}
+
+/* Build + run the modal box. Returns the pressed button's id. */
+static int32_t msgbox_run(uint64_t owner, const char *text8,
+                          const char *caption8, uint32_t type)
+{
+    msgbox_ctx *m = wn_xcalloc(1, sizeof *m);
+    m->type = type;
+    m->owner = owner;
+    msgbox_buttons(type, m->ids, m->labels, &m->n_buttons);
+    int def = (int)((type >> 8) & 3);   /* MB_DEFBUTTON2=0x100, 3=0x200 */
+    m->default_idx = def < m->n_buttons ? def : 0;
+    uint32_t ic = type & 0xF0;
+    m->icon_kind = (ic & 0x10) ? 1 : (ic & 0x20) ? 2
+                 : (ic & 0x30) ? 3 : (ic & 0x40) ? 4 : 0;
+
+    /* no backend (headless /S installers) or AUTO mode: answer the
+     * default button and stay deterministic for tests. */
+    int auto_mode = getenv("WINNUX_MSGBOX_AUTO") != NULL;
+    if (auto_mode || ensure_gui() != 0) {
+        wn_log(WN_LOG_INFO, "MSGBOX(auto) '%s': %s -> default button",
+               caption8 ? caption8 : "", text8 ? text8 : "");
+        int32_t r = (int32_t)msgbox_auto_answer(m);
+        free(m);
+        return r;
+    }
+
+    /* --- measure the wrapped text ------------------------------------ */
+    extern wn_handle g32_CreateCompatibleDC(wn_handle);
+    const int MAX_TXT_W = 380, MARGIN = 18, BTN_W = 78, BTN_H = 24,
+              BTN_GAP = 10, AREA_PAD = 18;
+    wn_handle mdc = g32_CreateCompatibleDC(0);
+    int text_h = 0, text_w = 0;
+    if (mdc) {
+        int32_t mr[4] = { 0, 0, MAX_TXT_W, 0 };
+        g32_DrawTextA(mdc, text8 ? text8 : "", -1, mr,
+                      0x400 /*DT_CALCRECT*/ | 0x10 /*DT_WORDBREAK*/);
+        text_w = mr[2] - mr[0];
+        text_h = mr[3] - mr[1];
+        g32_ReleaseDC(0, mdc);
+    }
+    if (text_w < 40)
+        text_w = 40;
+    if (text_h < 16)
+        text_h = 16;
+
+    /* --- geometry ----------------------------------------------------- */
+    int icon_w = m->icon_kind ? 32 + 14 : 0;
+    int inner_w = icon_w + text_w + MARGIN;
+    int btn_row_w = m->n_buttons * BTN_W + (m->n_buttons - 1) * BTN_GAP;
+    if (btn_row_w + 2 * AREA_PAD > inner_w)
+        inner_w = btn_row_w + 2 * AREA_PAD;
+    int box_w = inner_w + 2 * MARGIN;
+    if (box_w < 240)
+        box_w = 240;
+    int inner_h = text_h;
+    if (inner_h < 32)
+        inner_h = 32;
+    int box_h = inner_h + BTN_H + 3 * AREA_PAD;
+    if (box_h < 120)
+        box_h = 120;
+    /* center on the owner (screen center when none) */
+    int bx = 0, by = 0;
+    wn_window *ow = owner ? win_from_hwnd(owner) : NULL;
+    if (ow) {
+        int sx, sy;
+        win_screen_origin(ow, &sx, &sy);
+        bx = sx + (ow->cw - box_w) / 2;
+        by = sy + (ow->ch - box_h) / 2;
+    } else {
+        bx = (u32_GetSystemMetrics(0 /*SM_CXSCREEN*/) - box_w) / 2;
+        by = (u32_GetSystemMetrics(1 /*SM_CYSCREEN*/) - box_h) / 2;
+    }
+    if (bx < 0) bx = 0;
+    if (by < 0) by = 0;
+
+    /* --- the box window ------------------------------------------------ */
+    char cap[128];
+    snprintf(cap, sizeof cap, "%s", caption8 ? caption8 : "");
+    uint32_t style = 0x80000000u /*WS_POPUP*/ | 0x00C00000u /*WS_CAPTION*/ |
+                     0x00080000u /*WS_SYSMENU*/;
+    uint64_t box = create_window_core(0, "#32770", cap, 0, 0, style,
+                                      bx, by, box_w, box_h,
+                                      (wn_abiword)owner, 0, 0, NULL);
+    if (!box) {
+        int32_t r = (int32_t)msgbox_auto_answer(m);
+        free(m);
+        wn_log(WN_LOG_WARN, "MSGBOX: box creation failed -> auto answer %d",
+               r);
+        return r;
+    }
+    wn_window *bw = win_from_hwnd(box);
+    if (!bw) {
+        int32_t r = (int32_t)msgbox_auto_answer(m);
+        free(m);
+        return r;
+    }
+    bw->is_dialog = 1;
+    bw->ctl_priv_kind = CTL_PRIV_MSGBOX;   /* DestroyWindow frees it */
+    bw->ctl_priv = m;
+    m->icon_x = MARGIN;
+    m->icon_y = AREA_PAD;
+    int text_x = MARGIN + icon_w;
+    int text_y = AREA_PAD;
+    m->result = 0;
+
+    /* text Static */
+    uint64_t txt = create_window_core(0, "Static", text8 ? text8 : "",
+                                      0, 0,
+                                      0x40000000u /*WS_CHILD*/ |
+                                      0x10000000u /*WS_VISIBLE*/,
+                                      text_x, text_y,
+                                      MARGIN + text_w, text_h,
+                                      (wn_abiword)box, 0xFFFF /*id*/,
+                                      0, NULL);
+    (void)txt;
+
+    /* buttons: right-aligned row at the bottom */
+    int row_w = btn_row_w;
+    int bx0 = box_w - MARGIN - row_w;
+    int byy = box_h - AREA_PAD - BTN_H;
+    for (int i = 0; i < m->n_buttons; i++) {
+        uint32_t bstyle = 0x40000000u /*WS_CHILD*/ |
+                          0x10000000u /*WS_VISIBLE*/ |
+                          0x10000 /*WS_TABSTOP*/;
+        if (i == m->default_idx)
+            bstyle |= 0x2000 /*WS_DEFPUSHBUTTON*/;
+        char lab[20];
+        snprintf(lab, sizeof lab, "%s", m->labels[i]);
+        m->mnem[i] = 0;
+        for (char *p = lab; *p; p++) {
+            if (*p == '&' && p[1] && p[1] != '&') {
+                m->mnem[i] = (char)((p[1] >= 'A' && p[1] <= 'Z')
+                                      ? p[1] + 32 : p[1]);
+                break;
+            }
+        }
+        create_window_core(0, "Button", lab, 0, 0, bstyle,
+                           bx0 + i * (BTN_W + BTN_GAP), byy, BTN_W, BTN_H,
+                           (wn_abiword)box, (wn_abiword)m->ids[i], 0, NULL);
+    }
+
+    /* --- modality ------------------------------------------------------ */
+    uint64_t prev_focus = g_focus_hwnd;
+    uint64_t prev_active = g_active_hwnd;
+    int owner_was_enabled = 1;
+    if (owner)
+        owner_was_enabled = u32_EnableWindow((wn_abiword)owner, 0);
+    u32_ShowWindow((wn_abiword)box, 1 /*SW_SHOWNORMAL*/);
+    u32_SetActiveWindow((wn_abiword)box);
+    {
+        uint64_t def_btn = 0;
+        for (int i = 0; i < g_hwnd_count && !def_btn; i++) {
+            wn_window *c = g_hwnds[i].win;
+            if (c && c->parent == box && c->id == (uint64_t)m->ids[m->default_idx])
+                def_btn = (uint64_t)(uintptr_t)hwnd_of_window(c);
+        }
+        if (!def_btn)
+            def_btn = box;
+        user32_set_focus_internal(def_btn);
+    }
+    wn_log(WN_LOG_DEBUG, "MSGBOX modal: '%s' type=0x%x owner=0x%llx",
+           cap, type, (unsigned long long)owner);
+
+    uint8_t msgbuf[0x30];   /* guest MSG layout; wn_msg is smaller! */
+    while (!m->done) {
+        int32_t r = u32_GetMessageA(msgbuf, 0, 0, 0);
+        if (r <= 0)
+            break;              /* WM_QUIT or backend death: bail */
+        uint64_t mh;
+        uint32_t mm;
+        uint64_t mwp;
+        int64_t mlp;
+        msg_read(msgbuf, &mh, &mm, &mwp, &mlp);
+        /* Alt+mnemonic: WM_CHAR with Alt held clicks the matching button
+         * (Windows msgboxes answer Alt+Y / Alt+N). */
+        if (mm == WN_WM_CHAR && (u32_GetKeyState(0x12 /*VK_MENU*/)
+                                 & 0x8000)) {
+            char c = (char)(uint8_t)(mwp & 0xFF);
+            if (c >= 'A' && c <= 'Z')
+                c = (char)(c + 32);
+            int hit = 0;
+            for (int i = 0; i < m->n_buttons && !hit; i++) {
+                if (m->mnem[i] && m->mnem[i] == c) {
+                    for (int j = 0; j < g_hwnd_count; j++) {
+                        wn_window *b2 = g_hwnds[j].win;
+                        if (b2 && b2->parent == box &&
+                            b2->id == (uint64_t)m->ids[i]) {
+                            ctl_notify(b2, 0 /*BN_CLICKED*/);
+                            hit = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (hit)
+                continue;
+        }
+        if (!u32_IsDialogMessageA(box, msgbuf))
+            u32_DispatchMessageA(msgbuf);
+    }
+    int32_t answer = m->result ? m->result : (int32_t)msgbox_close_answer(m);
+    m->result = answer;          /* ctl_priv payload freed by DestroyWindow */
+    if (owner && owner_was_enabled)
+        u32_EnableWindow((wn_abiword)owner, 1);
+    user32_set_focus_internal(prev_focus);
+    u32_SetActiveWindow((wn_abiword)prev_active);
+    wn_log(WN_LOG_DEBUG, "MSGBOX answered %d", answer);
+    u32_DestroyWindow((wn_abiword)box);   /* frees the msgbox ctx payload */
+    return answer;
+}
+
 static WN_API int32_t u32_MessageBoxA(wn_abiword hwnd, const char *text,
                                       const char *caption, uint32_t type)
 {
-    (void)hwnd;
-    (void)type;
-    wn_log(WN_LOG_ERR, "MSGBOX '%s': %s",
-           caption ? caption : "", text ? text : "");
-    return 1;   /* IDOK */
+    return msgbox_run((uint64_t)hwnd, text, caption, type);
 }
 
 static WN_API int32_t u32_MessageBoxW(wn_abiword hwnd, const uint16_t *text,
                                       const uint16_t *caption, uint32_t type)
 {
-    (void)hwnd;
-    (void)type;
     char *t = NULL, *c = NULL;
     if (text) {
         size_t l = 0;
@@ -6797,10 +7961,10 @@ static WN_API int32_t u32_MessageBoxW(wn_abiword hwnd, const uint16_t *text,
         while (caption[l]) l++;
         c = wn_utf16_to_utf8(caption, l);
     }
-    wn_log(WN_LOG_ERR, "MSGBOX '%s': %s", c ? c : "", t ? t : "");
+    int32_t r = msgbox_run((uint64_t)hwnd, t, c, type);
     free(t);
     free(c);
-    return 1;   /* IDOK */
+    return r;
 }
 
 /* --- wsprintf family ---------------------------------------------------------- */
@@ -6988,6 +8152,7 @@ const wn_export_entry wn_user32_exports[] = {
     { "CharPrevA", u32_CharPrevA },
     { "CharPrevW", u32_CharPrevW },
     { "MessageBoxIndirectW", u32_MessageBoxIndirectW },
+    { "MessageBoxIndirectA", u32_MessageBoxIndirectA },
     { "EnableWindow", u32_EnableWindow },
     { "IsWindowEnabled", u32_IsWindowEnabled },
     { "MessageBeep", u32_MessageBeep },
@@ -7013,6 +8178,20 @@ const wn_export_entry wn_user32_exports[] = {
     { "GetSysColorBrush", u32_GetSysColorBrush },
     { "ShowCursor", u32_ShowCursor },
     { "GetCursorPos", u32_GetCursorPos },
+    { "GetKeyState", u32_GetKeyState },
+    { "GetAsyncKeyState", u32_GetAsyncKeyState },
+    { "GetWindowThreadProcessId", u32_GetWindowThreadProcessId },
+    { "EnumWindows", u32_EnumWindows },
+    { "SetScrollInfo", u32_SetScrollInfo },
+    { "GetScrollInfo", u32_GetScrollInfo },
+    { "SetScrollPos", u32_SetScrollPos },
+    { "GetScrollPos", u32_GetScrollPos },
+    { "SetScrollRange", u32_SetScrollRange },
+    { "GetScrollRange", u32_GetScrollRange },
+    { "ShowScrollBar", u32_ShowScrollBar },
+    { "EnableScrollBar", u32_EnableScrollBar },
+    { "EnumThreadWindows", u32_EnumThreadWindows },
+    { "GetKeyboardType", u32_GetKeyboardType },
     { "GetKeyboardState", u32_GetKeyboardState },
     { "SetKeyboardState", u32_SetKeyboardState },
     { "GetKeyboardLayout", u32_GetKeyboardLayout },

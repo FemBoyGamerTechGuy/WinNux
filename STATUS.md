@@ -1,3 +1,121 @@
+## Date: 2026-10-21 (session 20: interactive wizard — real modal MessageBox, Windows close chain, key state, baseline atlas, real scrollbars)
+
+### Milestone
+The wizard is now INTERACTIVE end-to-end for the reported flows. The user's
+five-item report is closed root-and-branch (plus a teardown crash found on
+the way), verified by a full synthetic-input E2E under qemu-i386 + Xvfb:
+
+1. COMMIT-HASH LEDGER FIX: the previous report quoted 295f6cf, but a
+   docs-only ledger commit (f343ba4) landed on top; origin/main HEAD is
+   f343ba4. The local clone had drifted to the session-11 snapshot (mode-bit
+   noise only) — hard-reset to origin/main; every future report quotes the
+   verified pushed HEAD (git rev-parse origin/main == HEAD).
+2. REAL MODAL MESSAGEBOX (A/W + MessageBoxIndirectA/W): the Inno
+   "Exit Setup?" confirm was a log-print stub answering IDOK (neither
+   IDYES nor IDNO) — closing the wizard "hung" it. Now: #32770 box owned by
+   hwndOwner, owner disabled while modal, Static word-wrap text measured
+   via DT_CALCRECT, icon plate, standard buttons with '&' mnemonics,
+   MB_DEFBUTTON1/2/3 focus, Enter->default, Esc->IDCANCEL (when present),
+   Alt+mnemonic clicks, box WM_CLOSE/SC_CLOSE answers Cancel/No/OK.
+   E2E PROOF: WM_DELETE_WINDOW -> "Exit Setup?" box (452x158, owner-
+   centered) -> synthetic click on &Yes -> "MSGBOX answered 6" (IDYES) ->
+   wizard exits CLEANLY (rc=2, Inno's user-exit code; the first run
+   SIGSEGV'd — see bugfix 6). Headless contract pinned by t22_msgbox
+   (WINNUX_MSGBOX_AUTO answers the DEFAULT button for automated runs).
+3. THE WINDOWS CLOSE CHAIN: X11 WM_DELETE_WINDOW now delivers
+   WM_SYSCOMMAND(SC_CLOSE) synchronously (DefWindowProc derives WM_CLOSE
+   -> DestroyWindow; SC_MINIMIZE/SC_MAXIMIZE/SC_RESTORE map through
+   ShowWindow), so apps that intercept see exactly ONE close request —
+   the Inno confirm fires once, never twice.
+4. REAL INPUT/STATE APIs (all were returning-0 stubs): GetWindowThreadProcessId
+   (thread id + guest-safe PID write), GetKeyState/GetAsyncKeyState (down
+   bit, toggle bits for Caps/Num/Scroll, async edge bit; X11 modifier
+   reconcile from XKeyEvent.state via the new WN_BEV_KEYMODS event),
+   EnumWindows/EnumThreadWindows (real enumeration; guest callbacks via
+   the wow64 4-arg bridge — safe for 2-arg stdcall callees), WM_MOUSEWHEEL/
+   WM_MOUSEHWHEEL from X11 buttons 4/5/6/7, GetKeyboardType. STUB LOG
+   DEDUPE: each (dll,api,caller) site logs ONCE with a counter; an atexit
+   summary lists every site + hits (the flood buried real errors). The
+   DEAD-hwnd SendMessage(0x496->0xac1) WARN is deduped too (0x496 =
+   WM_USER+150, an app-private VCL/Inno message; DefWindowProc's 0 answer
+   is contract-correct).
+5. TEXT BASELINE (the "letters vertically misaligned, some higher and
+   some lower" report): ROOT CAUSE — the 8x16 bitmap atlas generator
+   CROPPED each glyph to its ink box and CENTERED it vertically,
+   destroying baseline information (the wizard runs winnux32 = the atlas
+   path). gen_font.py now anchors every glyph at ONE baseline row
+   (WN_FONT_BASELINE=12, H/x rest ON it, g/y/p descend, |/(/) dip like
+   parens — generator self-checks those invariants). GDI gained
+   SetTextAlign/GetTextAlign (TA_UPDATECP/CENTER/RIGHT/BASELINE/BOTTOM)
+   applied in TextOut AND the previously-stubbed ExtTextOutA/W
+   (ETO_OPAQUE/ETO_CLIPPED/lpDx per-char placement), GetPixel (framebuffer
+   readback), GetTextColor/GetBkColor; GetTextMetrics tmAscent/tmDescent
+   now derive from the SAME baseline row the blit renders (the old
+   cell_h-3/3 pair was invented), so metrics match what is drawn. t21
+   pins the contract under Xvfb by rendering "Hxgyp|" and reading ink
+   rows back with GetPixel: H bottom == x bottom == y0+tmAscent-1,
+   descenders uniform, TA_BASELINE lands on the same rows, extent within
+   bearing tolerance — validated for BOTH the atlas path (WINNUX_NO_FT=1
+   via the new .env runner hook) and the FreeType path. VLM on the real
+   wizard: "the baselines are straight and consistent horizontally".
+6. REAL SCROLLBARS: per-window SCROLLINFO state (V+H), Set/GetScrollInfo,
+   Set/GetScrollPos, Set/GetScrollRange, ShowScrollBar, EnableScrollBar,
+   SBM_ messages (the old sel-as-pos hack removed), painted track +
+   pixel-triangle arrows + scaled thumb for real 'ScrollBar' controls AND
+   as WS_VSCROLL/WS_HSCROLL adornments inside Edit/RichEdit/ListBox
+   (content rect shrinks by SM_CXVSCROLL), hit-tested input (arrows =
+   SB_LINE*, bands = SB_PAGE*, thumb drag with capture + SB_THUMBTRACK/
+   POSITION/ENDSCROLL), WM_MOUSEWHEEL = 3 lines/notch, WM_VSCROLL/
+   WM_HSCROLL routing, and the RichEdit viewer contracts: EM_LINESCROLL
+   (wp = vertical lines), EM_SCROLL, EM_GETFIRSTVISIBLELINE, with the
+   multiline edit painting shifted by the first-visible line.
+   t23_scrollbars pins it all; the wizard's license viewer now paints
+   its 17px strip (screenshot-verified).
+7. TEARDOWN CRASH (found by the E2E): DestroyWindow treated EVERY
+   ctl_priv payload as treeview nodes — the msgbox ctx was freed as
+   tv_data (wild frees, heap corruption, exit SIGSEGV rc=139). ctl_priv
+   now carries a kind tag (TV/MSGBOX) and DestroyWindow dispatches on
+   it; the msgbox ctx is owned by the box window. Exit is now CLEAN.
+
+### Bugfixes worth remembering
+- wn_backend.h: WN_BEV_KEYMODS + x11 dispatch on modifier CHANGE (stale
+  state when a modifier was held before launch or eaten by a WM grab).
+- Makefile: M32LDFLAGS — hosts without /lib/ld-linux.so.2 (rootless
+  boxes) embed the sysroot's loader via -Wl,-dynamic-linker + rpath,
+  so winnux32 runs (the sandbox lost its multilib runtime AND the i386
+  sysroot was rebuilt from debs: libc6-i386 + libc6-dev-i386 +
+  lib32gcc-14-dev + i386 libX11/libxcb/libXau/libXdmcp, ld scripts
+  patched to relative paths — see scripts/bootstrap_root32.sh).
+- gen_sigs32 regenerated: 8 new exports had 4-word-stdcall guesses
+  leaking the guest stack per call (GetKeyState 1, EnumWindows 2,
+  EnumThreadWindows 3, SetTextAlign 2, SetScrollInfo 4, ...).
+- tests/run_tests.sh: per-case .env files (t21 pins the atlas path).
+- Edit-scroll linkage: EM_LINESCROLL/EM_SCROLL/WM_VSCROLL keep top_item
+  (first visible LINE) and sb_pos in sync; edits scroll line-based with
+  internal range management (RichEdit semantics).
+- WM_VSCROLL is 0x0115 and WM_HSCROLL is 0x0114 (an early swap starved
+  the tests; pinned in t23).
+
+### Environment facts (reset sandbox)
+- seccomp kills native i386 syscalls (SIGSYS): winnux32 BUILDS and LINKS
+  but must RUN under qemu-i386 (toolchain/qemu rebuilt from qemu-user
+  debs; run32.sh contract unchanged: WINNUX_CHILD_CMD + LD_LIBRARY_PATH).
+- Under WINNUX_WOW64=1 (x64 runtime) the installer ENGINE still hits the
+  session-11 write-to-RO-section crash at luaforwindows tmp+0x1bb7
+  (addr 0x40a998) — the wizard only runs on the i386 runtime path. The
+  wow64-engine crash remains open (its own investigation).
+- The wizard click-through reaches the DIRECTORY page and freezes there
+  (welcome/license/components all advance; dir Next click dispatches but
+  Inno does not move pages — full WINNUX_LOG=debug trace captured in
+  /tmp/wiz8.log era logs; needs the dir-page state-contract hunt next).
+
+### Result
+Suite 23/23 (t21_baseline, t22_msgbox, t23_scrollbars new; all .gui cases
+under Xvfb). E2E under qemu-i386 + Xvfb: wizard paints with uniform text
+pitch, license page + viewer scrollbar verified, close -> real Exit
+Setup? box -> Yes -> clean exit rc=2. Commit <TO_FILL> pushed and
+verified (origin/main == HEAD).
+
 ## Date: 2026-10-20 (session 19: THE LICENSE PAGE IS REAL — EM_STREAMIN feed, VCL class-kind tokens, caption/titles/ghost-window chain)
 
 ### Milestone

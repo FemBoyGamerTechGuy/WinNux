@@ -309,6 +309,13 @@ static int ft_init(void)
      * atlas (32-bit GUI fidelity is a later milestone). */
     return -1;
 #else
+    if (getenv("WINNUX_NO_FT")) {
+        /* test hook: pin the bitmap-atlas path (the i386 build's reality)
+         * so t21 validates the baseline contract for BOTH renderers. */
+        if (!g_ft_state)
+            g_ft_state = -1;
+        return g_ft_state;
+    }
     if (g_ft_state)
         return g_ft_state;
     void *h = dlopen("libfreetype.so.6", RTLD_LAZY | RTLD_LOCAL);

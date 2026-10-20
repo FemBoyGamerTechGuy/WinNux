@@ -27,6 +27,11 @@ void wn_log(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)
  * resolved to module+offset when possible. Sets last error 120. */
 void wn_stub_log(const char *dll, const char *api, const void *retaddr);
 
+/* Dedupe bookkeeping for stub hits: count a hit for (dll, api, caller
+ * site) without logging (the site's first incident was already
+ * printed). The exit summary lives in log.c. */
+void wn_stub_site_note(const char *dll, const char *api, const char *where);
+
 #define WN_LOGE(...) wn_log(WN_LOG_ERR,  __VA_ARGS__)
 #define WN_LOGW(...) wn_log(WN_LOG_WARN, __VA_ARGS__)
 #define WN_LOGI(...) wn_log(WN_LOG_INFO, __VA_ARGS__)

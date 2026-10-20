@@ -202,11 +202,30 @@ OBJS32  := $(patsubst src/%.c,$(OBJ32)/%.o,$(SRCS))
 
 winnux32: $(TARGET32)
 
+# The 32-bit binary's ELF interpreter: hosts WITHOUT the multilib
+# runtime (no /lib/ld-linux.so.2 — e.g. a rootless build box) can still
+# run winnux32 by embedding the SYSROOT's own loader + an rpath to its
+# libc. Hosts that have the system loader keep the standard PT_INTERP.
+M32_LOADER_HOST := /lib/ld-linux.so.2
+M32_LOADER_SYS  := $(M32_SYSROOT)/usr/lib32/ld-linux.so.2
+ifeq ($(M32_MODE),sysroot)
+  ifneq ($(wildcard $(M32_LOADER_HOST)),)
+    M32LDFLAGS :=
+  else ifneq ($(wildcard $(M32_LOADER_SYS)),)
+    M32LDFLAGS := -Wl,-dynamic-linker,$(M32_LOADER_SYS) \
+                  -Wl,-rpath,$(M32_SYSROOT)/usr/lib32
+  else
+    M32LDFLAGS :=
+  endif
+else
+  M32LDFLAGS :=
+endif
+
 $(TARGET32): $(OBJS32) | $(BIN)
 ifneq ($(M32_MODE),none)
 	$(CC) $(CSTD) $(WARN) $(DEFS) $(INC) $(OPT) $(M32FLAGS) \
-	      -fstack-protector-strong -o $@ $(OBJS32) $(LDLIBS)
-	@echo "built $(TARGET32) ($(M32_MODE) toolchain)"
+	      -fstack-protector-strong $(M32LDFLAGS) -o $@ $(OBJS32) $(LDLIBS)
+	@echo "built $(TARGET32) ($(M32_MODE) toolchain, embedded-loader fallback armed)"
 else
 	@echo "winnux32: SKIP - no -m32 toolchain (native or $(M32_SYSROOT))"
 	@echo "  Arch:   enable [multilib] in /etc/pacman.conf, then: pacman -S gcc-multilib lib32-gcc-libs"

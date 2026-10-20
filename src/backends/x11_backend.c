@@ -505,6 +505,17 @@ static void handle_event(void *raw)
         char buf[16] = { 0 };
         wnx_Atom keysym = 0;
         int n = pXLookupString(raw, buf, sizeof buf - 1, &keysym, NULL);
+        /* modifier-mask reconcile: user32 keeps GetKeyState honest for
+         * modifiers held before launch or eaten by WM grabs. Dispatched
+         * on every CHANGE so shift/ctrl/alt state is never stale. */
+        {
+            static int s_last_mods = -1;
+            int mods = ev_i32(raw, KY_OFF_STATE);
+            if (mods != s_last_mods) {
+                s_last_mods = mods;
+                dispatch(b, WN_BEV_KEYMODS, 0, 0, mods, 0);
+            }
+        }
         dispatch(b, type == 2 ? WN_BEV_KEY : WN_BEV_KEYUP,
                  ev_i32(raw, KY_OFF_X), ev_i32(raw, KY_OFF_Y),
                  (int)(keysym & 0xFFFFFFFF), ev_u32(raw, KY_OFF_KEYCODE));

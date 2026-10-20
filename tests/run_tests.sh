@@ -82,6 +82,10 @@ run_one() {
 
     args=""
     [ -f "$CASES/$name.args" ] && args=$(cat "$CASES/$name.args")
+    # Optional environment for a case (one VAR=VALUE per line; e.g.
+    # t21_baseline.env pins the bitmap-atlas font path with WINNUX_NO_FT).
+    env_extra=""
+    [ -f "$CASES/$name.env" ] && env_extra=$(cat "$CASES/$name.env")
 
     # GUI tests need a display: start a private Xvfb when none is present.
     disp_env=""
@@ -104,7 +108,7 @@ run_one() {
     fi
 
     actual="$RESULTS/$name.out"
-    timeout 30 env $disp_env "$BIN" run "$exe" $args >"$actual" 2>"$RESULTS/$name.err"
+    timeout 30 env $disp_env $env_extra "$BIN" run "$exe" $args >"$actual" 2>"$RESULTS/$name.err"
     rc=$?
     if [ -n "$XVFB_PID" ] && kill -0 $XVFB_PID 2>/dev/null; then
         kill $XVFB_PID 2>/dev/null
