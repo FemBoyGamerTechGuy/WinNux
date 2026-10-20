@@ -1910,6 +1910,56 @@ static int pump_once(void)
     return got || g_q_count || g_quit_posted;
 }
 
+/* WaitMessage: yield/block until something is queueable for this thread
+ * WITHOUT consuming it. Delphi's TApplication.Idle calls WaitMessage when
+ * there is nothing left to do; the returning-0 stub made that idle loop a
+ * 100%-CPU spin (field case: LuaForWindows wizard alive and idle at 101k
+ * WaitMessage/min under WinNux). Same wake sources as GetMessage: posted
+ * messages, the quit flag, timer deadlines, backend input. */
+static WN_API int32_t u32_WaitMessage(void)
+{
+    if (ensure_gui() != 0)
+        return 0;
+    for (;;) {
+        if (g_quit_posted || g_q_count)
+            return 1;
+        if (pump_once())
+            continue;          /* may have queued paints/timers/input */
+        if (g_quit_posted || g_q_count)
+            return 1;
+        uint64_t now = wn_monotonic_ns() / 1000000;
+        int wait = 100;
+        for (int i = 0; i < 32; i++) {
+            if (g_timers[i].active && g_timers[i].next_fire > now) {
+                int ms = (int)(g_timers[i].next_fire - now);
+                if (ms < wait)
+                    wait = ms;
+            }
+        }
+        struct pollfd pfds[2];
+        int n = 0;
+        if (g_msg_fd >= 0) {
+            pfds[n].fd = g_msg_fd;
+            pfds[n].events = POLLIN;
+            n++;
+        }
+        const wn_backend *be = wn_backend_get();
+        if (be && be->poll_fd && be->poll_fd() >= 0) {
+            pfds[n].fd = be->poll_fd();
+            pfds[n].events = POLLIN;
+            n++;
+        }
+        if (n)
+            poll(pfds, n, wait);
+        if (g_msg_fd >= 0) {
+            uint64_t v;
+            (void)!read(g_msg_fd, &v, 8);
+        }
+        /* input or a timer deadline may have arrived — report wake */
+        return 1;
+    }
+}
+
 static WN_API int32_t u32_GetMessageA(void *msg_out, wn_abiword hwnd,
                                       uint32_t min, uint32_t max)
 {
@@ -3582,6 +3632,30 @@ static wn_wndclass *builtin_control_class(const char *name)
                 snprintf(g_classes[c].name, sizeof g_classes[c].name, "%s",
                          known[i]);
                 g_classes[c].proc = ctl_proc;
+#if defined(__i386__)
+                /* Expose the builtin proc to GUESTS. On the native i386
+                 * build ctl_proc IS a stdcall (WN_API) function in this
+                 * process, so its plain address is a perfectly callable
+                 * i386 wndproc — the guest can store it and call it back
+                 * through CallWindowProc.
+                 *
+                 * Field case (LuaForWindows TNewCheckListBox raise "List
+                 * item and state item count mismatch"): VCL's CreateSubClass
+                 * asks GetClassInfo(HInstance, "LISTBOX") and installs the
+                 * returned lpfnWndProc as the proc of its own superclassed
+                 * control class; VCL then fetches it AGAIN via
+                 * GetWindowLong(GWL_WNDPROC) (FDefWndProc) after
+                 * CreateWindowEx and forwards every message it doesn't
+                 * handle through CallWindowProc(FDefWndProc). With
+                 * lpfnWndProc = 0 VCL rejected the class, registered
+                 * 'TNewCheckListBox' with its OWN proc, and the window had
+                 * zero listbox semantics: LB_ADDSTRING/LB_GETCOUNT went
+                 * into the VCL proc and died, AddItem2's Items.Count-vs-
+                 * FStateList.Count sanity check raised on the 2nd item.
+                 * (x64/wow64 keeps 0 — a host code pointer is not
+                 * expressible to a 32-bit guest there.) */
+                g_classes[c].proc32 = (uint32_t)(uintptr_t)ctl_proc;
+#endif
                 g_classes[c].used = 1;
                 wn_log(WN_LOG_DEBUG, "user32: builtin control class '%s'",
                        known[i]);
@@ -4392,6 +4466,127 @@ static WN_API int32_t u32_OffsetRect(void *rect, int32_t dx, int32_t dy)
     int32_t *r = rect;
     r[0] += dx; r[1] += dy; r[2] += dx; r[3] += dy;
     return 1;
+}
+
+/* --- rect init/tests + WindowFromPoint ----------------------------------
+ * Inno/VCL initializes TRect with SetRect/SetRectEmpty and probe the cursor
+ * with PtInRect/WindowFromPoint while the wizard paints; leaving them as
+ * "return 0" stubs handed VCL garbage rects (SetRectEmpty) and a 4-byte
+ * stack skew (WindowFromPoint's POINT arrives BY VALUE: 8 bytes on i386
+ * stdcall — the stub table's 1-word pop leaked half the frame per call and
+ * the next ret jumped to dead stack; field crash: tmp+0x41458b's frame
+ * returning to 0x40bdc101 "EXPFTEA" stack junk). POINT-by-value has a
+ * per-arch shape: two dword args on i386, ONE packed 8-byte arg in a
+ * register under ms_abi (both map to plain integer params here). */
+static WN_API int32_t u32_SetRect(void *rect, int32_t l, int32_t t,
+                                  int32_t rr, int32_t b)
+{
+    if (!rect)
+        return 0;
+    int32_t *r = rect;
+    r[0] = l; r[1] = t; r[2] = rr; r[3] = b;
+    return 1;
+}
+
+static WN_API int32_t u32_SetRectEmpty(void *rect)
+{
+    if (!rect)
+        return 0;
+    int32_t *r = rect;
+    r[0] = r[1] = r[2] = r[3] = 0;
+    return 1;
+}
+
+static WN_API int32_t u32_PtInRect(const void *rect
+#if !defined(__x86_64__)
+                                   , uint32_t px, uint32_t py
+#else
+                                   , wn_abiword pt_packed
+#endif
+                                   )
+{
+    if (!rect)
+        return 0;
+    int32_t x, y;
+#if defined(__x86_64__)
+    x = (int32_t)(uint32_t)pt_packed;
+    y = (int32_t)(uint32_t)(pt_packed >> 32);
+#else
+    x = (int32_t)px;
+    y = (int32_t)py;
+#endif
+    const int32_t *r = rect;
+    /* Windows contract: left/top inclusive, right/bottom exclusive. */
+    return x >= r[0] && x < r[2] && y >= r[1] && y < r[3];
+}
+
+/* Deepest visible window under a SCREEN point: same parent-relative
+ * descent the mouse path uses (children hold parent-coordinate rects),
+ * walking children last-to-first so the newest sibling wins like a
+ * proper z-order. Top-levels hold screen coordinates in wx/wy. */
+static WN_API wn_abiword u32_WindowFromPoint(
+#if !defined(__x86_64__)
+                                   uint32_t sx, uint32_t sy
+#else
+                                   wn_abiword pt_packed
+#endif
+                                   )
+{
+    int32_t x, y;
+#if defined(__x86_64__)
+    x = (int32_t)(uint32_t)pt_packed;
+    y = (int32_t)(uint32_t)(pt_packed >> 32);
+#else
+    x = (int32_t)sx;
+    y = (int32_t)sy;
+#endif
+    if (ensure_gui() != 0)
+        return 0;
+
+    uint64_t target = 0;
+    wn_window *top = NULL;
+    for (int i = g_hwnd_count - 1; i >= 0; i--) {
+        wn_window *w = g_hwnds[i].win;
+        if (!w || w->parent || !w->visible || w->in_destroy)
+            continue;
+        if (x >= w->wx && y >= w->wy &&
+            x < w->wx + w->cw && y < w->wy + w->ch) {
+            target = (uint64_t)(uintptr_t)g_hwnds[i].h;
+            top = w;
+            break;
+        }
+    }
+    if (!target || !top)
+        return 0;
+
+    /* Children hold PARENT-relative coords: translate the screen point
+     * into the top-level's frame first, then keep translating on each
+     * descent (same as the mouse event path). */
+    int mx = x - top->wx, my = y - top->wy;
+    for (int depth = 0; depth < 16; depth++) {
+        uint64_t next = 0;
+        int nx = 0, ny = 0;
+        for (int i = g_hwnd_count - 1; i >= 0; i--) {
+            wn_window *c = g_hwnds[i].win;
+            if (!c || c->parent != target || !c->visible ||
+                c->in_destroy ||
+                (c->style & 0x08000000u /*WS_DISABLED*/))
+                continue;
+            if (mx >= c->wx && my >= c->wy &&
+                mx < c->wx + c->cw && my < c->wy + c->ch) {
+                next = (uint64_t)(uintptr_t)g_hwnds[i].h;
+                nx = mx - c->wx;
+                ny = my - c->wy;
+                break;
+            }
+        }
+        if (!next)
+            break;
+        target = next;
+        mx = nx;
+        my = ny;
+    }
+    return target;
 }
 
 /* --- metrics / monitors / DPI ---------------------------------------------------
@@ -5869,9 +6064,14 @@ const wn_export_entry wn_user32_exports[] = {
     { "DispatchMessageA", u32_DispatchMessageA },
     { "EndPaint", g32_EndPaint },
     { "GetClientRect", u32_GetClientRect },
+    { "SetRect", u32_SetRect },
+    { "SetRectEmpty", u32_SetRectEmpty },
+    { "PtInRect", u32_PtInRect },
+    { "WindowFromPoint", u32_WindowFromPoint },
     { "FillRect", g32_FillRect },
     { "GetDC", g32_GetDC },
     { "GetMessageA", u32_GetMessageA },
+    { "WaitMessage", u32_WaitMessage },
     { "GetWindowRect", u32_GetWindowRect },
     { "IsWindow", u32_IsWindow },
     { "KillTimer", u32_KillTimer },

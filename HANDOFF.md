@@ -3,68 +3,68 @@
 Read this before continuing. Pair with STATUS.md (what works + proof) and
 TODO.md (prioritized backlog).
 
-## Last session (session 11) — what happened
+## Last session (session 17) — what happened
 
-USER REPORT (the session trigger): `WINNUX_WOW64=1 WINNUX_LOG=debug
-timeout 120 ./bin/winnux run ~/test/LuaForWindows_v5.1.5-52.exe /S` spammed
-the terminal with `PeekMessageA / TranslateMessage / DispatchMessageA` pairs
-returning `hwnd=101 msg=1` forever and hit the timeout.
+THE WIZARD RUNS. The LuaForWindows (Inno Setup 5) installer under
+winnux32 now: outer extracts → engine spawns → full wizard built (incl. the
+TNewCheckListBox that raised since session 13) → paints under Xvfb →
+settles into a real idle (0.9% CPU, 1-line log, zero stubs, zero
+exceptions). Screenshot proof: download/wizard-luaforwindows-session17.png.
 
-- REPRODUCED exactly (21.5M lines / 40s with Xvfb up). TWO root causes:
-  (a) u32_PeekMessageA had PM_NOREMOVE/PM_REMOVE INVERTED (PM_REMOVE=1 took
-  the "leave it queued" branch — Inno re-peeked the same message forever);
-  (b) WM_CREATE was POSTED into the queue instead of being sent inside
-  CreateWindowEx with a real CREATESTRUCT. Both fixed.
-- The fix exposed a chain of systemic wow64 bugs, all the same class
-  (compile-time `#if __x86_64__` struct layouts applied to a 32-bit guest
-  running IN-PROCESS on the x86-64 host; the runtime fix is
-  wn_wow64_guest32()): guest MSG layout (stack smash per peek),
-  RegisterClassA/WNDCLASS (the child registered 'TApplication' with a
-  GARBAGE name -> Delphi "class not found" exception), the sigs32 table
-  (regenerate with scripts/dev/gen_sigs32.py after adding exports — a
-  stale table caused a 4-byte stack skew: CreateWnd's `pop ebx` read a
-  RETURN ADDRESS and `ret` jumped to 0), RaiseException info arrays,
-  WFMO/MsgWait handle arrays (the parent polled garbage handles and never
-  reaped its zombie child), GWL_WNDPROC on builtin classes (host pointer
-  handed to the guest -> jumped to its low 32 bits).
-- NEW INFRASTRUCTURE: the 64->32 callback bridge
-  (wn_wow64_call_wndproc32: wndprocs/dlgprocs/timers/subclassing/
-  CallWindowProc — 32-bit guest code addresses are NEVER callable as host
-  functions) and the 32-bit frame-based SEH engine in seh.c (fs:[0] walk,
-  guest-layout record/context in low memory, unwind-to-finally + outward
-  search model decoded from the installer's own Borland System-unit
-  handlers, RtlUnwind continuation landing with [esp]=ReturnValue
-  [esp+4]=Record, longjmp chain for clean handler-abort).
-- RESULT: the process tree works end-to-end for the first time (extract ->
-  spawn engine -> engine reads its payload byte-perfect -> parent notices
-  failure, deletes the temp dir, ExitProcess). The engine itself still
-  crashes in Inno's setup-data processing (corrupted list node
-  edx=0x40a998; reads proven clean, so the engine corrupts its own data —
-  details + evidence in TODO "installer bring-up").
+Three root causes fixed in sequence (all decode chains in session-17
+STATUS.md):
+
+1. **VCL CreateSubClass contract.** The "List item and state item count
+   mismatch" raise: VCL's CreateSubClass(Params,'LISTBOX') installs the
+   lpfnWndProc returned by GetClassInfo(HInstance,'LISTBOX') as the class
+   proc of its superclassed control class — ours returned NULL, so VCL
+   registered 'TNewCheckListBox' with its own proc and NO window had
+   listbox semantics (LB_ messages died inside VCL, Items.Count stayed 0
+   while FStateList grew). Fix: builtin_control_class() now exposes
+   proc32 = (uint32_t)ctl_proc on the native i386 build — GetClassInfo,
+   GetWindowLong(GWL_WNDPROC) (FDefWndProc) and CallWindowProc all route
+   to it (the i386 bridge is a plain stdcall indirect call).
+2. **POINT-by-value stdcall ABI.** The WindowFromPoint stub popped 4 bytes
+   for an 8-byte by-value POINT → 4-byte frame leak → the wizard's hover
+   logic returned to dead stack. Fixed by implementing WindowFromPoint /
+   PtInRect / SetRect / SetRectEmpty for real (per-arch signatures; stub
+   widths WindowFromPoint 1→2, PtInRect 2→3).
+3. **WaitMessage.** Delphi's TApplication.Idle spins on a returning-0
+   WaitMessage stub (101k calls/min, 100% CPU). Now blocks on the same
+   wake sources as GetMessage without consuming.
+
+Plus: software raises now carry REAL guest registers (naked pusha gate on
+kernel32!RaiseException, i386-only), an EBP frame probe (VMT class names
+of frame locals — Self identification), the Inno checklistbox field
+probes, and an i386 EBP-chain backtrace in crash reports. Proof:
+scripts/dev/raise32.c under run32.sh round-trips six distinct register
+constants.
+
+Also: the dev environment was rebuilt from scratch after another sandbox
+reset — ONE idempotent script now rebuilds the entire 32-bit loop
+(scripts/setup_root32.sh: i386 libc + linux-libc-dev + lib32gcc + qemu-user
++ the i386 X11/freetype runtime + "=" ld-script patching; Makefile sysroot
+mode gained --sysroot via scripts/fix_m32_sysroot.py; i686 mingw installed
+into toolchain/root for 32-bit guest probes). The installer re-download:
+GitHub rjpcomputing/luaforwindows release v5.1.5-52 (SourceForge blocks).
+
+Gates: 19/19 tests (new t19_rect_wfp_wait), sigs32 788 exports, both
+runtimes green.
 
 ## The next 3 steps
 
-0. DONE in session 12 (context): the reported `make winnux32` failure
-   (unused params in wn_wow64_unwind32_take under -m32) plus the link
-   breakage it was masking (wn_seh_rtl_unwind_32 was x64-only): seh.c now
-   has the NATIVE i386 frame-SEH engine (#else branch — real fs:0x18 TEB
-   walk, cdecl handler calls, wn_seh32_land stack-switch landing), the
-   nested-fault cap + pending-unwind reuse went into BOTH engines, and
-   the obj32 Makefile rules gained per-file -fno-stack-protector + dep
-   tracking. toolchain/root32 + qemu were rebuilt (setup script:
-   /home/z/my-project/scripts/setup_root32.sh); `make winnux32` links,
-   smoke32 9/9 under qemu, 64-bit suite 16/16. The qemu process tree works
-   (WINNUX_CHILD_CMD routes guest CreateProcess through the emulator).
-1. Engine corruption hunt — now fully armed: the crash is DECODED (the
-   engine's own small-block heap freelist push at 0x401bb7 with a VMT
-   address in the bucket head; one runaway write also tramples host brk
-   key structs, caught by the child_find "HK" tripwire). The engine
-   binary is captured + analysis in /home/z/my-project/engine-forensics/.
-   Next: qemu -g + gdb on winnux32, breakpoint 0x401bb7, watchpoint the
-   bucket table (ds:0x49d478), walk back to the FIRST corrupting write.
-   All Windows-contract fixes that were provably wrong (Global heap
-   moveable model, resource HGLOBALs, registry zombies) are landed;
-   16/16 + smoke32 green with them.
-2. Then the same installer goal continues: engine past the data-corruption
-   crash -> files land in drive_c/Program Files -> registry uninstall keys
-   -> lua.exe smoke test `print(1+2*3, ("win"):upper())`.
+1. **Drive the wizard through the install.** Synthetic clicks (the
+   scripts/dev xtree click mode from session 6): Welcome → Next → license
+   radio → components checks (the checklistbox state model: LB_GETITEMDATA
+   / SetChecked → WM_ to the VCL proc → DrawItem ownerdraw) → directory
+   page → Install. Each page turn will surface the next contract gap;
+   the self-describing crash reports (registers + frame probe) make field
+   triage nearly instant now.
+2. **Run the /S silent path** — it should now pass the checklistbox
+   construction that killed it since session 12; harvest whatever raise
+   comes next (expect the file-copy + registry phase: the real test of
+   GlobalAlloc/Moveable, file writes, and the uninstall key tree).
+3. **Close the loop: lua.exe.** Files in drive_c/Program Files/Lua/5.1,
+   registry keys, then `winnux32 run .../lua.exe -e "print(1+2*3,
+   ('win'):upper())"` — the original milestone-1-class proof on a REAL
+   installed application.

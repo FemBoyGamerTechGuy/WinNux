@@ -16,6 +16,13 @@ void wn_seh_init(void);
 void wn_seh_raise(uintptr_t raise_site, uint32_t code, uint32_t flags,
                   uint32_t nparams, const uint64_t *params);
 
+/* Software-raise register snapshot (native i386): kernel32's naked
+ * RaiseException gate stores the guest's registers (pusha block:
+ * [edi, esi, ebp, orig_esp, ebx, edx, ecx, eax]) with the raise site
+ * before wn_seh_raise destroys them, so the crash report can print the
+ * real guest context. Consumed by the next wn_seh_raise on the thread. */
+void wn_seh_set_raise_regs(const uint32_t regs[8], uintptr_t raise_site);
+
 /* Vectored handlers (RtlAddVectoredExceptionHandler). Returns a
  * non-NULL registration handle or 0 on failure. */
 void *wn_seh_veh_add(void *handler, int first);

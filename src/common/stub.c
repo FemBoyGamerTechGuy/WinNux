@@ -321,7 +321,7 @@ static const struct { const char *dll, *name; uint8_t nargs; } g_stub_pop_table[
     { "gdi32.dll", "PatBlt", 6 },
     { "gdi32.dll", "Pie", 9 },
     { "gdi32.dll", "Polyline", 3 },
-    { "user32.dll", "PtInRect", 2 },
+    { "user32.dll", "PtInRect", 3 },        /* RECT* + POINT by value */
     { "gdi32.dll", "RealizePalette", 1 },
     { "gdi32.dll", "RectVisible", 2 },
     { "gdi32.dll", "RemoveFontResourceA", 1 },
@@ -359,7 +359,7 @@ static const struct { const char *dll, *name; uint8_t nargs; } g_stub_pop_table[
     { "user32.dll", "WaitForInputIdle", 2 },
     { "user32.dll", "WaitMessage", 0 },
     { "user32.dll", "WinHelpA", 4 },
-    { "user32.dll", "WindowFromPoint", 1 },
+    { "user32.dll", "WindowFromPoint", 2 },  /* POINT by value: 8B */
     { "ole32.dll", "CLSIDFromProgID", 2 },
     { "ole32.dll", "CoDisconnectObject", 2 },
     { "ole32.dll", "CoFreeUnusedLibraries", 0 },

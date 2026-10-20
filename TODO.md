@@ -4,34 +4,38 @@ Order = what real apps import/hit most. Every entry carries the evidence that
 put it here. Never silently drop items; move them to STATUS.md when done.
 
 
-## P0 — installer bring-up (session 13 state)
+## P0 — installer bring-up (session 17 state)
 
-The reported movaps GUI crash is FIXED for real (M32ALIGN now carries
-`-mincoming-stack-boundary=2` — session-14 STATUS.md has the post-mortem of
-why the session-13 `-mstackrealign`-only version left the export->libX11
-chain unprotected, and why the first push never reached origin).
-The wizard builds under Xvfb through TNewCheckListBox; /S and GUI converge
-at ONE remaining blocker, decoded to the exact engine check:
+THE WIZARD RUNS (session 17): builds the full wizard, paints it, idles at
+0.9% CPU with a clean log. The TNewCheckListBox raise, the POINT-by-value
+stub skew, and the WaitMessage idle spin are all root-caused and fixed
+(session-17 STATUS.md has the decode chain). New P0 = drive the wizard
+through the actual install:
 
-0. TNewCheckListBox count check (engine+0x44e058, raise 'List item and
-   state item count mismatch'): Items.Count via [Self+0xfc] (TStrings
-   virtual) vs FState.Count ([Self+0x168]+8) diverge; the checklistbox
-   receives NO LB_ traffic before the raise, so one list is populated
-   through a path we haven't seen. NEXT: qemu -g + gdb break at 0x44e083,
-   dump both counts + [Self+0xfc]'s identity; or extend the Delphi decoder
-   to walk info[2].
-1. Solved (session 13, kept for history): the session-12 "engine data
-   corruption" WAS the registry-key use-after-free — RegCloseKey freed
-   tree-owned nodes and the next RegOpenKey walked recycled heap
-   (wn_handle_set_nofree fixed it; tripwire = 0 hits). The 0x401bb7
-   freelist-push crash should be re-tested against this fix before any
-   further heap-hunting.
-2. GetSystemMenu/DeleteMenu menus: DONE (session 13, real menu objects).
-3. RichEdit: RICHED20/RICHED32 DLLs missing — Inno falls back
-   (TRichEditViewer is created anyway); only matters if the license page
-   needs real rich text later.
+0. CLICK THROUGH: synthetic input (scripts/dev xtree click mode) — Welcome
+   page Next → license radio → components checklistbox checks → dir page
+   typing → install. Every page turn likely surfaces the next missing
+   contract (combo pages, the TNewProgress bar, WM_CTLCOLOR* theming).
+1. /S SILENT PATH: with the GUI chain fixed the silent install should now
+   get much further; run it and harvest the next raise (the crash reports
+   are now self-describing: real registers + EBP frame probe + backtrace).
+2. Files land in drive_c/Program Files/Lua/5.1 → registry uninstall keys
+   (HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall) →
+   lua.exe smoke test: print(1+2*3, ("win"):upper()).
+3. RichEdit: presence-shims only; the license page needs real rich-text
+   rendering to look right (EM_SETCHARFORMAT/EM_SETSEL/EM_GETLINE line
+   model) — cosmetic until users read license text.
 4. Session-11 wow64 width-bug pattern audit (struct readers/writers with
    compile-time #if __x86_64__): still open.
+5. i686 mingw is installed (toolchain/root, apt-get download line in
+   scripts/dev/raise32.c): a 32-bit smoke suite under run32.sh would lock
+   the i386-only paths (RaiseException gate, builtin proc32 tokens,
+   GetClassInfo layouts) into CI-style checks the way smoke32 did.
+6. Solved (session 13, kept for history): the session-12 "engine data
+   corruption" WAS the registry-key use-after-free — RegCloseKey freed
+   tree-owned nodes and the next RegOpenKey walked recycled heap
+   (wn_handle_set_nofree fixed it; tripwire = 0 hits).
+7. GetSystemMenu/DeleteMenu menus: DONE (session 13, real menu objects).
 
 Older P0 notes (session 11/12 handoff):
 

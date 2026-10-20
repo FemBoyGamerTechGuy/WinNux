@@ -179,7 +179,7 @@ else ifeq ($(M32_MODE),sysroot)
 # amd64 dir (wordsize.h dispatches on __x86_64__), so re-add it to the chain.
 # GCC32DIR auto-detects the gcc version dir holding 32/crtbegin.o.
 GCC32DIR := $(patsubst %/32/,%,$(dir $(firstword $(wildcard $(M32_SYSROOT)/usr/lib/gcc/x86_64-linux-gnu/*/32/crtbegin.o))))
-M32FLAGS := -m32 -no-pie -fno-pic -static-libgcc $(M32ALIGN) \
+M32FLAGS := -m32 --sysroot=$(M32_SYSROOT) -no-pie -fno-pic -static-libgcc $(M32ALIGN) \
   -isystem $(M32_SYSROOT)/usr/include \
   -isystem $(M32_SYSROOT)/usr/include/i386-linux-gnu \
   -isystem /usr/include/x86_64-linux-gnu \

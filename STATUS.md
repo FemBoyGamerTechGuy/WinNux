@@ -1,4 +1,98 @@
 
+## Date: 2026-10-20 (session 17: THE WIZARD RUNS — VCL superclass contract, POINT-by-value ABI, WaitMessage idle, real raise registers)
+
+### Milestone
+`./bin/winnux run LuaForWindows_v5.1.5-52.exe` on the dev box (winnux32 under
+qemu+Xvfb, WINNUX_KEEP_TEMP): the outer extractor spawns the Inno engine, the
+engine builds the full wizard (TApplication → TWizardForm 579x360 → notebooks,
+pages, TEdit, TRichEditViewer, TNewComboBox, **TNewCheckListBox alive with
+items**), paints it (353k lit pixels, ~99k text/line pixels, exact Inno 5.x
+window geometry), and settles into a proper idle — **0.9% CPU**, zero
+stub hits, zero exceptions, 1-line log (the known benign dead-hwnd note).
+Screenshot: download/wizard-luaforwindows-session17.png. 19/19 tests.
+
+### The TNewCheckListBox raise, root-caused: VCL's CreateSubClass contract
+AddItem2's `Items.Count <> FStateList.Count` sanity check (the decoded
+"List item and state item count mismatch") fired because the checklistbox
+had NO listbox semantics: zero LB_ messages ever reached our builtin
+ctl_proc. Chain (from Inno's own NewCheckListBox.pas + the engine's
+disassembly of the check at engine+0x44e058):
+1. VCL's `CreateSubClass(Params, 'LISTBOX')` calls
+   `GetClassInfo(HInstance, 'LISTBOX')` and installs the returned
+   lpfnWndProc as the class proc of the control's superclassed class —
+   that proc IS the listbox. Ours reported success but lpfnWndProc = NULL
+   (builtin classes only had a host ctl_proc, never a guest-callable one).
+2. VCL then registered 'TNewCheckListBox' with its OWN proc; every
+   SendMessage routed to the guest VCL proc; FDefWndProc (GetWindowLong
+   GWL_WNDPROC) was also unusable, so LB_ADDSTRING/LB_GETCOUNT died inside
+   VCL and Items.Count stayed 0 while FStateList grew.
+Fix: on the native i386 build ctl_proc IS a stdcall function in-process —
+expose it: `builtin_control_class()` now sets `proc32 = (uint32_t)ctl_proc`
+(i386 only). GetClassInfoA/W and GetWindowLong already return proc32, and
+CallWindowProc/call_guest_wndproc route through wn_wow64_call_wndproc32
+which is a plain stdcall indirect call on this build — the whole
+superclass-subclass-DefWndProc chain now lands in the builtin. (x64/wow64
+keeps 0: a host code pointer is not expressible to a 32-bit guest there.)
+
+### The next crash in the chain: POINT-by-value stdcall ABI
+Wizard moved (SetRectEmpty, WindowFromPoint = Inno's flat-button hover
+logic — VCL FindControl/GetParent walk) and died returning to a dead stack
+address (0x40bdc101, bytes "EXPFTEA") inside tmp+0x414548's frame: the
+WindowFromPoint STUB popped 4 bytes for a POINT that arrives BY VALUE
+(8 bytes, i386 stdcall) — a 4-byte leak per call that redirected the next
+ret. Fixed by making the APIs real (they needed implementing anyway):
+- `WindowFromPoint(POINT)`: per-arch signature (two dword args on i386,
+  one packed register arg under ms_abi), deepest visible+enabled window
+  under the point with proper parent-relative translation (newest-first
+  z-order approximation).
+- `PtInRect(RECT*, POINT)`: real test, inclusive left/top, exclusive
+  right/bottom. Stub table width 2→3.
+- `SetRect`/`SetRectEmpty`: real writes (stub-0 left VCL TRects garbage).
+- Stub pop table: WindowFromPoint 1→2 (POINT by value).
+
+### WaitMessage: the 100%-CPU idle spin
+With the wizard up, Delphi's TApplication.Idle called our returning-0
+WaitMessage stub in a hot loop — 101k calls/min, 100% CPU, but ALIVE.
+Now a real blocking WaitMessage on the same wake sources as GetMessage
+(posted messages, quit flag, timer deadlines, backend input), consuming
+nothing. Wizard now idles at 0.9% CPU.
+
+### Software raises finally carry real registers (the all-zero reports)
+kernel32's RaiseException is entered directly from the guest IAT; on i386
+a naked gate (`pusha`, `ret $16`) snapshots EAX..EDI/EBP/ESP at the call
+and passes (args, regs) to the impl — the crash report now prints the
+raising method's live context, and seh.c walks it: an EBP frame probe that
+classifies frame locals via VMT shortstring class names (AddItem2's
+[ebp-4]=Self proves out), the caller chain, the Inno checklistbox's two
+divergent lists (Items @ Self+0xfc, FStateList.Count @ [Self+0x168]+8),
+and an i386 EBP-chain backtrace in the crash report. Proof:
+scripts/dev/raise32.c (i686 mingw, distinct constants in EAX..EDI) — the
+report round-trips all six plus RIP = the raise site and an EBP backtrace.
+x64 keeps honest zeros (no register state to keep there).
+
+### Environment rebuilt from scratch (sandbox reset again)
+Everything needed to rebuild the 32-bit loop is now in ONE idempotent
+script: /home/z/my-project/scripts/setup_root32.sh (libc6/libc6-dev:i386,
+libgcc-s1:i386, lib32gcc-14-dev, linux-libc-dev:i386 — bits/sched.h wants
+linux/types.h under --sysroot — qemu-user 10.0.13, the i386 X11/freetype
+runtime chain for winnux32's dlopen, ld scripts rewritten to "="
+sysroot-relative paths). Makefile sysroot mode gained
+`--sysroot=$(M32_SYSROOT)` (tab-safe patch script:
+scripts/fix_m32_sysroot.py) so ld finds the 32-bit interpreter and
+NEEDED dirs inside the sysroot. trixie's qemu-user-static is a STUB
+package — the dynamic qemu-user has the real binaries. The i686 mingw
+toolchain (apt-get download gcc-mingw-w64-i686-posix binutils-
+mingw-w64-i686 mingw-w64-i686-dev mingw-w64-common, extract into
+toolchain/root) builds 32-bit guest probes end-to-end
+(scripts/dev/raise32.c: build → run32.sh → report).
+
+### Gates
+19/19 (new t19_rect_wfp_wait: SetRect/SetRectEmpty values, PtInRect edge
+semantics, WindowFromPoint off-window/parent/deepest-child via
+ClientToScreen, WaitMessage wake on a queued message). sigs32 regen: 788
+exports. winnux32 boots under qemu-i386; raise32 probe verified. Installer
+wizard run verified twice (alive+idle, 1-line log, 0 stubs).
+
 ## Date: 2026-10-20 (session 16: field-log forensics — user IS on the fix; SID 11-word ABI + real EnumFonts + self-describing Delphi reports)
 
 ### Forensics: the user's latest log is from a d8c6996 build

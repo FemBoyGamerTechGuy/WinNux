@@ -907,6 +907,40 @@ static const char *exc_name(uint32_t c)
     }
 }
 
+/* Delphi VMT class-name probe: the VMT's metadata block [vmt-0x40, vmt-4)
+ * embeds the class shortstring (canonical vmtClassName at -$0C in
+ * Delphi 2..7). Longest plausible length-prefixed printable run wins.
+ * Safe-probed; returns 1 when a class name was found. */
+static int delphi_vmt_class(uint32_t vmt, char *cls, size_t clsz)
+{
+    cls[0] = 0;
+    if (clsz < 48)
+        return 0;                      /* callers pass a >=48-byte buffer */
+    if (vmt <= 0x10000 || !wn_ptr_readable((void *)(uintptr_t)(vmt - 0x40),
+                                            0x40))
+        return 0;
+    size_t best = 0;
+    for (int off = -0x40; off < -3; off++) {
+        const volatile uint8_t *q =
+            (const volatile uint8_t *)(const void *)(uintptr_t)(vmt + (int64_t)off);
+        uint8_t len = *q;
+        if (len < 2 || len > 40)
+            continue;
+        size_t k = 0;
+        for (; k < len; k++) {
+            uint8_t ch = q[k + 1];
+            if (ch < 0x20 || ch > 0x7E)
+                break;
+        }
+        if (k == len && k > best) {
+            best = k;
+            memcpy(cls, (const void *)(const volatile void *)(q + 1), k);
+            cls[k] = 0;
+        }
+    }
+    return best > 0;
+}
+
 /* Best-effort decode of a Delphi raise for the crash report: the exception
  * object carries [obj]=VMT (class-name shortstring embedded in the VMT's
  * metadata block below the class ref, canonically at vmt-$0C) and
@@ -931,33 +965,8 @@ static void delphi_describe(const wn_exc_record *rec, char *out, size_t outsz)
         memcpy(&vmt, (const void *)(uintptr_t)obj, 4);
         memcpy(&msgp, (const void *)(uintptr_t)(obj + 4), 4);
 
-        /* Class name: longest plausible shortstring in the VMT metadata
-         * block [vmt-0x40, vmt-4). Length byte + printable chars; the
-         * canonical vmtClassName sits at -$0C in Delphi 2..7 layouts. */
         char cls[48];
-        size_t best = 0;
-        cls[0] = 0;
-        if (vmt > 0x10000 && wn_ptr_readable((void *)(uintptr_t)(vmt - 0x40),
-                                             0x40)) {
-            for (int off = -0x40; off < -3; off++) {
-                const volatile uint8_t *q =
-                    (const volatile uint8_t *)(const void *)(uintptr_t)(vmt + (int64_t)off);
-                uint8_t len = *q;
-                if (len < 2 || len > 40)
-                    continue;
-                size_t k = 0;
-                for (; k < len; k++) {
-                    uint8_t ch = q[k + 1];
-                    if (ch < 0x20 || ch > 0x7E)
-                        break;
-                }
-                if (k == len && k > best) {
-                    best = k;
-                    memcpy(cls, (const void *)(const volatile void *)(q + 1), k);
-                    cls[k] = 0;
-                }
-            }
-        }
+        delphi_vmt_class(vmt, cls, sizeof cls);
 
         /* Message: longstring (length DWORD at msgp-4, chars at msgp). */
         char msg[208];
@@ -1023,11 +1032,11 @@ crash_report(wn_exc_record *rec, wn_context64 *ctx)
            (unsigned long long)ctx->r8, (unsigned long long)ctx->r9,
            (unsigned long long)ctx->r10, (unsigned long long)ctx->r11);
     wn_log(WN_LOG_ERR, "  RIP=%016llx", (unsigned long long)ctx->rip);
-    /* Frame-pointer backtrace (MSVC /Oy- builds): stop on anything that does
-     * not look like a sane chain. Best-effort - we are already crashing. */
+    /* Frame-pointer backtrace: stop on anything that does not look like a
+     * sane chain. Best-effort - we are already crashing. Delphi/MSVC i386
+     * builds keep EBP chains, and with the RaiseException gate snapshot
+     * even software raises now carry a real RBP to walk from. */
 #if defined(__x86_64__)
-    /* RBP frame-chain walk (MSVC builds keep frame pointers on x64). The
-     * i386 frame chain is 4-byte; the walk is skipped there for now. */
     {
         uint64_t rbp = ctx->rbp;
         for (int i = 0; i < 24 && rbp; i++) {
@@ -1041,6 +1050,28 @@ crash_report(wn_exc_record *rec, wn_context64 *ctx)
             wn_module_describe_addr((const void *)(uintptr_t)ret, w, sizeof w);
             wn_log(WN_LOG_ERR, "  #%d from %s", i, w);
             uint64_t next = *(const uint64_t *)(const void *)(uintptr_t)rbp;
+            if (next <= rbp)
+                break;
+            rbp = next;
+        }
+    }
+#else
+    {
+        uint32_t rbp = (uint32_t)ctx->rbp;
+        for (int i = 0; i < 24 && rbp > 0x1000; i++) {
+            if (rbp & 3 || rbp - (uint32_t)ctx->rbp > 0x400000u ||
+                (i && rbp <= (uint32_t)ctx->rbp + (uint32_t)i * 8))
+                break;
+            if (!wn_ptr_readable((void *)(uintptr_t)rbp, 8))
+                break;
+            uint32_t ret = 0, next = 0;
+            memcpy(&ret, (const void *)(uintptr_t)(rbp + 4), 4);
+            memcpy(&next, (const void *)(uintptr_t)rbp, 4);
+            if (!ret)
+                break;
+            char w[96];
+            wn_module_describe_addr((const void *)(uintptr_t)ret, w, sizeof w);
+            wn_log(WN_LOG_ERR, "  #%d from %s", i, w);
             if (next <= rbp)
                 break;
             rbp = next;
@@ -1221,6 +1252,117 @@ void wn_seh_init(void)
     sigaction(SIGILL, &sa, NULL);
 }
 
+/* --- software-raise register snapshot (native i386) ------------------------
+ * Delphi raises carry no fault context: RaiseException is a plain stdcall,
+ * so the ONLY source for the guest register state is the gate snapshot
+ * kernel32's naked trampoline takes at the call. Thread-local because the
+ * raise and its report happen synchronously on the raising thread, and a
+ * second thread may raise while one walk is still logging. */
+typedef struct wn_raise_regs {
+    int      valid;
+    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;   /* pusha block */
+    uintptr_t raise_site;
+} wn_raise_regs;
+
+static _Thread_local wn_raise_regs g_raise_regs;
+
+void wn_seh_set_raise_regs(const uint32_t regs[8], uintptr_t raise_site)
+{
+    g_raise_regs.edi = regs[0];
+    g_raise_regs.esi = regs[1];
+    g_raise_regs.ebp = regs[2];
+    g_raise_regs.esp = regs[3];
+    g_raise_regs.ebx = regs[4];
+    g_raise_regs.edx = regs[5];
+    g_raise_regs.ecx = regs[6];
+    g_raise_regs.eax = regs[7];
+    g_raise_regs.raise_site = raise_site;
+    g_raise_regs.valid = 1;
+}
+
+/* Delphi raise-frame probe: with the real EBP, the raising method's frame
+ * is directly readable. Delphi's -EBP frame stores locals at [ebp-4],
+ * [ebp-8] — the classic receiver (Self) sits in one of them (verified on
+ * the Inno engine's AddItem2: [ebp-4]=Self of TNewCheckListBox). For any
+ * local that points at a live object we print its class, plus the caller
+ * chain, plus — when the object looks like Inno's checklistbox — the two
+ * lists whose divergence triggered this exact check (Items @ +0xfc,
+ * FStateList @ +0x168 with TList.FCount at +8). All probes guarded: a
+ * garbage local can only cost a log line. */
+static void delphi_probe_raise_frame(void)
+{
+    wn_raise_regs *r = &g_raise_regs;
+    if (!r->valid || r->ebp <= 0x10000)
+        return;
+    uint32_t ebp = r->ebp;
+    if (!wn_ptr_readable((void *)(uintptr_t)ebp, 12))
+        return;
+
+    char w[96];
+    wn_module_describe_addr((const void *)(uintptr_t)r->raise_site,
+                            w, sizeof w);
+    wn_log(WN_LOG_DEBUG, "seh:   raise frame ebp=0x%x at %s", ebp, w);
+
+    /* Caller chain (EBP-chain, 4-byte frames). */
+    uint32_t frame = ebp;
+    for (int i = 0; i < 6; i++) {
+        if (frame <= 0x10000 || (frame & 3) ||
+            !wn_ptr_readable((void *)(uintptr_t)frame, 8))
+            break;
+        uint32_t ret = 0, next = 0;
+        memcpy(&ret, (const void *)(uintptr_t)(frame + 4), 4);
+        memcpy(&next, (const void *)(uintptr_t)frame, 4);
+        if (!ret || next <= frame || next - frame > 0x10000)
+            break;
+        wn_module_describe_addr((const void *)(uintptr_t)ret, w, sizeof w);
+        wn_log(WN_LOG_DEBUG, "seh:   caller #%d %s", i, w);
+        frame = next;
+    }
+
+    /* Frame locals [ebp-4], [ebp-8]: object identity via VMT class name. */
+    for (int slot = 4; slot <= 8; slot += 4) {
+        uint32_t lp = 0;
+        if (!wn_ptr_readable((void *)(uintptr_t)(ebp - slot), 4))
+            continue;
+        memcpy(&lp, (const void *)(uintptr_t)(ebp - slot), 4);
+        if (lp <= 0x10000 || !wn_ptr_readable((void *)(uintptr_t)lp, 16))
+            continue;
+        uint32_t vmt = 0;
+        memcpy(&vmt, (const void *)(uintptr_t)lp, 4);
+        char cls[48];
+        if (!delphi_vmt_class(vmt, cls, sizeof cls))
+            continue;
+        wn_log(WN_LOG_DEBUG, "seh:   frame[-0x%x]=0x%x class=%s",
+               slot, lp, cls);
+
+        /* Inno TNewCheckListBox check: Items object @ Self+0xfc and the
+         * state list @ Self+0x168 (TList: [list]+8 = FCount). */
+        uint32_t items = 0, state = 0;
+        if (wn_ptr_readable((void *)(uintptr_t)(lp + 0xfc), 4)) {
+            memcpy(&items, (const void *)(uintptr_t)(lp + 0xfc), 4);
+            if (items > 0x10000 &&
+                wn_ptr_readable((void *)(uintptr_t)items, 4)) {
+                uint32_t ivmt = 0;
+                memcpy(&ivmt, (const void *)(uintptr_t)items, 4);
+                char icls[48];
+                if (delphi_vmt_class(ivmt, icls, sizeof icls))
+                    wn_log(WN_LOG_DEBUG, "seh:     Self+0xfc Items=0x%x "
+                           "class=%s", items, icls);
+            }
+        }
+        if (wn_ptr_readable((void *)(uintptr_t)(lp + 0x168), 4)) {
+            memcpy(&state, (const void *)(uintptr_t)(lp + 0x168), 4);
+            if (state > 0x10000 &&
+                wn_ptr_readable((void *)(uintptr_t)(state + 8), 4)) {
+                uint32_t cnt = 0;
+                memcpy(&cnt, (const void *)(uintptr_t)(state + 8), 4);
+                wn_log(WN_LOG_DEBUG, "seh:     Self+0x168 FStateList=0x%x "
+                       "count=%u", state, cnt);
+            }
+        }
+    }
+}
+
 void wn_seh_raise(uintptr_t raise_site, uint32_t code, uint32_t flags,
                   uint32_t nparams, const uint64_t *params)
 {
@@ -1288,6 +1430,10 @@ void wn_seh_raise(uintptr_t raise_site, uint32_t code, uint32_t flags,
                 }
             }
         }
+        /* Raise-frame forensics (native i386): real registers + the
+         * raising method's EBP locals — Self, its class, the callers, and
+         * for Inno's checklistbox the two diverging list counts. */
+        delphi_probe_raise_frame();
     }
 
     ucontext_t uc;
@@ -1298,10 +1444,25 @@ void wn_seh_raise(uintptr_t raise_site, uint32_t code, uint32_t flags,
      * return address); a NULL site means "use my caller" (internal raises).
      * Without this the crash report blamed the host RaiseException builtin
      * (RIP in winnux32, registers all zero) instead of the guest raise
-     * point. Registers are honestly unknown for software raises: keep the
-     * zeroed ucontext, but the RIP/RVA now names the real origin. */
+     * point. On the native i386 build the naked gate in kernel32 handed
+     * us the REAL guest registers (see wn_seh_set_raise_regs): software
+     * raises now carry the raising method's live context, like a fault
+     * would. x64 keeps the honest zeros (no gate there). */
     ctx.rip = (uint64_t)(uintptr_t)raise_site;
+    if (g_raise_regs.valid && raise_site &&
+        g_raise_regs.raise_site == raise_site) {
+        ctx.rax = g_raise_regs.eax;
+        ctx.rbx = g_raise_regs.ebx;
+        ctx.rcx = g_raise_regs.ecx;
+        ctx.rdx = g_raise_regs.edx;
+        ctx.rsi = g_raise_regs.esi;
+        ctx.rdi = g_raise_regs.edi;
+        ctx.rbp = g_raise_regs.ebp;
+        ctx.rsp = g_raise_regs.esp;   /* esp at the call: [esp] = ret site */
+    }
     rec.exception_address = ctx.rip;
+    g_raise_regs.valid = 0;   /* consumed: a stale snapshot must never
+                               * decorate a later, unrelated raise */
 
     if (dispatch_veh(&rec, &ctx, &uc))
         return;   /* VEH continued: exception swallowed (logged) */

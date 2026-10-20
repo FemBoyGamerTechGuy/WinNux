@@ -4352,12 +4352,79 @@ static WN_API int32_t k32_GetLocaleInfoW(uint32_t lcid, uint32_t lctype,
     return copy;
 }
 
+/* RaiseException. The gate + register snapshot exist because Delphi's RTL
+ * calls RaiseException as a plain stdcall from the raising method — every
+ * VCL raise on record was reported with ALL registers zero: the C prologue
+ * had already clobbered the only copy of the guest context. On i386 a
+ * naked gate snapshots everything with pusha before any C code runs, so
+ * the crash report now carries the real EAX..EDI/EBP/ESP at the raise
+ * call (Self lives in one of the frame locals reachable from EBP).
+ * The ExceptionInformation array is DWORD-sized for 32-bit callers
+ * (Delphi passes the exception object + address there) and QWORD-sized
+ * for x64 callers. */
+#if defined(__i386__)
+/* referenced only from the naked gate's asm string — keep the compiler
+ * from treating it as dead code (the x64 build guards it out entirely) */
+__attribute__((used))
+static void k32_RaiseException_impl(const uint32_t *a, const uint32_t *regs)
+{
+    /* a[0] = the guest's return address (the raise site); a[1..4] are the
+     * original RaiseException(code, flags, nparams, params) args.
+     * regs = pusha block at the raise call: [edi, esi, ebp, orig_esp,
+     * ebx, edx, ecx, eax]. */
+    uint32_t code = a[1], flags = a[2], nparams = a[3];
+    const void *params = (const void *)(uintptr_t)a[4];
+    uint64_t p[15] = { 0 };
+    if (params && nparams) {
+        uint32_t n = nparams > 15 ? 15 : nparams;
+        if (wn_wow64_guest32()) {
+            const uint32_t *p32 = params;
+            for (uint32_t i = 0; i < n; i++)
+                p[i] = p32[i];
+        } else {
+            const uint64_t *p64 = params;
+            for (uint32_t i = 0; i < n; i++)
+                p[i] = p64[i];
+        }
+    }
+    wn_seh_set_raise_regs(regs, a[0]);
+    wn_seh_raise((uintptr_t)a[0], code, flags, nparams, p);
+}
+
+/* Naked stdcall gate: entered straight from the guest IAT with
+ * [esp]=ret, [esp+4]=code, [esp+8]=flags, [esp+12]=nparams,
+ * [esp+16]=params. pusha saves edi,esi,ebp,esp,ebx,edx,ecx,eax (in push
+ * order; orig_esp slot = esp at entry). Layout after pusha (S = entry esp):
+ *   esp=S-32, pusha block at S-32; "push %esp" stores S-32 (regs arg);
+ *   esp=S-36; lea 36(%esp)=S (&args, ret first); push -> esp=S-40.
+ * The impl call realigns its own frame (-mincoming-stack-boundary=2).
+ * The 4-parameter decl is REQUIRED: the sigs32 table derives the stdcall
+ * width (ret $16) from it — a naked body may not reference parameters,
+ * so the unused-parameter warning is silenced for the gate only. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+__attribute__((naked, noinline, used))
 static WN_API void k32_RaiseException(uint32_t code, uint32_t flags,
                                       uint32_t nparams, const void *params)
 {
-    /* The ExceptionInformation array is DWORD-sized for 32-bit callers
-     * (Delphi passes the exception object + address there) and QWORD-
-     * sized for x64 callers. */
+    __asm__ volatile(
+        "pusha                          \n\t"
+        "push  %%esp                    \n\t"   /* regs block ptr */
+        "lea   36(%%esp), %%eax         \n\t"   /* &args[0] = ret addr */
+        "push  %%eax                    \n\t"
+        "call  k32_RaiseException_impl  \n\t"
+        "add   $8, %%esp                \n\t"
+        "popa                           \n\t"
+        "ret   $16                      \n\t"
+        :
+        :
+        : "memory");
+}
+#pragma GCC diagnostic pop
+#else  /* __x86_64__: no register state to keep — plain stdcall body */
+static WN_API void k32_RaiseException(uint32_t code, uint32_t flags,
+                                      uint32_t nparams, const void *params)
+{
     uint64_t p[15] = { 0 };
     if (params && nparams) {
         uint32_t n = nparams > 15 ? 15 : nparams;
@@ -4378,6 +4445,7 @@ static WN_API void k32_RaiseException(uint32_t code, uint32_t flags,
     wn_seh_raise((uintptr_t)__builtin_return_address(0), code, flags,
                  nparams, p);
 }
+#endif /* __i386__ */
 
 static WN_API int32_t k32_DuplicateHandle(wn_handle src_proc, wn_handle src,
                                           wn_handle tgt_proc, wn_handle *out,
