@@ -1,4 +1,36 @@
 
+## Date: 2026-10-20 (session 14: the alignment fix that actually closes the crash)
+
+### Why the user still crashed after session 13 — two stacked failures
+User re-ran the installer and hit the SAME `_XSend` movaps SIG11
+(bytes `0f 29 64 24 20`, fault in libX11 `_XSend+0x135` via XSetWMProtocols,
+backtrace guest `0x40afa3` -> winnux32 `0x8070dcb` -> `0x807055b` ->
+`0x804b61f` -> X11). Chain: our wndproc dispatcher called the guest VCL
+wndproc; INSIDE it the guest called CreateWindowEx; our builtin passed the
+guest's 4-byte-aligned ESP straight down into libX11.
+1. bcb34df (session 13 recovery) was NEVER PUSHED — origin/main sat at
+   9edf899, so the user's pull+rebuild never contained ANY fix (crash bytes
+   were byte-identical to the pre-fix binary).
+2. Even if pushed, -mstackrealign alone could NOT fix this crash:
+   disassembly of the bcb34df build showed u32_CreateWindowExA,
+   u32_ShowWindow, u32_SetWindowPos and x11_win_create ALL had plain
+   prologues — -mstackrealign only realigns functions that THEMSELVES have
+   16-byte-aligned stack objects (69 of ~1700). The crash chain contains no
+   such function, so guest misalignment propagated into libX11 regardless.
+Fix (verified this session): M32ALIGN gains
+`-mpreferred-stack-boundary=4 -mincoming-stack-boundary=2`. GCC then assumes
+only 4-byte incoming alignment for EVERY function, and every function that
+makes an outgoing call realigns its frame at entry — so the FIRST builtin
+any guest touches realigns, and every host lib below (libX11/libc included)
+runs 16-byte aligned. Rebuilt winnux32: 929 realign prologues (was 69);
+u32_CreateWindowExA / u32_ShowWindow / u32_SetWindowPos / u32_CreateWindowExW
+/ u32_MessageBoxW / k32_GetModuleFileNameA / x11_win_create / all
+missing-import stub impls now open with `lea 0x4(%esp),%ecx;
+and $0xfffffff0,%esp; push -0x4(%ecx)`. Varargs + 16-aligned struct copies
+probed correct under qemu-i386; winnux32 boots under qemu-i386; 16/16
+tests green; x86_64 build untouched (flag is i386-only).
+Push verification: origin/main == HEAD after this session's push.
+
 ## Date: 2026-10-20 (session 13, rebased + pushed)
 
 ### The reported GUI installer crash: root cause + fix (VERIFIED at build level)

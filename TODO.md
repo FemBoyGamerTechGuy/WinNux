@@ -6,7 +6,10 @@ put it here. Never silently drop items; move them to STATUS.md when done.
 
 ## P0 — installer bring-up (session 13 state)
 
-The reported movaps GUI crash is FIXED (M32ALIGN; see STATUS session-13).
+The reported movaps GUI crash is FIXED for real (M32ALIGN now carries
+`-mincoming-stack-boundary=2` — session-14 STATUS.md has the post-mortem of
+why the session-13 `-mstackrealign`-only version left the export->libX11
+chain unprotected, and why the first push never reached origin).
 The wizard builds under Xvfb through TNewCheckListBox; /S and GUI converge
 at ONE remaining blocker, decoded to the exact engine check:
 

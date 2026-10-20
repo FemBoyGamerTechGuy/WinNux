@@ -145,17 +145,31 @@ endef
 # Guest->host stack alignment contract (LuaForWindows GUI crash, 2026-10-20):
 # i386 WinNux builtins are stdcall C functions wired DIRECTLY into the guest
 # IAT, so they are entered from guest code with only the Win32 4-byte ESP
-# alignment. GCC (any -m32 toolchain that emits SSE, e.g. Arch's default
-# tuning) lays out 16-aligned stack slots and copies structs with aligned
-# `movaps` per its -mpreferred-stack-boundary=4 chain assumption -> #GP ->
-# SIGSEGV si_addr=NULL (no CR2 for #GP) at the first misaligned guest call.
-# -mstackrealign is the documented mechanism for exactly this: every function
-# realigns its own frame at entry, so any guest entry alignment is safe.
-# -msse2 pins the same (SSE-enabled) codegen on conservative toolchains too
-# (Debian -m32 = i586 baseline) so this bug class can't silently diverge by
-# build host; every x86-64 CPU has SSE2 and qemu-i386 emulates it.
+# alignment (Delphi/Inno and other i386 compilers do NOT keep ESP 16-byte
+# aligned). Host libs built by any modern distro (libX11, libc, ...) assume
+# GCC's -mpreferred-stack-boundary=4 chain: the first `movaps` on a stack
+# slot (e.g. libX11 _XSend) takes a #GP when our wrapper passes the guest's
+# misaligned ESP through -> SIGSEGV si_addr=NULL (no CR2 for #GP).
+#
+# LESSON (verified on gcc-14 -m32): `-mstackrealign` alone is NOT enough.
+# It only inserts `and $-16,%esp` in functions that THEMSELVES have 16-byte
+# aligned stack objects/SSE spills (12 of ~1700 in this tree). A plain chain
+# (u32_CreateWindowExA -> x11_win_create -> XSetWMProtocols -> _XSend) has
+# no such function, so the guest's 4-byte ESP propagated into libX11 and the
+# exact same crash survived the earlier "fix".
+#
+# `-mincoming-stack-boundary=2` is the real mechanism: every function then
+# ASSUMES only 4-byte incoming alignment, and every function that makes an
+# outgoing call (i.e. every link of any guest->...->host-lib chain) realigns
+# its own frame at entry. The first host builtin the guest touches realigns,
+# and everything below it - our code AND libX11/libc - runs 16-byte aligned.
+# Verified: varargs + 16-aligned struct copies correct under qemu-i386;
+# export prologues checked in bin/winnux32 (u32_CreateWindowExA et al.).
+# -msse2 pins SSE codegen on conservative toolchains too (Debian -m32 =
+# i586 baseline) so this bug class can't silently diverge by build host;
+# every x86-64 CPU has SSE2 and qemu-i386 emulates it.
 M32_MODE := $(strip $(m32_probe))
-M32ALIGN := -msse2 -mstackrealign
+M32ALIGN := -msse2 -mstackrealign -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2
 ifeq ($(M32_MODE),native)
 M32FLAGS := -m32 -no-pie -fno-pic -static-libgcc $(M32ALIGN)
 M32POST  :=
