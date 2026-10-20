@@ -1,3 +1,64 @@
+## Date: 2026-10-20 (session 19: THE LICENSE PAGE IS REAL — EM_STREAMIN feed, VCL class-kind tokens, caption/titles/ghost-window chain)
+
+### Milestone
+The field-reported license page is now complete: radio captions render as
+`I accept the agreement` / `I do not accept the agreement` (4x-zoom VLM OCR,
+no literal '&', round radio glyphs), the instruction label wraps, the
+license BODY is fully rendered (Copyright (C) 1994-2008 Lua.org / blank
+line / wrapped MIT-style paragraphs), the wizard is a single framed
+toplevel titled "Setup - Lua for Windows" (no ghost "Setup" window, no
+"(Window without title)"), and the run log is 1 benign line with ZERO
+stub hits. Suite 20/20 (new t20_streamin). Commit 295f6cf, pushed and
+verified (origin/main == HEAD). Screenshot:
+download/wizard-luaforwindows-session19.png.
+
+### The six bug classes (all root-caused empirically)
+1. VCL subclass class names missed the control-kind table: ctl_kind_of
+   matched exact Windows names, so 'TNewRadioButton'/'TNewStaticText'/
+   'TRichEditViewer'/'TNewButton' fell to the generic paint branch —
+   raw TextOutA captions with a literal '&' (the "(&accept)"/"(&do)"
+   report), no check glyph, no 3D frames, no wrapping. Token matching
+   (most specific first) restores the original standard control's
+   semantics; the radio glyph is a real ring+dot disc raster.
+2. EM_STREAMIN (0x449) was silently ignored — Inno PULLS the license
+   through the guest's EDITSTREAM callback. Pull-loop implemented
+   (low-heap buffers for 32-bit guests, 4-arg stdcall bridge reuse,
+   ms_abi direct calls for x64 guests) + minimal RTF stripper
+   (destination groups, \par/\line, \'hh, \uN, CP1252->UTF-8).
+   RichEdits auto-detect PLAIN TEXT under the SF_RTF flag (Inno's
+   actual license.txt feed): CRLF->LF, paragraphs kept apart — the RTF
+   path's "CR/LF is layout-only" rule had glued them together
+   ("PUC-Rio.Permission").
+3. DefWindowProc ignored WM_SETTEXT/GETTEXT/GETTEXTLENGTH — VCL titles
+   forms via Perform(WM_SETTEXT), not the API: the wizard stayed
+   title-less while the ghost window (API-fed) showed "Setup". Fixed.
+4. Zero-sized toplevels mapped as 1x1 X windows — VCL's WS_VISIBLE
+   WS_POPUP 0x0 TApplication owner got a WM frame + taskbar entry on
+   real WMs (Windows shows nothing for a pixel-less window).
+   zero_sized windows never map until they actually grow.
+5. wtext became dynamic: licenses stream 20KB+; the fixed 512-char
+   cell showed only the head. WM_GETTEXT/GETTEXTLENGTH round-trip the
+   full payload now.
+6. i386 native bridge returned full RAX for guest calls — the ABI
+   defines only EAX; garbage high bits poisoned every '!= 0' check
+   (the stream callback delivered pcb=1088 yet read as an error).
+   Truncated to 32 bits. Plus: DT_WORDBREAK word-boundary wrapping,
+   newline-terminator consumption fixed (the audit-proven
+   one-blank-line-per-source-newline bug), SelectPalette/RealizePalette
+   honest true-color returns, IsWindowVisible implemented, SendMessage
+   routes builtin-class windows to ctl_proc (control messages were
+   swallowed by DefWindowProc).
+
+### Method notes for future sessions
+- VLM OCR of zoomed crops is decisive for text/pixels questions; keep
+  prompts neutral (priming it with '&' or 'ampersand' produced
+  false positives) and verify small-font readings at 4x zoom.
+- The dev loop gotcha repeats: `cd X && Xvfb &` backgrounds the whole
+  compound. Also: a MultiEdit applies sequentially and STOPS at the
+  failing edit — re-read the file to know which edits actually landed.
+- Band-scan geometry must be re-derived from the live tree every run
+  (VCL recreates windows with different sizes than at creation).
+
 
 ## Date: 2026-10-20 (session 17: THE WIZARD RUNS — VCL superclass contract, POINT-by-value ABI, WaitMessage idle, real raise registers)
 

@@ -14,16 +14,18 @@ inflation, the SetWindowPos SWP_SHOWWINDOW early-return, the child paint
 pipeline, and the GDI clip/origin/DIB family — full decode chain in
 session-18 STATUS.md. New P0 = interact with the real pixels:
 
-0. CLICK THROUGH (now meaningful — the pixels exist): synthetic input via
-   scripts/dev xtree click mode. NOTE: the click chain needs the i386 event
-   overlays that landed this session (mouse was dead before). Welcome Next
-   -> license radio -> components checklist -> dir page -> install. Expect
-   the checklist scroll (ScrollWindowEx is real now) and the progress bar
-   as the next contracts.
-1. LICENSE MEMO BODY: the license page renders but the memo is empty. The
-   text path is ready (full wtext + DT_WORDBREAK multiline EDIT paint +
-   EM_GETLINECOUNT honest); trace where Inno's LicenseMemo.Lines.Text
-   actually goes (WM_SETTEXT? EM_REPLACESEL? a gating EM_* we mis-answer?).
+0. CLICK THROUGH (the pixels are real now — session 19 closed the license
+   page: EM_STREAMIN feed, VCL class kinds, captions, titles, one window):
+   synthetic input via scripts/dev xtree click mode. Welcome Next ->
+   license radio (BM_SETCHECK already real) -> components checklist ->
+   dir page -> install. Expect ScrollWindowEx scrolling, the progress
+   bar, and richedit scrolling (the license viewer shows the first
+   screenful; EM_LINESCROLL/SetScrollPos are the next contracts) as the
+   next pieces.
+1. DONE (session 19, commit 295f6cf): the license body renders — Inno
+   feeds it via EM_STREAMIN+SF_RTF with plain-text bytes; the stream
+   loop + RTF stripper + plain-text auto-detect landed, gated by
+   t20_streamin (20/20). Remaining polish: viewer scrolling (see 0).
 2. /S SILENT PATH + lua.exe smoke test (unchanged from session 17).
 3. Session-11 wow64 width-bug pattern audit: STILL OPEN, and this session
    added fresh per-arch surfaces (x11_backend offsets, ScrollWindowEx
