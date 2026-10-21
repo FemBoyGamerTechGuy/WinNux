@@ -68,6 +68,13 @@ typedef struct wn_window {
                                  stream 20KB+ through EM_STREAMIN — the old
                                  fixed 512-char cell showed only the head */
     int visible;
+    uint32_t z_seq;            /* sibling z-order proxy: higher = on top.
+                                 Raised at create, on hide->show, and on
+                                 SetWindowPos without SWP_NOZORDER. The
+                                 hit-test prefers the highest z_seq - a
+                                 first-created match sent clicks for the
+                                 components checklist to the never-yet-
+                                 visited DIR notebook page. */
     int zero_sized;            /* created 0x0 (VCL TApplication owner):
                                  Windows shows nothing for a pixel-less
                                  window, but a mapped 1x1 gains a WM frame
@@ -137,6 +144,63 @@ static uint64_t g_paint_counter;
 static uint64_t g_focus_hwnd;       /* 0 = unset */
 static uint64_t g_active_hwnd;      /* 0 = unset */
 static uint64_t g_capture_hwnd;    /* mouse capture window (SetCapture) */
+static uint32_t g_z_seq;          /* z_seq source (see wn_window.z_seq) */
+/* Dev diagnostic: Inno small-block-heap canary (see scripts/
+ * patch_session21c_canary.py). The engine's freelist bucket heads live at
+ * engine+0x9d420/0x9d46c/0x9d470/0x9d478 (base 0x400000; disassembly-
+ * verified: allocator freelist push at 0x401bbe, arena sentinel 0x49d47c).
+ * A head must be 0 or inside a big RW arena. Anything else = the heap
+ * corruption that wedges the engine at Install. WARN ONCE PER VALUE so
+ * the log timestamp brackets the FIRST corrupting write. */
+extern uint32_t wn_dbg_arena_lo, wn_dbg_arena_hi;
+static uint32_t g_canary_bad_seen[4];
+static int g_canary_valid;
+static void heap_canary_check(void)
+{
+    if (!g_canary_valid)
+        return;
+    const wn_module *m = g_proc.exe;
+    if (!m)
+        return;
+    static const uint32_t offs[4] = { 0x9d420, 0x9d46c, 0x9d470, 0x9d478 };
+    for (int i = 0; i < 4; i++) {
+        volatile uint32_t *head = (volatile uint32_t *)(m->base + offs[i]);
+        uint32_t val = head[0];
+        if (val == g_canary_bad_seen[i])
+            continue;           /* already warned for this value */
+        /* A freelist head can NEVER point into the image's CODE/RVA
+         * section (session-12: corrupt head 0x40a998 = a VMT table inside
+         * CODE) or hold small ASCII garbage (0x2e '.'). Pointers into
+         * BSS/stacks/host-HeapAlloc blocks are all legitimate - only the
+         * impossible values warn. */
+        int bad = (val >= 0x401000 && val < 0x49a000) ||
+                  (val != 0 && val < 0x10000);
+        if (bad) {
+            wn_log(WN_LOG_WARN, "HEAP-CANARY: engine bucket head %d "
+                   "(engine+0x%x) = 0x%x - CODE-SECTION or garbage value: "
+                   "heap corruption present at this moment",
+                   i, offs[i], val);
+            g_canary_bad_seen[i] = val;
+        }
+        (void)wn_dbg_arena_lo; (void)wn_dbg_arena_hi;
+    }
+}
+static void heap_canary_arm(void)
+{
+    const wn_module *m = g_proc.exe;
+    if (m && m->kind == WN_MOD_PE &&
+        (uintptr_t)m->base == 0x400000 && m->size >= 0x9d480) {
+        g_canary_valid = 1;
+        wn_log(WN_LOG_DEBUG, "HEAP-CANARY: armed for %s (base 0x%llx "
+               "size 0x%zx)", m->name,
+               (unsigned long long)(uintptr_t)m->base, m->size);
+    }
+}
+static int g_buttons_down;        /* real mouse buttons currently down */
+static int g_capture_while_down;  /* capture taken during a drag: Windows
+                                     auto-releases it when the button
+                                     comes up (VCL buttons/listboxes and
+                                     our scrollbar drags both rely on it) */
 static uint64_t g_desktop_hwnd;     /* 0 = not created yet */
 
 /* hwnd registry (parallel to the handle table, for reverse lookup). */
@@ -511,16 +575,24 @@ void wn_backend_event_cb(const wn_backend_event *ev)
             wn_window *tw = win_from_hwnd(target);
             if (!tw)
                 target = h;
-            post_msg(target, ev->type == WN_BEV_KEY ? WN_WM_KEYDOWN
-                                                    : WN_WM_KEYUP, vk, 0);
+            /* Alt held: Windows delivers WM_SYSKEYDOWN/UP (0x0104/5)
+             * instead — VCL's mnemonic machinery (CM_DIALOGCHAR from
+             * WM_SYSCHAR) depends on the SYS variants arriving. */
+            int alt = g_key_state[0x12 / 8] & (1u << (0x12 % 8));
+            uint32_t kmsg = ev->type == WN_BEV_KEY
+                ? (alt ? 0x0104 /*WM_SYSKEYDOWN*/ : WN_WM_KEYDOWN)
+                : (alt ? 0x0105 /*WM_SYSKEYUP*/ : WN_WM_KEYUP);
+            post_msg(target, kmsg, vk, (int64_t)(alt ? (1u << 29) : 0));
         }
         break;
     }
     case WN_BEV_TEXT:
-        post_msg(g_focus_hwnd ? g_focus_hwnd : h, WN_WM_CHAR,
-                 (uint64_t)(uint32_t)ev->val, 0);
+        post_msg(g_focus_hwnd ? g_focus_hwnd : h,
+                 (g_key_state[0x12 / 8] & (1u << (0x12 % 8)))
+                     ? 0x0106 /*WM_SYSCHAR*/ : WN_WM_CHAR,
+                 (uint64_t)(uint32_t)ev->val, (int64_t)(1u << 29));
         break;
-    case WN_BEV_MOUSE_MOVE:
+    case WN_BEV_MOUSE_MOVE: {
         /* approximate cursor tracking for GetCursorPos (root coords) */
         {
             int ox, oy;
@@ -528,14 +600,39 @@ void wn_backend_event_cb(const wn_backend_event *ev)
             g_mouse_x = ox + ev->x;
             g_mouse_y = oy + ev->y;
         }
-        post_msg(g_capture_hwnd ? g_capture_hwnd : h, WN_WM_MOUSEMOVE, 0,
-                 (int64_t)(((uint64_t)(uint16_t)ev->x) |
-                           ((uint64_t)(uint16_t)ev->y << 16)));
+        if (g_capture_hwnd) {
+            /* captured move: client coords of the CAPTURE window (raw
+             * form coords made thumb drags compute garbage positions). */
+            wn_window *hw = win_from_hwnd(h);
+            wn_window *cw = win_from_hwnd(g_capture_hwnd);
+            int tx = (int)(int16_t)ev->x, ty = (int)(int16_t)ev->y;
+            if (hw && cw) {
+                int hxo, hyo, cxo, cyo;
+                win_screen_origin(hw, &hxo, &hyo);
+                win_screen_origin(cw, &cxo, &cyo);
+                tx = (int)(int16_t)ev->x - (cxo - hxo);
+                ty = (int)(int16_t)ev->y - (cyo - hyo);
+            }
+            post_msg(g_capture_hwnd, WN_WM_MOUSEMOVE, 0,
+                     (int64_t)(((uint64_t)(uint16_t)tx) |
+                               ((uint64_t)(uint16_t)ty << 16)));
+        } else {
+            post_msg(h, WN_WM_MOUSEMOVE, 0,
+                     (int64_t)(((uint64_t)(uint16_t)ev->x) |
+                               ((uint64_t)(uint16_t)ev->y << 16)));
+        }
         break;
+    }
     case WN_BEV_MOUSE_BUTTON: {
         wn_log(WN_LOG_TRACE, "user32: mouse button win=%llx val=%d btn=%d "
                "at %d,%d", (unsigned long long)h, ev->val, ev->val2,
                ev->x, ev->y);
+        if (ev->val2 >= 1 && ev->val2 <= 3) {
+            if (ev->val)
+                g_buttons_down++;
+            else if (g_buttons_down > 0)
+                g_buttons_down--;
+        }
         uint32_t msg = 0;
         uint64_t wp = 1 /* MK_LBUTTON */;
         if (ev->val2 == 1)      msg = ev->val ? WN_WM_LBUTTONDOWN : WN_WM_LBUTTONUP;
@@ -555,20 +652,25 @@ void wn_backend_event_cb(const wn_backend_event *ev)
             if (g_key_state[0x11 / 8] & (1u << (0x11 % 8))) keys |= 8;
             uint32_t wheel_msg = hmsg ? 0x020E /*WM_MOUSEHWHEEL*/
                                       : 0x020A /*WM_MOUSEWHEEL*/;
-            /* deepest visible child under the cursor, like clicks */
+            /* deepest visible child under the cursor: the TOPMOST
+             * containing sibling wins (highest z_seq), not the first
+             * created - Inno's never-yet-visited notebook pages are
+             * visible and would otherwise swallow wheel events. */
             uint64_t target = h;
             int mx = (int)(int16_t)ev->x, my = (int)(int16_t)ev->y;
             for (int depth = 0; depth < 8; depth++) {
                 uint64_t next = 0;
+                uint32_t best_z = 0;
                 for (int i = 0; i < g_hwnd_count; i++) {
                     wn_window *c = g_hwnds[i].win;
                     if (!c || c->parent != target || !c->visible ||
                         c->in_destroy)
                         continue;
                     if (mx >= c->wx && my >= c->wy &&
-                        mx < c->wx + c->cw && my < c->wy + c->ch) {
+                        mx < c->wx + c->cw && my < c->wy + c->ch &&
+                        c->z_seq > best_z) {
                         next = (uint64_t)(uintptr_t)g_hwnds[i].h;
-                        break;
+                        best_z = c->z_seq;
                     }
                 }
                 if (!next)
@@ -582,8 +684,13 @@ void wn_backend_event_cb(const wn_backend_event *ev)
             } else {
                 ox = oy = 0;
             }
+            /* Windows contract: wParam = (WHEEL_DELTA << 16) | key
+             * states - the DELTA lives in the HIGH word. Writing it into
+             * the low word made every control read delta=0 (the wheel
+             * "worked" in old tests only because XSendEvent bypassed
+             * this packing). */
             post_msg(target, wheel_msg,
-                     ((uint64_t)keys << 16) | (delta & 0xFFFF),
+                     ((uint64_t)(delta & 0xFFFF) << 16) | keys,
                      (int64_t)(((uint64_t)(uint16_t)(ox + mx)) |
                        ((uint64_t)(uint16_t)(oy + my) << 16)));
             break;
@@ -596,11 +703,33 @@ void wn_backend_event_cb(const wn_backend_event *ev)
             if (ew && (ew->style & 0x08000000u /*WS_DISABLED*/) &&
                 !g_capture_hwnd)
                 break;
-            /* Captured window eats all button messages (Windows contract). */
+            /* Captured window eats all button messages (Windows
+             * contract) - with lParam translated to ITS client space
+             * (can be negative outside the window; the old raw coords
+             * broke every captured drag: VCL buttons, checklist, our
+             * scrollbar thumb). */
             if (g_capture_hwnd) {
-                post_msg(g_capture_hwnd, msg, wp,
-                         (int64_t)(((uint64_t)(uint16_t)ev->x) |
-                                   ((uint64_t)(uint16_t)ev->y << 16)));
+                wn_window *hw = win_from_hwnd(h);
+                wn_window *cw = win_from_hwnd(g_capture_hwnd);
+                int tx = (int)(int16_t)ev->x, ty = (int)(int16_t)ev->y;
+                if (hw && cw) {
+                    int hxo, hyo, cxo, cyo;
+                    win_screen_origin(hw, &hxo, &hyo);
+                    win_screen_origin(cw, &cxo, &cyo);
+                    tx = (int)(int16_t)ev->x - (cxo - hxo);
+                    ty = (int)(int16_t)ev->y - (cyo - hyo);
+                    wn_log(WN_LOG_DEBUG, "user32: capture button msg=%u "
+                           "raw=%d,%d capwin=0x%llx org=%d,%d -> %d,%d",
+                           msg, (int)(int16_t)ev->x, (int)(int16_t)ev->y,
+                           (unsigned long long)g_capture_hwnd,
+                           cxo - hxo, cyo - hyo, tx, ty);
+                }
+                /* button UP auto-releases a capture taken during the drag
+                 * (Windows contract; VCL apps rely on it). */
+                if (!ev->val && g_capture_while_down) {
+                    g_capture_hwnd = 0;
+                    g_capture_while_down = 0;
+                }
                 break;
             }
             /* hit-test: deliver to the deepest visible, ENABLED child under
@@ -613,17 +742,19 @@ void wn_backend_event_cb(const wn_backend_event *ev)
             for (int depth = 0; depth < 8; depth++) {
                 uint64_t next = 0;
                 int nx = 0, ny = 0;
+                uint32_t best_z = 0;
                 for (int i = 0; i < g_hwnd_count; i++) {
                     wn_window *c = g_hwnds[i].win;
                     if (!c || c->parent != target || !c->visible ||
                         c->in_destroy || (c->style & 0x08000000u /*WS_DISABLED*/))
                         continue;
                     if (mx >= c->wx && my >= c->wy &&
-                        mx < c->wx + c->cw && my < c->wy + c->ch) {
+                        mx < c->wx + c->cw && my < c->wy + c->ch &&
+                        c->z_seq > best_z) {
                         next = (uint64_t)(uintptr_t)g_hwnds[i].h;
                         nx = mx - c->wx;
                         ny = my - c->wy;
-                        break;
+                        best_z = c->z_seq;
                     }
                 }
                 if (!next)
@@ -662,6 +793,7 @@ static int ensure_gui(void)
         return -1;
     }
     g_backend_up = 1;
+    heap_canary_arm();
     g_msg_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (g_msg_fd < 0)
         return -1;
@@ -705,6 +837,8 @@ static WN_API int32_t u32_ShowWindow(wn_abiword hwnd, int32_t cmd)
         }
     }
     w->visible = (cmd != 0);
+    if (cmd != 0 && !was_visible)
+        w->z_seq = ++g_z_seq;   /* (re)shown: on top of its siblings */
     if (w->parent && w->visible)
         compose_child(w);
     if (cmd != 0)
@@ -826,6 +960,8 @@ static WN_API int32_t u32_SetWindowPos(wn_abiword hwnd, wn_abiword after,
      * `return 1` on the no-size/no-move path swallowed SWP_SHOWWINDOW, so
      * the wizard's entire control tree stayed invisible=0 → never dirty →
      * never painted (white wizard with nothing but the form's bevels). */
+    if (!(flags & 0x0004 /* SWP_NOZORDER */))
+        win->z_seq = ++g_z_seq;   /* raise to top of siblings (HWND_TOP) */
     if (flags & 0x0040 /* SWP_SHOWWINDOW */)
         u32_ShowWindow(hwnd, 5);
     else if (flags & 0x0080 /* SWP_HIDEWINDOW */)
@@ -1136,15 +1272,25 @@ static uint32_t g_next_regmsg = 0xC000;
 static WN_API uint64_t u32_SetCapture(wn_abiword hwnd)
 {
     uint64_t old = g_capture_hwnd;
-    if (win_from_hwnd(hwnd))
+    wn_log(WN_LOG_DEBUG, "user32: SetCapture(0x%llx) old=0x%llx buttons=%d",
+           (unsigned long long)hwnd, (unsigned long long)old, g_buttons_down);
+    if (win_from_hwnd(hwnd)) {
         g_capture_hwnd = hwnd;
+        /* Windows releases the capture automatically at button-up when it
+         * was taken while a button was down (VCL's TButton/listbox and our
+         * scrollbar drags all take capture inside WM_LBUTTONDOWN). */
+        if (g_buttons_down > 0)
+            g_capture_while_down = 1;
+    }
     return old;
 }
 
 static WN_API int32_t u32_ReleaseCapture(void)
 {
     int32_t had = g_capture_hwnd != 0;
+    wn_log(WN_LOG_DEBUG, "user32: ReleaseCapture() had=%d", had);
     g_capture_hwnd = 0;
+    g_capture_while_down = 0;
     return had;
 }
 
@@ -1971,6 +2117,7 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
         win->bwin->pixels = wn_xmalloc((size_t)win->cw * win->ch * 4 + 64);
         memset(win->bwin->pixels, 0xFF, (size_t)win->cw * win->ch * 4);
         wn_handle hwnd = register_hwnd(win);
+        win->z_seq = ++g_z_seq;
         (void)ex_style;
         if (!send_create_msgs((uint64_t)(uintptr_t)hwnd, hinst, menu, parent,
                               x, y, win->cw, win->ch, style, ex_style,
@@ -2038,6 +2185,7 @@ static uint64_t create_window_core(uint32_t ex_style, const char *cls_name,
     win->bwin->stride = w * 4;
 
     wn_handle hwnd = register_hwnd(win);
+    win->z_seq = ++g_z_seq;     /* Windows inserts new windows on top */
     if (g_bwin_count < WN_USER32_MAX_WINDOWS) {
         g_bwins[g_bwin_count].bwin = win->bwin;
         g_bwins[g_bwin_count].backend_priv = win->bwin->priv;
@@ -2339,6 +2487,7 @@ static int pump_once(void)
 {
     const wn_backend *be = wn_backend_get();
     int got = 0;
+    heap_canary_check();         /* dev heartbeat: catch heap corruption */
     fire_timers();               /* may queue WM_TIMER */
     generate_paints();           /* queues ONE WM_PAINT per dirty window */
     if (be && be->pump)
@@ -4352,11 +4501,30 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         return 0;
     }
     case WN_WM_MOUSEWHEEL: {
-        /* wheel: 3 lines per notch (Windows default) */
+        /* wheel: 3 lines per notch (Windows default). Edits are LINE-based:
+         * the first visible LINE is top_item — moving sb_pos alone left the
+         * content frozen (the wheel hit the edit, sb_pos moved, top_item
+         * stayed 0: "edit first visible=0"). Keep both in sync like the
+         * WM_VSCROLL/EM_LINESCROLL contract. */
         int delta = (int)(int16_t)((uint64_t)wp >> 16);
         if (delta) {
             int dir = delta > 0 ? SB_LINEUP : SB_LINEDOWN;
             int steps = (delta > 0 ? delta : -delta) / 40 + 1;
+            if (k == CTL_EDIT) {
+                w->top_item += (dir == SB_LINEDOWN ? 1 : -1) * steps * 3;
+                if (w->top_item < 0)
+                    w->top_item = 0;
+                w->sb_pos[0] = w->top_item;
+                if (w->sb_max[0] > w->sb_min[0])
+                    sb_clamp(w, 0);
+                ctl_repaint(w);
+                if (w->parent)
+                    post_msg(w->parent, WN_WM_VSCROLL,
+                             SB_THUMBPOSITION |
+                             ((uint64_t)w->sb_pos[0] << 16),
+                             (int64_t)(uintptr_t)hwnd_of_window(w));
+                return 0;
+            }
             for (int i = 0; i < steps * 3; i++)
                 sb_apply(w, 0, (uint32_t)dir);
             ctl_repaint(w);
@@ -4507,7 +4675,12 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
         switch (k) {
         case CTL_BUTTON: {
             uint32_t bs = w->style & 0xF;
-            if (bs == 0x2 || bs == 0x9) {    /* auto check / auto radio */
+            /* Auto-state buttons toggle themselves on click:
+             * BS_AUTOCHECKBOX(3) / BS_AUTO3STATE(6) / BS_AUTORADIOBUTTON(9).
+             * BS_CHECKBOX(2) is APP-managed (BM_SETCHECK) — including it
+             * here kept every AUTOCHECKBOX (Inno's TNewCheckBox!) firing
+             * BN_CLICKED with the glyph never changing. */
+            if (bs == 0x3 || bs == 0x6 || bs == 0x9) {
                 if (bs == 0x9) {
                     /* uncheck radio group siblings (same WS_GROUP run) */
                     for (int i = 0; i < g_hwnd_count; i++) {
@@ -5075,6 +5248,29 @@ static WN_API wn_abiword ctl_proc(wn_abiword hwnd, uint32_t msg,
     case TVM_SETITEMHEIGHT_: return 0;
     case TVM_GETITEMHEIGHT_: return (uint64_t)(ctl_row_h() + 2);
     case WN_WM_KEYDOWN: {
+        /* Windows' BUTTON class: Space toggles auto-state buttons and
+         * activates push buttons; Enter activates the focused one.
+         * The field report "checkbox doesn't respond to the keyboard"
+         * was this missing branch. */
+        if (k == CTL_BUTTON) {
+            uint32_t bvk = (uint32_t)wp;
+            if (bvk == 0x20 /*VK_SPACE*/) {
+                uint32_t bs = w->style & 0xF;
+                if (bs == 0x3 || bs == 0x6)
+                    w->check = w->check ? BST_UNCHECKED : BST_CHECKED;
+                else if (bs == 0x9)
+                    w->check = BST_CHECKED;
+                ctl_repaint(w);
+                ctl_notify(w, 0 /* BN_CLICKED */);
+                return 0;
+            }
+            if (bvk == 0x0D /*VK_RETURN*/ &&
+                (w->style & 0xF) <= 0x1) {   /* push/defpush */
+                ctl_notify(w, 0 /* BN_CLICKED */);
+                return 0;
+            }
+            return 0;
+        }
         /* tree view keyboard navigation (arrows move selection like
          * Windows; putty drives the config tree with them) */
         if (k != CTL_TREEVIEW)
@@ -5512,9 +5708,50 @@ static int32_t u32_IsDialogMessage_impl(uint64_t hdlg, const uint8_t *msg)
     msg_read(msg, &hwnd, &message, &wp, &lp);
     (void)lp;
     (void)hdlg;
+    /* The message may target ANY window IN the dialog (keyboard goes to
+     * the FOCUSED child; IsDialogMessage owns it dialog-wide). Walk up to
+     * the dialog from the message's window. */
     wn_window *dlg = win_from_hwnd(hwnd);
+    while (dlg && !dlg->is_dialog && dlg->parent)
+        dlg = win_from_hwnd(dlg->parent);
     if (!dlg || !dlg->is_dialog)
         return 0;
+    if (message == 0x0106 /*WM_SYSCHAR*/) {
+        /* Alt+<mnemonic>: activate the child BUTTON whose caption carries
+         * '&<ch>'. The dialog manager owns this translation on Windows. */
+        uint32_t ch = (uint32_t)wp & 0xFF;
+        uint32_t lch = (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch;
+        uint64_t dlg_h = (uint64_t)(uintptr_t)hwnd_of_window(dlg);
+        for (int i = 0; i < g_hwnd_count; i++) {
+            wn_window *c = g_hwnds[i].win;
+            if (!c || c->parent != dlg_h || !c->cls || !c->visible ||
+                !wn_strcaseeq(c->cls->name, "Button"))
+                continue;
+            if (!c->wtext)
+                continue;
+            for (const uint16_t *t = c->wtext; t[0]; t++) {
+                if (t[0] != '&')
+                    continue;
+                uint32_t mch = t[1] & 0xFF;
+                uint32_t lmch = (mch >= 'A' && mch <= 'Z') ? mch + 32 : mch;
+                if (mch && lmch == lch) {
+                    /* toggle auto-state + notify exactly like a click */
+                    uint32_t bs = c->style & 0xF;
+                    if (bs == 0x3 || bs == 0x6)
+                        c->check = c->check ? BST_UNCHECKED : BST_CHECKED;
+                    else if (bs == 0x9)
+                        c->check = BST_CHECKED;
+                    user32_set_focus_internal((uint64_t)(uintptr_t)
+                                              hwnd_of_window(c));
+                    ctl_repaint(c);
+                    ctl_notify(c, 0 /* BN_CLICKED */);
+                    return 1;
+                }
+                break;   /* one mnemonic per caption */
+            }
+        }
+        return 0;
+    }
     if (message != WN_WM_KEYDOWN)
         return 0;
     uint32_t vk = (uint32_t)wp;
@@ -6678,6 +6915,55 @@ static WN_API int32_t u32_EnumThreadWindows(uint32_t tid, wn_abiword proc,
                                            wn_abiword lp)
 {
     return enum_windows_common(tid, proc, lp, 1);
+}
+
+static WN_API int32_t u32_GetClassNameA(wn_abiword hwnd, char *out,
+                                        int32_t cap)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !w->cls || !out || cap <= 0) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    const char *n = w->cls->name;
+    int32_t len = (int32_t)strlen(n);
+    if (len >= cap)
+        len = cap - 1;
+    memcpy(out, n, (size_t)len);
+    out[len] = 0;
+    return len;
+}
+
+static WN_API int32_t u32_GetClassNameW(wn_abiword hwnd, uint16_t *out,
+                                        int32_t cap)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w || !w->cls || !out || cap <= 0) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    uint16_t *wn16 = wn_utf8_to_utf16(w->cls->name, NULL);
+    if (!wn16)
+        return 0;
+    int32_t len = 0;
+    while (wn16[len])
+        len++;
+    if (len >= cap)
+        len = cap - 1;
+    memcpy(out, wn16, (size_t)len * 2);
+    out[len] = 0;
+    free(wn16);
+    return len;
+}
+
+static WN_API int32_t u32_GetDlgCtrlID(wn_abiword hwnd)
+{
+    wn_window *w = win_from_hwnd(hwnd);
+    if (!w) {
+        wn_last_error_set(WN_ERR_INVALID_HANDLE);
+        return 0;
+    }
+    return (int32_t)w->id;
 }
 
 static WN_API int32_t u32_GetKeyboardType(int32_t kind)
@@ -8192,6 +8478,9 @@ const wn_export_entry wn_user32_exports[] = {
     { "EnableScrollBar", u32_EnableScrollBar },
     { "EnumThreadWindows", u32_EnumThreadWindows },
     { "GetKeyboardType", u32_GetKeyboardType },
+    { "GetClassNameA", u32_GetClassNameA },
+    { "GetDlgCtrlID", u32_GetDlgCtrlID },
+    { "GetClassNameW", u32_GetClassNameW },
     { "GetKeyboardState", u32_GetKeyboardState },
     { "SetKeyboardState", u32_SetKeyboardState },
     { "GetKeyboardLayout", u32_GetKeyboardLayout },

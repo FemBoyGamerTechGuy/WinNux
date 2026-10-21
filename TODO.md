@@ -5,35 +5,48 @@ put it here. Never silently drop items; move them to STATUS.md when done.
 
 
 
-## P0 — installer bring-up (session 20 state)
+## P0 — installer bring-up (session 21 state)
 
-THE WIZARD IS INTERACTIVE (session 20, commit 2047966 (code commit; this docs commit on top)): the close flow
-is COMPLETE and E2E-verified (WM_DELETE_WINDOW -> WM_SYSCOMMAND(SC_CLOSE)
--> Inno confirm -> REAL modal Exit-Setup box -> Yes -> IDYES -> clean
-rc=2 exit), the text baseline is fixed (baseline-aligned atlas +
-SetTextAlign/ExtTextOut/GetPixel + tmAscent consistency, t21 pins it for
-BOTH font paths), real scrollbars landed (SCROLLINFO/SBM_/EM_LINESCROLL/
-paint/input/wheel, t23), stub logging is deduped with an atexit summary,
-and the input/state API batch is real (GetKeyState/GetAsyncKeyState/
-GetWindowThreadProcessId/EnumWindows/EnumThreadWindows/WM_MOUSEWHEEL).
+THE WIZARD IS REAL-INPUT INTERACTIVE (session 21): the click-through
+(REAL XTEST server-side input via scripts/dev/xinject.py — the old
+XSendEvent harness bypassed the router and masked every bug below)
+reaches the DIRECTORY page with all pages advancing, and the INSTALL
+click DELIVERS BN_CLICKED to the engine. The router is now
+Windows-correct (topmost-sibling z_seq hit-test, capture client-coord
+translation, capture auto-release at UP), BS_AUTOCHECKBOX toggles,
+Space/Enter/Alt+mnemonic work on buttons, WM_MOUSEWHEEL packs delta in
+the HIGH word, edit wheel keeps top_item in sync. Suite 23/23,
+make e2e 7/7.
 
-0. WIZARD CLICK-THROUGH: welcome/license/components pages ADVANCE under
-   synthetic clicks; the DIRECTORY page freezes on Next (the click
-   dispatches, Inno does not move pages — no error box, no log noise).
-   Debug trace exists (winnux32 + WINNUX_LOG=debug under qemu; see the
-   session-20 worklog notes for the exact run). The components page
-   needed a checklist item click BEFORE Next would advance (state
-   contract suspicion: Inno re-reads checklist state via LB_ and our
-   answers leave it "nothing selected" until a click lands).
-   -> hunt the dir-page Next handler's wait/branch; then Finish flow,
-   files-in-prefix check, and the installed lua.exe smoke run.
-1. /S SILENT PATH + lua.exe smoke test (unchanged; the /S path shares
-   the same engine as the interactive flow).
+0. THE INSTALL STALL (user report #1, "Install crashes" — their box
+   crashes, ours stalls one step earlier; BOTH are the engine's
+   wpSelectDir Next path): after BN_CLICKED the engine bails SILENTLY —
+   no page switch, no MessageBox, zero API calls, /LOG stops at
+   "Created temporary directory". /S silent mode (same page-validation
+   code) parks at the same point; identical on a FRESH prefix. No
+   SEH raise, no exception: a clean Result=False branch in ENGINE code
+   before any Win32 call. NEXT STEP (all tooling ready):
+   - Engine binary kept: ~/.WinNux/default/drive_c/windows/temp/
+     is-*.tmp/LuaForWindows_v5.1.5-52.tmp (WINNUX_KEEP_TEMP=1).
+   - objdump -d it; DirExists = call GetFileAttributesA (thunk
+     0x405914) + test 0x10 at 0x42d174; callers in the wizard region:
+     0x451d0a/0x452a9c/0x453514/0x4540ea/0x455f8d/0x4562ce (see
+     /tmp/engine.asm recipe in HANDOFF). Walk UP from the wpSelectDir
+     handler to the branch that returns False without calling
+     anything; the branch condition names the missing contract.
+   - Heap canary armed (user32.c heap_canary_check, pump heartbeat):
+     the four freelist bucket heads never go code-range while the
+     pump runs — the corruption (if any) is created inside a
+     synchronous handler; extend sampling or watch block headers.
+   - gdbstub_session.py attaches to the engine's qemu -g 12346 and
+     snapshots live guest regs+stack mid-flow (repro wired).
+1. lua.exe smoke test after 0 lands: files in the prefix, uninstall
+   registry entry, lua.exe runs (the user's success criteria).
 2. wow64-engine crash (session-11 carryover): under WINNUX_WOW64=1 the
    Inno ENGINE faults writing to its own RO section at tmp+0x1bb7
    (addr 0x40a998). The wizard runs ONLY on the i386 runtime (winnux32,
-   which the acceptance command re-execs). Root-cause this next if the
-   x64 path matters for users.
+   which the acceptance command re-execs). Root-cause after 0 — the
+   user's crash and our stall may be the same broken state.
 3. RichEdit viewer scrolling polish: EM_LINESCROLL/GETFIRSTVISIBLELINE
    are real; VCL also drives the viewer via WM_VSCROLL codes from the
    ADORNMENT bar (verified painted). Wire the license page's keyboard

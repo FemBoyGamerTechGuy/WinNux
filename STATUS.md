@@ -1,3 +1,94 @@
+## Date: 2026-10-21 (session 21: REAL server-side input — the XTEST harness, the router bugs it exposed, checkbox/wheel/keyboard fixes, the Install-stall forensics)
+
+### Milestone
+The old "synthetic clicks" were XSendEvent: delivered DIRECTLY to the
+target window, bypassing the server's entire input path. Everything
+"worked under Xvfb" while the user's real pointer did not. This session
+built a genuine XTEST-injection harness, drove the same controls with
+it, and fixed everything real input exposed.
+
+1. XTEST HARNESS: scripts/dev/xinject.py (python-xlib, pip --break-
+   system-packages) injects MOTION/PRESS/RELEASE/KEY/WHEEL through the
+   SERVER's normal delivery (implicit grabs, real pointer position,
+   wheel as buttons 4/5). Plus a gdbstub client (gdbstub_session.py) —
+   one persistent session driving qemu -g with no gdb on the host.
+2. THREE ROUTER DEFECTS (src/dlls/user32.c, found via xinject + the
+   wizard dispatch log; ALL were masked by XSendEvent):
+   a. NO SIBLING Z-ORDER: the hit-test picked the FIRST-CREATED visible
+      child containing the point. Inno's never-yet-visited notebook
+      pages are created WS_VISIBLE — clicks meant for the components
+      checklist landed on the DIR page (log proof: DOWN dispatched to
+      0x2000 with dir-page-relative coords while components showed).
+      Now: per-window z_seq (raised at create, on hide->show, on
+      SetWindowPos without SWP_NOZORDER); topmost sibling wins.
+   b. CAPTURE COORDS NOT TRANSLATED: with a live capture (VCL captures
+      on WM_LBUTTONDOWN), UP/MOVE were posted with RAW toplevel
+      coords — the log showed UP at (66,200) on a page whose client is
+      486x237. Windows ALWAYS translates lParam to the receiving
+      window's client space (negative outside, capture included).
+   c. NO AUTO-RELEASE: Windows releases a capture taken while a button
+      was down when that button comes up. We leaked captures — every
+      event after the first captured click went raw to the stale
+      capture window. Now tracked (g_buttons_down/g_capture_while_down).
+3. CONTROL CONTRACTS REAL INPUT EXPOSED (all fixed, pinned by tests/
+   e2e, make e2e):
+   - BUTTON auto-toggle handled bs==2 (BS_CHECKBOX, APP-managed!) and
+     9 — but BS_AUTOCHECKBOX is 3 and NEVER toggled. Clicks fired
+     BN_CLICKED with the glyph never changing: the exact field report
+     ("the 'Don't create a Start Menu folder' checkbox doesn't seem
+     clickable, or I can't tell whether it changed"). Now {3,6,9}.
+   - WM_MOUSEWHEEL wParam was packed (keys<<16|delta) — Windows has
+     (DELTA<<16)|keys; every control read delta==0 (wheel dead with a
+     real pointer; the old tests passed only via XSendEvent bypass).
+   - Edit wheel: sb_apply moved sb_pos but never top_item (the first
+     visible LINE) — the content never scrolled. Kept in sync now.
+   - BUTTON keyboard: Space toggles/activates, Enter activates — the
+     ctl KEYDOWN handler only knew treeview arrows.
+   - WM_SYSKEYDOWN/WM_SYSKEYUP (0x104/5) when Alt is held + WM_SYSCHAR
+     (0x106) for Alt+mnemonic (VCL's CM_DIALOGCHAR depends on the SYS
+     variants; the KEY router posted plain KEYDOWN/CHAR only).
+   - IsDialogMessage: dialog looked up FROM THE MESSAGE WINDOW via
+     parent-walk (keyboard goes to the focused child; requiring
+     msg.hwnd == hDlg made mnemonics dead), and WM_SYSCHAR now
+     activates the child BUTTON whose caption carries '&<ch>'.
+   - GetClassNameA/W (returned 0 stub), GetDlgCtrlID (stub) implemented.
+4. THE INSTALL STALL (top priority, still open — user sees a CRASH,
+   we hit a deterministic STALL one step earlier; both are the
+   engine's wpSelectDir Next path):
+   - Full wizard E2E with REAL clicks now works: welcome -> license ->
+     components -> dir pages all advance; the Install button click
+     DELIVERS BN_CLICKED (WM_COMMAND 0x273 on 0x2480) — then the
+     engine bails silently: no page switch, no MessageBox, zero API
+     calls, inno.log stops at "Created temporary directory". This is
+     the OLD dir-page freeze, now with the click provably delivered.
+   - /S silent mode (same engine code path for page validation)
+     builds the hidden wizard and parks in the message pump at the
+     same point; identical on a FRESH prefix.
+   - Forensics run: heap canary (engine freelist bucket heads at
+     engine+0x9d420/9d46c/9d470/9d478, disassembly-verified against
+     the kept is-*.tmp engine; heads never turn code-range under the
+     pump), /proc thread sampling (the sleeping threads are the OUTER
+     waiting on its child + winnux32's own main() in pthread_join —
+     NOT a guest deadlock; the guest is parked in our GetMessage
+     poll), gdbstub client for live guest registers. NEXT: walk the
+     engine's NextButtonClick from the DirExists call sites
+     (0x42d174 etc. in the kept engine; /tmp/engine.asm recipe in
+     HANDOFF) to find the silent Result=False branch.
+5. LOGGING: default level is WARN + the one atexit stub summary; the
+   summary now also prints on the unhandled-exception path and on
+   SIGTERM/SIGINT (timeout-killed runs). The wizard E2E log is 3
+   lines by default (was thousands); WINNUX_DEBUG=1 (repro scripts) or
+   WINNUX_LOG=debug/trace for full detail; empty WINNUX_LOG == unset.
+
+### Result
+Suite 23/23. NEW real-input E2E: make e2e -> 7/7 (t24 z-order/capture
+coords/auto-release, t25 scrollbar arrows+trough+thumb-drag+wheel with
+GetScrollPos/EM_GETFIRSTVISIBLELINE readback, t26 checkbox
+click+Space+Alt-mnemonic with BN_CLICKED/BM_GETCHECK/glyph-pixel
+asserts). Wizard E2E (scripts/dev/repro_install_crash.sh): real XTEST
+click-through to the Install button, BN_CLICKED delivered, stall
+documented.
+
 ## Date: 2026-10-21 (session 20: interactive wizard — real modal MessageBox, Windows close chain, key state, baseline atlas, real scrollbars)
 
 ### Milestone

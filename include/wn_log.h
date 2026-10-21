@@ -16,6 +16,9 @@ enum wn_log_level {
 
 /* Initialize from WINNUX_LOG / WINNUX_TRACE env vars. Safe to call twice. */
 void wn_log_init(void);
+/* One-line-per-site stub summary (atexit + crash paths) so killed/crashed
+ * runs still print it — the default log is short, this is the tail. */
+void wn_log_stub_summary(void);
 
 /* Current maximum enabled level. */
 int  wn_log_level(void);

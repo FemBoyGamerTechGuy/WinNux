@@ -3,6 +3,7 @@
 #include "wn_types.h"
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +38,13 @@ static int g_site_count;
 static pthread_mutex_t g_site_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_exit_hooked;
 
-static void wn_stub_site_summary(void)
+static void summary_on_signal(int sig)
+{
+    wn_log_stub_summary();
+    _exit(128 + sig);
+}
+
+void wn_log_stub_summary(void)
 {
     pthread_mutex_lock(&g_site_lock);
     if (g_site_count <= 0) {
@@ -86,7 +93,15 @@ static int wn_stub_site_record(const char *dll, const char *api,
     snprintf(s->where, sizeof s->where, "%s", where ? where : "?");
     s->hits = 1;
     if (!g_exit_hooked) {
-        atexit(wn_stub_site_summary);
+        atexit(wn_log_stub_summary);
+        /* `timeout`-killed runs never reach atexit — print the summary on
+         * the way out of SIGTERM/SIGINT too (crash logs stay readable). */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = summary_on_signal;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
         g_exit_hooked = 1;
     }
     pthread_mutex_unlock(&g_site_lock);
@@ -102,6 +117,8 @@ void wn_stub_site_note(const char *dll, const char *api, const char *where)
 void wn_log_init(void)
 {
     const char *s = getenv("WINNUX_LOG");
+    if (s && !*s)
+        s = NULL;                   /* empty value == unset (sh ${VAR:+x}) */
     if (s) {
         if (!strcmp(s, "error")) g_level = WN_LOG_ERR;
         else if (!strcmp(s, "warn"))  g_level = WN_LOG_WARN;

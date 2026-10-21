@@ -23,6 +23,10 @@ typedef struct vregion {
 
 /* Documented global: list of VirtualAlloc regions. */
 static vregion *g_regions;
+/* Dev diagnostic (heap canary): bounds of big RW guest arenas. The Delphi
+ * small-block heap reserves a 32MB arena; freelist bucket heads must point
+ * inside it (or be NULL). user32.c validates the Inno engine's heads. */
+uint32_t wn_dbg_arena_lo = 0xFFFFFFFFu, wn_dbg_arena_hi = 0;
 static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Win32 protection constants (subset). */
@@ -90,6 +94,14 @@ void *wn_virtual_alloc(void *hint, uint64_t size, uint32_t type, uint32_t prot)
     void *res = wn_virtual_alloc_inner(hint, size, type, prot);
     wn_log(WN_LOG_DEBUG, " valloc addr=%p size=0x%llx type=0x%x prot=0x%x "
            "-> %p", hint, (unsigned long long)size, type, prot, res);
+    if (res && size >= 0x400000 && (prot & 0x04 /*PAGE_READWRITE*/)) {
+        uint64_t a = (uint64_t)(uintptr_t)res;
+        if (a < 0x100000000ULL) {
+            if (a < wn_dbg_arena_lo) wn_dbg_arena_lo = (uint32_t)a;
+            if (a + size > wn_dbg_arena_hi)
+                wn_dbg_arena_hi = (uint32_t)(a + size);
+        }
+    }
     return res;
 }
 

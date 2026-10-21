@@ -1032,6 +1032,9 @@ crash_report(wn_exc_record *rec, wn_context64 *ctx)
            (unsigned long long)ctx->r8, (unsigned long long)ctx->r9,
            (unsigned long long)ctx->r10, (unsigned long long)ctx->r11);
     wn_log(WN_LOG_ERR, "  RIP=%016llx", (unsigned long long)ctx->rip);
+    /* Crash logs must stay readable: append the stub summary HERE too —
+     * atexit never runs on the fatal paths. */
+    wn_log_stub_summary();
     /* Frame-pointer backtrace: stop on anything that does not look like a
      * sane chain. Best-effort - we are already crashing. Delphi/MSVC i386
      * builds keep EBP chains, and with the RaiseException gate snapshot

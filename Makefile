@@ -198,7 +198,15 @@ $(OBJ32):
 
 OBJS32  := $(patsubst src/%.c,$(OBJ32)/%.o,$(SRCS))
 
-.PHONY: winnux32 check32
+# REAL server-side input (XTEST) regression suite: needs Xvfb + the mingw
+# cross toolchain + python-xlib (scripts/dev/xinject.py header explains).
+e2e: $(TARGET32)
+	@if command -v Xvfb >/dev/null 2>&1 && \
+	   [ -x /home/z/my-project/toolchain/root/usr/bin/x86_64-w64-mingw32-gcc-posix ]; then \
+		sh tests/e2e/run_e2e.sh; \
+	else echo "SKIP e2e (no Xvfb or cross toolchain)"; fi
+
+.PHONY: winnux32 check32 e2e
 
 winnux32: $(TARGET32)
 
